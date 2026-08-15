@@ -14,6 +14,137 @@ if hasattr(sys.stderr, 'reconfigure'):
 LICENSE_VERSION_SEP = "::"
 
 
+def read_canary_const(name, canary_rs_path=r"src\canary.rs"):
+    """Reads a committed const out of src/canary.rs. Same single-source-of-truth
+    trick as read_base_secret, so build.rs, the binary, this script and
+    tools/canary_check.py cannot drift apart."""
+    with open(canary_rs_path, 'r', encoding='utf-8') as f:
+        src = f.read()
+    m = re.search(r'pub const %s: &str = "([^"]*)"' % re.escape(name), src)
+    if not m:
+        raise RuntimeError("%s not found in %s" % (name, canary_rs_path))
+    return m.group(1)
+
+
+def release_token(version):
+    """Must match canary::token_for() in Rust and token_for() in build.rs."""
+    import hashlib
+    seed = read_canary_const("CANARY_SEED")
+    sep = read_canary_const("CANARY_SEP")
+    d = hashlib.sha256((seed + sep + version).encode('utf-8')).hexdigest().upper()
+    return "AGU-%s-%s-%s" % (d[0:5], d[5:10], d[10:15])
+
+
+def record_canary(version, token, exe_path):
+    """Appends this release to CANARIES.md.
+
+    The token is derivable from the sources, so the ledger is a convenience, not
+    a secret. Its value is being a dated, committed record of which token belongs
+    to which release and which binary hash - i.e. the thing you would actually
+    put in front of someone. It therefore lives at the repo root, NOT under
+    release/, which is gitignored and would never be committed."""
+    import hashlib
+    try:
+        with open(exe_path, 'rb') as f:
+            sha = hashlib.sha256(f.read()).hexdigest()
+    except OSError:
+        sha = "(unavailable)"
+
+    ledger = "CANARIES.md"
+    row = "| %s | `%s` | `%s` | `%s` |\n" % (
+        version, token, read_canary_const("STATIC_CANARY"), sha)
+
+    if not os.path.exists(ledger):
+        header = (
+            "# Release canaries\n\n"
+            "Provenance record for every published build. See `src/canary.rs`\n"
+            "for what these are and `tools/canary_check.py` for how to scan a\n"
+            "suspect file against them. Tokens are derived from the committed\n"
+            "seed, so this table is reproducible - it exists so the mapping is\n"
+            "dated and committed rather than recomputed after the fact.\n\n"
+            "| version | release token | static canary | sha256 of the .exe |\n"
+            "|---|---|---|---|\n"
+        )
+        with open(ledger, 'w', encoding='utf-8') as f:
+            f.write(header + row)
+        return ledger
+
+    with open(ledger, 'r', encoding='utf-8') as f:
+        content = f.read()
+    if "| %s |" % version in content:
+        # Rebuild of an already-recorded version: refresh its row in place so the
+        # hash matches the binary that actually shipped.
+        content = re.sub(r'^\| %s \|.*$' % re.escape(version), row.rstrip('\n'),
+                         content, flags=re.M)
+        with open(ledger, 'w', encoding='utf-8') as f:
+            f.write(content)
+    else:
+        with open(ledger, 'a', encoding='utf-8') as f:
+            f.write(row)
+    return ledger
+
+
+def find_upx():
+    """Locate the UPX packer. Returns the executable path or None."""
+    import shutil
+    found = shutil.which("upx")
+    if found:
+        return found
+    for candidate in (
+        r"C:\Program Files\upx\upx.exe",
+        r"C:\Program Files (x86)\upx\upx.exe",
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "upx.exe"),
+    ):
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
+def compress_exe_inplace(exe_path):
+    """Shrink the release exe in place with UPX, keeping it a directly-runnable
+    .exe (no archive, no separate file).
+
+    UPX is a runtime packer: the file on disk gets ~60-65% smaller, and the exe
+    self-decompresses into memory on launch. For a ~1.5 MB binary that unpack is
+    single-digit milliseconds - imperceptible - but it is the unavoidable cost of
+    compressing the executable itself rather than shipping it in an archive.
+    Packed exes also raise more AV false positives (already noted in README).
+
+    Best-effort: if UPX is absent the uncompressed exe still ships.
+    """
+    upx = find_upx()
+    if not upx:
+        print("[WARNING] UPX не найден (upx в PATH, C:\\Program Files\\upx или рядом со "
+              "скриптом). Сжатие пропущено - будет отгружён несжатый .exe.")
+        return
+
+    before = None
+    try:
+        before = os.path.getsize(exe_path)
+    except OSError:
+        pass
+    try:
+        # --best --lzma = maximum compression. UPX rewrites the file in place, so
+        # the output stays AG_<ver>.exe.
+        subprocess.check_call(
+            [upx, "--best", "--lzma", exe_path],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except Exception as e:
+        print(f"[WARNING] Не удалось сжать exe с помощью UPX: {e}")
+        return
+
+    try:
+        after = os.path.getsize(exe_path)
+        if before:
+            print(f"[INFO] exe сжат UPX: {before // 1024} КБ -> {after // 1024} КБ "
+                  f"({after / before * 100:.0f}%).")
+        else:
+            print(f"[INFO] exe сжат UPX: {after // 1024} КБ.")
+    except OSError:
+        print("[INFO] exe сжат UPX.")
+
+
 def read_base_secret(auth_rs_path):
     """Reads the committed base secret straight from src\\auth.rs, so the source
     is the single source of truth for both the binary and the key generator."""
@@ -30,7 +161,7 @@ def main():
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
     print("[INFO] Starting build process...")
 
-    VERSION = "2.5.0"
+    VERSION = "2.8.1"
     version = VERSION
     # env!("CARGO_PKG_VERSION") only sees MAJOR.MINOR.PATCH, so the key salt uses
     # the same trimmed value the binary will compile with.
@@ -325,16 +456,20 @@ if __name__ == "__main__":
             os.remove(out_path)
         shutil.move(r"target\release\ag_unlocker.exe", out_path)
 
-        # Compress with UPX if available.
-        print("[INFO] Сжатие исполняемого файла с помощью UPX...")
-        try:
-            subprocess.run(["upx", "--best", "--lzma", out_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            print("[INFO] Исполняемый файл успешно сжат с помощью UPX.")
-        except Exception as e:
-            print(f"[WARNING] Не удалось сжать файл с помощью UPX: {e}")
+        # Shrink the exe in place; it stays a runnable AG_<ver>.exe.
+        print("[INFO] Сжатие исполняемого файла...")
+        compress_exe_inplace(out_path)
 
         print("\n[УСПЕХ] Сборка завершена!")
         print(f"Ваш исполняемый файл: {out_path}")
+
+        # Provenance record. Written after compression so the hash is of the file
+        # that actually ships.
+        token = release_token(cargo_version)
+        ledger = record_canary(cargo_version, token, out_path)
+        print(f"\n[i] Канарейка релиза: {token}")
+        print(f"    Записано в {ledger}. Проверить любой файл/бинарник:")
+        print(f"    python tools\\canary_check.py <путь>")
 
         if is_owner:
             print(f"Ваш генератор ключей для этой версии: {dist_keygen_path}")

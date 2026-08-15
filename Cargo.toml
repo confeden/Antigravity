@@ -1,6 +1,6 @@
 [package]
 name = "ag_unlocker"
-version = "2.5.0"
+version = "2.8.1"
 edition = "2021"
 description = "Antigravity Configuration Tool"
 authors = ["Brent t.me/nova_txt"]
@@ -15,10 +15,17 @@ serde_json = "1.0"
 
 [build-dependencies]
 winres = "0.1"
+# build.rs derives the per-release canary with the same formula as canary.rs.
+sha2 = "0.10"
+hex = "0.4"
 
 [profile.release]
 opt-level = "z"
-lto = true
+# LTO off by request (faster builds). The release exe is UPX-compressed in place
+# by build_rust.py, so final on-disk size is dominated by the packer, not LTO.
+# Note: turning LTO back on would shrink the (pre- and post-pack) binary a little
+# further and does NOT affect startup - flip if size matters more than build time.
+lto = false
 codegen-units = 1
 panic = "abort"
 strip = true

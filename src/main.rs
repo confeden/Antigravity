@@ -6,22 +6,23 @@ use std::process::Command;
 use std::thread;
 use std::time::Duration;
 
-mod utils;
-mod console_style;
-mod auth;
-mod dns;
 mod asar;
+mod auth;
+mod canary;
+mod console_style;
+mod dns;
 mod patch_binary;
-mod patch_ide;
 mod patch_gemini;
+mod patch_ide;
+mod utils;
 
-use utils::{clear_screen, link, open_url, mask_path, is_admin, print_results, prompt, open_hint};
-use auth::login_screen;
-use dns::{setup_dns_nrpt, setup_dns_nrpt_with, remove_dns_nrpt, is_nrpt_applied};
 use asar::extract_asar;
+use auth::login_screen;
+use dns::{is_nrpt_applied, remove_dns_nrpt, setup_dns_nrpt, setup_dns_nrpt_with};
 use patch_binary::{kill_affected_processes, patch_all_binaries, unpatch_all_binaries};
-use patch_ide::{patch_ide, patch_desktop, patch_extension_js, is_new_desktop_architecture};
 use patch_gemini::run_gemini_patcher;
+use patch_ide::{is_new_desktop_architecture, patch_desktop, patch_extension_js, patch_ide};
+use utils::{clear_screen, is_admin, link, mask_path, open_hint, open_url, print_results, prompt};
 
 // Title shown at the top of the main menu.
 const APP_TITLE: &str = "Antigravity Unlocker 2";
@@ -139,8 +140,12 @@ fn find_all_installs() -> Vec<PathBuf> {
     let prog_files_x86 = env::var("PROGRAMFILES(X86)").unwrap_or_default();
 
     let standard_paths = vec![
-        PathBuf::from(&local_appdata).join("Programs").join("Antigravity"),
-        PathBuf::from(&local_appdata).join("Programs").join("Antigravity IDE"),
+        PathBuf::from(&local_appdata)
+            .join("Programs")
+            .join("Antigravity"),
+        PathBuf::from(&local_appdata)
+            .join("Programs")
+            .join("Antigravity IDE"),
         PathBuf::from(&prog_files).join("Antigravity"),
         PathBuf::from(&prog_files).join("Antigravity IDE"),
         PathBuf::from(&prog_files_x86).join("Antigravity"),
@@ -324,7 +329,11 @@ fn handle_revert_all() {
     let mut reverted = Vec::new();
     for inst in &installs {
         println!("{}", "--------------------------------------------------");
-        println!("{} {}", "Обработка:", mask_path(&inst.display().to_string()));
+        println!(
+            "{} {}",
+            "Обработка:",
+            mask_path(&inst.display().to_string())
+        );
         let n = unpatch_all_binaries(inst);
         if let Err(e) = restore_pristine_asar(&inst.join("resources")) {
             println!("  \x1b[33m[ERR] {}\x1b[0m\x1b[92m", e);
@@ -349,17 +358,25 @@ fn is_valid_gemini_api_key(key: &str) -> bool {
 
 fn get_system_gcloud_project() -> Option<String> {
     if let Ok(proj) = env::var("GOOGLE_CLOUD_PROJECT") {
-        if !proj.is_empty() { return Some(proj.trim().to_string()); }
+        if !proj.is_empty() {
+            return Some(proj.trim().to_string());
+        }
     }
     #[cfg(target_os = "windows")]
     {
         let out = Command::new("powershell")
-            .args(["-NoProfile", "-Command", "[Environment]::GetEnvironmentVariable('GOOGLE_CLOUD_PROJECT', 'User')"])
+            .args([
+                "-NoProfile",
+                "-Command",
+                "[Environment]::GetEnvironmentVariable('GOOGLE_CLOUD_PROJECT', 'User')",
+            ])
             .output()
             .ok()?;
         if out.status.success() {
             let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if !stdout.is_empty() { return Some(stdout); }
+            if !stdout.is_empty() {
+                return Some(stdout);
+            }
         }
     }
     let settings_path = format!(
@@ -371,7 +388,9 @@ fn get_system_gcloud_project() -> Option<String> {
             let remainder = &content[start + 11..];
             if let Some(end) = remainder.find('"') {
                 let proj = &remainder[..end];
-                if !proj.is_empty() { return Some(proj.to_string()); }
+                if !proj.is_empty() {
+                    return Some(proj.to_string());
+                }
             }
         }
     }
@@ -383,7 +402,8 @@ fn is_valid_project_id(proj: &str) -> bool {
     if p.is_empty() || p.len() < 4 || p.len() > 30 {
         return false;
     }
-    p.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    p.chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
 fn update_settings_project_id(project_id: &str) -> Result<(), String> {
@@ -392,25 +412,19 @@ fn update_settings_project_id(project_id: &str) -> Result<(), String> {
         env::var("USERPROFILE").unwrap_or_default()
     );
     if !std::path::Path::new(&settings_path).exists() {
-        let settings_dir = format!(
-            "{}\\.gemini",
-            env::var("USERPROFILE").unwrap_or_default()
-        );
+        let settings_dir = format!("{}\\.gemini", env::var("USERPROFILE").unwrap_or_default());
         std::fs::create_dir_all(&settings_dir)
             .map_err(|e| format!("Не удалось создать директорию {}: {}", settings_dir, e))?;
-        
-        let default_content = format!(
-            "{{\n  \"project\": \"{}\"\n}}",
-            project_id
-        );
+
+        let default_content = format!("{{\n  \"project\": \"{}\"\n}}", project_id);
         std::fs::write(&settings_path, default_content)
             .map_err(|e| format!("Не удалось записать settings.json: {}", e))?;
         return Ok(());
     }
-    
+
     let content = std::fs::read_to_string(&settings_path)
         .map_err(|e| format!("Не удалось прочитать settings.json: {}", e))?;
-        
+
     let new_content = if content.contains(r#""project":"#) {
         if let Some(start) = content.find(r#""project":"#) {
             let remainder = &content[start + 10..];
@@ -437,7 +451,7 @@ fn update_settings_project_id(project_id: &str) -> Result<(), String> {
             content.clone()
         }
     };
-    
+
     std::fs::write(&settings_path, new_content)
         .map_err(|e| format!("Не удалось обновить settings.json: {}", e))?;
     Ok(())
@@ -452,7 +466,11 @@ fn get_system_gemini_api_key() -> Option<String> {
     #[cfg(target_os = "windows")]
     {
         let out = Command::new("powershell")
-            .args(["-NoProfile", "-Command", "[Environment]::GetEnvironmentVariable('GEMINI_API_KEY', 'User')"])
+            .args([
+                "-NoProfile",
+                "-Command",
+                "[Environment]::GetEnvironmentVariable('GEMINI_API_KEY', 'User')",
+            ])
             .output()
             .ok()?;
         if out.status.success() {
@@ -480,15 +498,23 @@ fn handle_patch_antigravity() {
 
     for inst in &installs {
         println!("{}", "--------------------------------------------------");
-        println!("{} {}", "Обработка:", mask_path(&inst.display().to_string()));
+        println!(
+            "{} {}",
+            "Обработка:",
+            mask_path(&inst.display().to_string())
+        );
         match process_install(inst) {
             Ok(name) => {
                 println!("{} {}", "[OK] Успешно пропатчено:", name);
                 successes.push(name);
-            },
+            }
             Err(e) => {
                 println!("\x1b[33m[ERR] Ошибка: {}\x1b[0m\x1b[92m", e);
-                failures.push(format!("{} - {}", mask_path(&inst.display().to_string()), e));
+                failures.push(format!(
+                    "{} - {}",
+                    mask_path(&inst.display().to_string()),
+                    e
+                ));
             }
         }
     }
@@ -539,18 +565,26 @@ fn handle_patch_gemini() {
     println!("\n============================================================");
     println!("Gemini CLI (forbidden necromancy)");
     println!("Требуется: AIzaSy-ключ из");
-    println!("  {}", link(API_KEYS_URL, "aistudio.google.com/app/u/1/api-keys"));
+    println!(
+        "  {}",
+        link(API_KEYS_URL, "aistudio.google.com/app/u/1/api-keys")
+    );
     println!("  {}", open_hint("open"));
     println!();
 
     if let Some(ref ext_key) = existing_key {
-        let masked = format!("{}***{}", &ext_key[..6], &ext_key[ext_key.len()-4..]);
-        println!("  - Нажмите Enter для использования сохраненного ключа ({})", masked);
+        let masked = format!("{}***{}", &ext_key[..6], &ext_key[ext_key.len() - 4..]);
+        println!(
+            "  - Нажмите Enter для использования сохраненного ключа ({})",
+            masked
+        );
         println!("  - Или введите 'skip' для сброса ключа и перехода к браузерному OAuth");
         println!("  - Или вставьте новый AIzaSy-ключ");
     } else {
         println!("  - Вставьте AIzaSy-ключ");
-        println!("  - Или нажмите Enter (пустая строка) для пропуска (авторизация через браузер/OAuth)");
+        println!(
+            "  - Или нажмите Enter (пустая строка) для пропуска (авторизация через браузер/OAuth)"
+        );
     }
     println!("------------------------------------------------------------");
 
@@ -574,7 +608,7 @@ fn handle_patch_gemini() {
         if key_input.is_empty() {
             if let Some(ref ext_key) = existing_key {
                 api_key = ext_key.clone();
-                let masked = format!("{}***{}", &api_key[..6], &api_key[api_key.len()-4..]);
+                let masked = format!("{}***{}", &api_key[..6], &api_key[api_key.len() - 4..]);
                 println!("> {}", masked);
                 println!("Используется сохраненный API-ключ.");
             } else {
@@ -591,7 +625,7 @@ fn handle_patch_gemini() {
 
         if is_valid_gemini_api_key(&key_input) {
             api_key = key_input;
-            let masked = format!("{}***{}", &api_key[..6], &api_key[api_key.len()-4..]);
+            let masked = format!("{}***{}", &api_key[..6], &api_key[api_key.len() - 4..]);
             println!("> {}", masked);
             println!("API-ключ получен.");
             break;
@@ -615,7 +649,10 @@ fn handle_patch_gemini() {
     println!();
 
     if let Some(ref ext_proj) = existing_project {
-        println!("  - Нажмите Enter для использования сохраненного Project ID ({})", ext_proj);
+        println!(
+            "  - Нажмите Enter для использования сохраненного Project ID ({})",
+            ext_proj
+        );
         println!("  - Или введите 'skip' для сброса и использования дефолтного cloudshell-gca");
         println!("  - Или введите новый Project ID");
     } else {
@@ -682,7 +719,8 @@ fn handle_patch_gemini() {
     };
     Command::new("powershell")
         .args(["-NoProfile", "-Command", &set_gemini])
-        .output().ok();
+        .output()
+        .ok();
 
     let set_project = if !project_id.is_empty() {
         format!(
@@ -694,11 +732,15 @@ fn handle_patch_gemini() {
     };
     Command::new("powershell")
         .args(["-NoProfile", "-Command", &set_project])
-        .output().ok();
+        .output()
+        .ok();
 
     if !project_id.is_empty() {
         if let Err(e) = update_settings_project_id(&project_id) {
-            println!("\x1b[33m[ERR] Не удалось обновить settings.json: {}\x1b[0m\x1b[92m", e);
+            println!(
+                "\x1b[33m[ERR] Не удалось обновить settings.json: {}\x1b[0m\x1b[92m",
+                e
+            );
         }
     }
 
@@ -706,9 +748,12 @@ fn handle_patch_gemini() {
         Ok(_) => {
             println!("[OK] Gemini CLI успешно разблокирован!");
             successes.push("Gemini CLI".to_string());
-        },
+        }
         Err(e) => {
-            println!("\x1b[33m[ERR] Ошибка разблокировки Gemini CLI: {}\x1b[0m\x1b[92m", e);
+            println!(
+                "\x1b[33m[ERR] Ошибка разблокировки Gemini CLI: {}\x1b[0m\x1b[92m",
+                e
+            );
             failures.push(format!("Gemini CLI - {}", e));
         }
     }
@@ -741,7 +786,9 @@ fn handle_manual_path() {
     let resolved = match resolve_install_root(&input_path) {
         Some(path) => path,
         None => {
-            println!("\x1b[33m[ERR] По указанному пути установка Antigravity не найдена.\x1b[0m\x1b[92m");
+            println!(
+                "\x1b[33m[ERR] По указанному пути установка Antigravity не найдена.\x1b[0m\x1b[92m"
+            );
             println!("Проверьте правильность пути: {}", cleaned);
             println!("\nЧтобы вернуться в главное меню, нажмите Enter");
             let mut wait = String::new();
@@ -750,7 +797,11 @@ fn handle_manual_path() {
         }
     };
 
-    println!("{} {}", "Обработка:", mask_path(&resolved.display().to_string()));
+    println!(
+        "{} {}",
+        "Обработка:",
+        mask_path(&resolved.display().to_string())
+    );
 
     let mut successes = Vec::new();
     let mut failures = Vec::new();
@@ -762,7 +813,11 @@ fn handle_manual_path() {
         }
         Err(e) => {
             println!("\x1b[33m[ERR] Ошибка: {}\x1b[0m\x1b[92m", e);
-            failures.push(format!("{} - {}", mask_path(&resolved.display().to_string()), e));
+            failures.push(format!(
+                "{} - {}",
+                mask_path(&resolved.display().to_string()),
+                e
+            ));
         }
     }
 
@@ -801,6 +856,11 @@ fn show_admin_prewarning() {
 }
 
 fn main() {
+    // `--about` / `--license` / `--version`: prints the copyright notice and the
+    // build canaries, then exits. Deliberately before the key prompt so any
+    // binary can be fingerprinted without a licence key.
+    canary::handle_cli_flags();
+
     let window_title = format!("Antigravity анлокер v{}", APP_VERSION);
     #[cfg(target_os = "windows")]
     console_style::set(&window_title);
@@ -813,12 +873,19 @@ fn main() {
 
     loop {
         clear_screen();
-        println!("{}", APP_TITLE);
+        // Users only need the product name and version here; the build canary is
+        // not shown (it stays in the binary, the version resource and `--about`
+        // for provenance). RELEASE_TOKEN is pinned into the binary by
+        // canary::CANARY_ANCHOR, so dropping this reference cannot strip it.
+        println!("{} v{}", APP_TITLE, APP_VERSION);
         println!();
         println!("1. Разблокировать Antigravity / Antigravity IDE / Antigravity CLI");
         println!("2. Разблокировать Gemini CLI (deprecated)");
         println!("3. Отменить NRPT-патч (отключит исправление ошибок \"400\")");
-        println!("4. Открыть Telegram-группу ({})", link(TELEGRAM_URL, TELEGRAM_URL));
+        println!(
+            "4. Открыть Telegram-группу ({})",
+            link(TELEGRAM_URL, TELEGRAM_URL)
+        );
         println!("5. Поблагодарить автора ({})", link(DONATE_URL, DONATE_URL));
         println!("6. Указать путь к Antigravity вручную");
         println!("7. Полный откат (снять патч и вернуть исходное состояние)");

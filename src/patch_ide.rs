@@ -6,14 +6,42 @@ fn detect_stacked_ide(content: &str) -> bool {
     content.contains("/*[AG_PATCHED]*/") || content.contains("[AG_PROXY_HOOK]")
 }
 
+/// Every file we rewrite ends with this comment. Releases up to 2.5.0 wrote the
+/// bare prefix; newer ones append the canaries (see `canary::file_marker`), so
+/// detection matches on the prefix and stays compatible with installs patched by
+/// an older build - `has_marker` decides "already patched", and getting that
+/// wrong would either re-patch a patched file or refuse to revert one.
+const MARKER_PREFIX: &str = "// UNLOCKED";
+
+/// True when the last non-empty line is our marker, tokenised or legacy.
+fn has_marker(content: &str) -> bool {
+    let trimmed = content.trim_end();
+    let last_line = trimmed.rsplit('\n').next().unwrap_or(trimmed);
+    last_line.trim_start().starts_with(MARKER_PREFIX)
+}
+
+/// Drops a trailing marker line. Returns None when there is none, so callers can
+/// tell "nothing to strip" from "stripped".
+fn strip_marker(content: &str) -> Option<String> {
+    if !has_marker(content) {
+        return None;
+    }
+    let end = content.trim_end().len();
+    match content[..end].rfind('\n') {
+        Some(nl) => Some(content[..nl].to_string()),
+        // Marker is the whole file: nothing but the marker to remove.
+        None => Some(String::new()),
+    }
+}
+
 pub fn patch_ide(_inst: &Path, main_js: &Path) -> Result<(), String> {
     let content = fs::read_to_string(main_js).map_err(|e| e.to_string())?;
 
-    if content.trim_end().ends_with("// UNLOCKED") && !detect_stacked_ide(&content) {
+    if has_marker(&content) && !detect_stacked_ide(&content) {
         return Ok(());
     }
 
-    if detect_stacked_ide(&content) || content.trim_end().ends_with("// UNLOCKED") {
+    if detect_stacked_ide(&content) || has_marker(&content) {
         return Err("Обнаружена старая версия патча. Пожалуйста, выполните чистую переустановку Antigravity IDE перед повторным патчем.".into());
     }
 
@@ -32,7 +60,8 @@ pub fn patch_ide(_inst: &Path, main_js: &Path) -> Result<(), String> {
         let var_h = caps.get(11).unwrap().as_str();
         let var_i = caps.get(8).unwrap().as_str();
 
-        let payload = format!(r#"async {fname}({var_t}){{
+        let payload = format!(
+            r#"async {fname}({var_t}){{
     this.{var_t_send}.send({{type:{var_t}.isGcpTos?"GCP_SIGN_IN":"SIGN_IN"}});
     this.{var_y}.resetIsTierGCPTos();
     try {{
@@ -48,9 +77,16 @@ pub fn patch_ide(_inst: &Path, main_js: &Path) -> Result<(), String> {
         this.{var_h}.fire({{settings:__res.settings, userTier:__res.userTier}});
     }} catch(e) {{}}
     return;
-"#);
+"#
+        );
 
-        let new_content = format!("{}\n// UNLOCKED", content[..caps.get(0).unwrap().start()].to_string() + &payload + &content[caps.get(0).unwrap().end()..]);
+        let new_content = format!(
+            "{}\n{}",
+            content[..caps.get(0).unwrap().start()].to_string()
+                + &payload
+                + &content[caps.get(0).unwrap().end()..],
+            crate::canary::file_marker()
+        );
         fs::write(main_js, new_content).map_err(|e| e.to_string())?;
         Ok(())
     } else {
@@ -62,8 +98,7 @@ pub fn patch_ide(_inst: &Path, main_js: &Path) -> Result<(), String> {
 /// Verified against 2.4.2 and 2.5.0 - `dist/main.js` only wires up the shell
 /// (`./languageServer`, `./ipcHandlers`) and carries no auth/eligibility code.
 pub fn is_new_desktop_architecture(content: &str) -> bool {
-    let modular = content.contains("./languageServer")
-        && content.contains("./ipcHandlers");
+    let modular = content.contains("./languageServer") && content.contains("./ipcHandlers");
     let legacy_auth = content.contains("_handleAuthErrorResponse")
         || content.contains("getUserStatus")
         || content.contains("\"AUTH_SUCCESS\"")
@@ -252,7 +287,12 @@ _elec.app.whenReady = function() {
 "#;
     }
 
-    let new_content = format!("{}\n{}\n// UNLOCKED", hook, inline_patched);
+    let new_content = format!(
+        "{}\n{}\n{}",
+        hook,
+        inline_patched,
+        crate::canary::file_marker()
+    );
     fs::write(main_js, new_content).map_err(|e| e.to_string())?;
     Ok(true)
 }
@@ -262,19 +302,14 @@ fn strip_desktop_hook(content: &str) -> String {
         if let Some(end) = content[start..].find("// [/AG_PROXY_HOOK]") {
             let after = start + end + "// [/AG_PROXY_HOOK]".len();
             let mut rest = content[after..].to_string();
-            if rest.trim_end().ends_with("// UNLOCKED") {
-                if let Some(pos) = rest.rfind("// UNLOCKED") {
-                    rest = rest[..pos].to_string();
-                }
+            if let Some(stripped) = strip_marker(&rest) {
+                rest = stripped;
             }
             return content[..start].to_string() + &rest;
         }
     }
-    let trimmed = content.trim_end();
-    if trimmed.ends_with("// UNLOCKED") {
-        if let Some(pos) = content.rfind("// UNLOCKED") {
-            return content[..pos].to_string() + "\n";
-        }
+    if let Some(stripped) = strip_marker(content) {
+        return stripped + "\n";
     }
     content.to_string()
 }
@@ -284,7 +319,10 @@ fn apply_desktop_inline_patches(content: &str) -> String {
 
     output = output.replace("ineligible", "inexigible");
 
-    let re_getus = Regex::new(r#"let ([A-Za-z_$]+)=.*\.getUserStatus\(\{\}\)\)\)\.userStatus;if\([A-Za-z_$]+\)\{"#).unwrap();
+    let re_getus = Regex::new(
+        r#"let ([A-Za-z_$]+)=.*\.getUserStatus\(\{\}\)\)\)\.userStatus;if\([A-Za-z_$]+\)\{"#,
+    )
+    .unwrap();
     output = re_getus.replace_all(&output, |caps: &regex::Captures| {
         if caps.get(1).map_or("", |m| m.as_str()) != caps.get(2).map_or("", |m| m.as_str()) {
             return caps.get(0).map_or("", |m| m.as_str()).to_string();
@@ -305,14 +343,18 @@ fn apply_desktop_inline_patches(content: &str) -> String {
     }).to_string();
 
     let re_inel = Regex::new(r#"\?\.failureDetails\?\.case===\"ineligible\"\?this\._authActor\.send\(\{type:\"SET_INELIGIBLE\""#).unwrap();
-    output = re_inel.replace_all(&output, |_caps: &regex::Captures| {
-        "?.failureDetails?.case===\"NEVER_MATCH\"?this._authActor.send({type:\"SET_INELIGIBLE\""
-    }).to_string();
+    output = re_inel
+        .replace_all(&output, |_caps: &regex::Captures| {
+            "?.failureDetails?.case===\"NEVER_MATCH\"?this._authActor.send({type:\"SET_INELIGIBLE\""
+        })
+        .to_string();
 
     let re_eligible = Regex::new(r#"(isEligible:\s*)false"#).unwrap();
-    output = re_eligible.replace_all(&output, |caps: &regex::Captures| {
-        format!("{}true", &caps[1])
-    }).to_string();
+    output = re_eligible
+        .replace_all(&output, |caps: &regex::Captures| {
+            format!("{}true", &caps[1])
+        })
+        .to_string();
 
     output
 }
@@ -323,8 +365,41 @@ mod tests {
     use std::env;
 
     #[test]
+    fn detects_a_marker_written_by_this_build() {
+        let js = format!("code();\n{}", crate::canary::file_marker());
+        assert!(has_marker(&js));
+    }
+
+    #[test]
+    fn detects_the_legacy_bare_marker() {
+        // Installs patched by <=2.5.0 must still read as "already patched",
+        // otherwise an upgrade re-patches an already patched file.
+        assert!(has_marker("code();\n// UNLOCKED"));
+        assert!(has_marker("code();\n// UNLOCKED\n\n"));
+    }
+
+    #[test]
+    fn an_unpatched_file_has_no_marker() {
+        assert!(!has_marker("code();\n// some other trailing comment"));
+        assert!(!has_marker("// UNLOCKED is mentioned mid-file\ncode();"));
+        assert!(!has_marker(""));
+    }
+
+    #[test]
+    fn strip_marker_removes_both_shapes_and_nothing_else() {
+        let body = "line one\nline two";
+        for marker in [crate::canary::file_marker(), "// UNLOCKED".to_string()] {
+            let patched = format!("{}\n{}", body, marker);
+            assert_eq!(strip_marker(&patched).as_deref(), Some(body));
+        }
+        assert!(strip_marker(body).is_none());
+    }
+
+    #[test]
     fn recognises_the_shipping_v24_plus_shell() {
-        let Ok(local) = env::var("LOCALAPPDATA") else { return };
+        let Ok(local) = env::var("LOCALAPPDATA") else {
+            return;
+        };
         let asar = Path::new(&local)
             .join("Programs")
             .join("Antigravity")
@@ -356,8 +431,13 @@ mod tests {
 }
 
 pub fn patch_extension_js(inst: &Path) -> Result<bool, String> {
-    let ext_path = inst.join("resources").join("app").join("extensions")
-        .join("antigravity").join("dist").join("extension.js");
+    let ext_path = inst
+        .join("resources")
+        .join("app")
+        .join("extensions")
+        .join("antigravity")
+        .join("dist")
+        .join("extension.js");
     if !ext_path.exists() {
         return Ok(false);
     }
@@ -386,7 +466,13 @@ pub fn patch_extension_js(inst: &Path) -> Result<bool, String> {
         return Err("Сигнатура extension.js не найдена (возможно, другая версия)".to_string());
     }
 
-    let marked = format!("/*[AG_EXT_PATCHED]*/\n{}", new_content);
+    // Leading fence stays the idempotence check; the trailing marker is the
+    // canary trailer every rewritten file carries.
+    let marked = format!(
+        "/*[AG_EXT_PATCHED]*/\n{}\n{}",
+        new_content,
+        crate::canary::file_marker()
+    );
     fs::write(&ext_path, marked).map_err(|e| e.to_string())?;
     Ok(true)
 }

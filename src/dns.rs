@@ -194,13 +194,18 @@ pub fn setup_dns_nrpt_with(include_gemini: bool) -> Result<(), String> {
         "$ErrorActionPreference='Stop'; \
          foreach ($n in @({})) {{ \
            try {{ Add-DnsClientNrptRule -Namespace $n -NameServers @({}) -Comment '{}' \
-                  -DisplayName 'AG Unlocker' -ErrorAction Stop }} \
+                  -DisplayName 'AG Unlocker {} {}' -ErrorAction Stop }} \
            catch {{ Write-Error \"$n :: $($_.Exception.Message)\"; exit 1 }} \
          }} \
          Clear-DnsClientCache -ErrorAction SilentlyContinue",
         ps_string_list(&namespaces),
         AG_NRPT_NAMESERVERS,
-        AG_NRPT_TAG
+        AG_NRPT_TAG,
+        // DisplayName is cosmetic - rule matching goes through Comment - so it is
+        // free real estate for the canaries. Recoverable from any patched machine
+        // with `Get-DnsClientNrptRule`, without touching the tool that wrote it.
+        crate::canary::STATIC_CANARY,
+        crate::canary::RELEASE_TOKEN
     );
 
     let out = powershell(&cmd).ok_or_else(|| "не удалось запустить PowerShell".to_string())?;
