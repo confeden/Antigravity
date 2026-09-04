@@ -37,8 +37,9 @@ use crate::upstream;
 // well under 100 bytes, so TC is never set. If that ever changes, Windows falls
 // back to the next nameserver in the rule rather than failing outright.
 
-/// Where the NRPT rules point. Any 127.0.0.0/8 address works; .53 keeps it
-/// recognisable and clear of anything bound to 127.0.0.1.
+#[cfg(target_os = "macos")]
+pub const LISTEN_IP: &str = "127.0.0.1";
+#[cfg(not(target_os = "macos"))]
 pub const LISTEN_IP: &str = "127.0.0.53";
 pub const LISTEN_PORT: u16 = 53;
 
@@ -155,10 +156,25 @@ pub fn log_dir() -> PathBuf {
     PathBuf::from(std::env::var("LOCALAPPDATA").unwrap_or_default()).join("AGUnlocker")
 }
 
+/// On macOS, logs live in ~/Library/Logs/agunlocker.
+#[cfg(target_os = "macos")]
+pub fn log_dir() -> PathBuf {
+    let home = if let Ok(user) = std::env::var("SUDO_USER") {
+        if !user.is_empty() && user != "root" {
+            format!("/Users/{}", user)
+        } else {
+            std::env::var("HOME").unwrap_or_default()
+        }
+    } else {
+        std::env::var("HOME").unwrap_or_default()
+    };
+    PathBuf::from(home).join("Library").join("Logs").join("agunlocker")
+}
+
 /// On Linux the per-user state dir follows the XDG base-dir spec
 /// (`~/.local/share/agunlocker`), which is also where the own-proxy config and
 /// any relay log will live once that layer is ported.
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 pub fn log_dir() -> PathBuf {
     let base = std::env::var("XDG_DATA_HOME")
         .ok()
@@ -232,7 +248,15 @@ fn stamp() -> String {
 
 #[cfg(not(target_os = "windows"))]
 fn stamp() -> String {
-    String::new()
+    unsafe {
+        let t = libc::time(std::ptr::null_mut());
+        let mut tm: libc::tm = std::mem::zeroed();
+        if !libc::localtime_r(&t, &mut tm).is_null() {
+            format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec)
+        } else {
+            String::new()
+        }
+    }
 }
 
 /// Best-effort logging: a background process with no console is otherwise

@@ -83,11 +83,29 @@ fn is_install_root(path: &Path) -> bool {
         return false;
     }
 
-    let resources = path.join("resources");
+    let resources = crate::utils::resources_dir(path);
     if resources.exists() && resources.is_dir() {
         if resources.join("app.asar").exists()
             || resources.join("app").exists()
             || resources.join("bin").exists()
+        {
+            return true;
+        }
+    }
+    // macOS .app bundle checks.
+    #[cfg(target_os = "macos")]
+    {
+        if path.extension().map_or(false, |ext| ext == "app") {
+            let contents = path.join("Contents");
+            if contents.exists()
+                && (contents.join("MacOS").exists() || contents.join("Resources").exists())
+            {
+                return true;
+            }
+        }
+        if path.join("Contents").join("MacOS").join("Antigravity").is_file()
+            || path.join("Contents").join("MacOS").join("Antigravity IDE").is_file()
+            || path.join("Contents").join("MacOS").join("Electron").is_file()
         {
             return true;
         }
@@ -148,12 +166,15 @@ pub fn resolve_install_root(raw: &Path) -> Option<PathBuf> {
     }
 
     let subfolder_candidates = [
+        "Antigravity IDE.app",
+        "Antigravity.app",
         "Antigravity IDE",
         "Antigravity",
         "agy",
         "Programs\\Antigravity IDE",
         "Programs\\Antigravity",
         "resources",
+        "Contents/Resources",
     ];
     for sub in subfolder_candidates {
         let candidate = p.join(sub);
@@ -193,13 +214,48 @@ fn standard_install_candidates() -> Vec<PathBuf> {
     ]
 }
 
+/// The macOS equivalents. Electron applications on macOS are packaged as .app bundles
+/// in /Applications or ~/Applications, while user data and CLI configs live under
+/// ~/Library/Application Support and ~/.local/bin or Homebrew (/opt/homebrew/bin).
+#[cfg(target_os = "macos")]
+fn standard_install_candidates() -> Vec<PathBuf> {
+    let home = env::var("HOME").unwrap_or_default();
+    let mut v: Vec<PathBuf> = Vec::new();
+    let apps_bases = ["/Applications", "/System/Applications"];
+    let app_names = [
+        "Antigravity.app",
+        "Antigravity IDE.app",
+        "antigravity.app",
+        "antigravity-ide.app",
+        "Antigravity",
+    ];
+    for base in apps_bases {
+        for name in app_names {
+            v.push(PathBuf::from(base).join(name));
+        }
+    }
+    if !home.is_empty() {
+        let h = PathBuf::from(&home);
+        v.push(h.join("Applications/Antigravity.app"));
+        v.push(h.join("Applications/Antigravity IDE.app"));
+        v.push(h.join("Library/Application Support/Antigravity"));
+        v.push(h.join("Library/Application Support/Antigravity IDE"));
+        v.push(h.join(".local/bin"));
+        v.push(h.join(".agy/bin"));
+        v.push(h.join(".agy"));
+    }
+    v.push(PathBuf::from("/opt/homebrew/bin"));
+    v.push(PathBuf::from("/usr/local/bin"));
+    v
+}
+
 /// The Linux equivalents. Antigravity ships as an Electron/VS Code fork, which on
 /// Linux lands in one of the system prefixes (`.deb` → `/usr/share` or `/opt`;
 /// tarball → `/opt` or under the home dir) with the language server at
 /// `resources/app/extensions/antigravity/bin/`. The CLI keeps a per-user `agy`
 /// tree. Anything not covered here is reachable through menu 2 (manual path),
 /// which is why this list can stay short rather than scanning the whole disk.
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 fn standard_install_candidates() -> Vec<PathBuf> {
     let home = env::var("HOME").unwrap_or_default();
     let mut v: Vec<PathBuf> = Vec::new();
@@ -233,7 +289,7 @@ fn standard_install_candidates() -> Vec<PathBuf> {
 }
 
 /// The directory holding the `agy` CLI, found via PATH first and then the common
-/// per-user/system bin dirs. Linux only; returns the dir (an install root once
+/// per-user/system bin dirs. Unix only; returns the dir (an install root once
 /// `agy` is in it), not the file.
 #[cfg(not(target_os = "windows"))]
 fn find_agy_dir() -> Option<PathBuf> {
@@ -244,6 +300,7 @@ fn find_agy_dir() -> Option<PathBuf> {
     }
     dirs.push(PathBuf::from(format!("{}/.local/bin", home)));
     dirs.push(PathBuf::from(format!("{}/.agy/bin", home)));
+    dirs.push(PathBuf::from("/opt/homebrew/bin"));
     dirs.push(PathBuf::from("/usr/local/bin"));
     dirs.push(PathBuf::from("/usr/bin"));
     // Never a snap dir: `/snap/bin/agy` is a read-only wrapper, not the real
@@ -261,10 +318,37 @@ fn is_snap_path(p: &Path) -> bool {
     p.starts_with("/snap") || p.starts_with("/var/lib/snapd")
 }
 
+/// Scans macOS applications and app support for any `*antigravity*` bundles or directories.
+#[cfg(target_os = "macos")]
+fn scan_antigravity_dirs() -> Vec<PathBuf> {
+    let home = env::var("HOME").unwrap_or_default();
+    let mut out = Vec::new();
+    let mut bases = vec!["/Applications".to_string()];
+    if !home.is_empty() {
+        bases.push(format!("{}/Applications", home));
+        bases.push(format!("{}/Library/Application Support", home));
+    }
+    for base in bases {
+        if let Ok(entries) = fs::read_dir(&base) {
+            for e in entries.flatten() {
+                let p = e.path();
+                let hit = p
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.to_lowercase().contains("antigravity"));
+                if hit && (p.is_dir() || p.extension().map_or(false, |ext| ext == "app")) {
+                    out.push(p);
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Scans the usual Linux prefixes for any `*antigravity*` directory, so an
 /// install whose name is not hardcoded is still found - the analogue of the
 /// Windows registry scan. Returns candidate roots to be resolved.
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 fn scan_antigravity_dirs() -> Vec<PathBuf> {
     let home = env::var("HOME").unwrap_or_default();
     let mut out = Vec::new();
@@ -387,7 +471,7 @@ fn process_install(install: &Path) -> Result<String, String> {
     // Patch all relevant binaries (Language Server / CLI).
     let bin_summary = patch_all_binaries(install);
 
-    let resources = install.join("resources");
+    let resources = crate::utils::resources_dir(install);
     let app_dir = resources.join("app");
     let app_asar = resources.join("app.asar");
 
@@ -423,6 +507,8 @@ fn process_install(install: &Path) -> Result<String, String> {
     let desktop_js = app_dir.join("dist").join("main.js");
 
     if ide_js.exists() {
+        // Re-scan and patch binaries that were newly unpacked from the archive
+        let _ = patch_all_binaries(install);
         patch_ide(install, &ide_js)?;
         if let Err(e) = patch_extension_js(install) {
             // Not reported per install: the progress line is one row wide, and
@@ -449,12 +535,26 @@ fn process_install(install: &Path) -> Result<String, String> {
                 e
             );
         }
+        #[cfg(target_os = "macos")]
+        if install.extension().map_or(false, |ext| ext == "app") {
+            let _ = std::process::Command::new("codesign")
+                .args(["--force", "--deep", "-s", "-"])
+                .arg(install)
+                .status();
+        }
         return Ok("Antigravity IDE".to_string());
     } else if desktop_js.exists() {
         let js_patched = patch_desktop(install, &desktop_js)?;
         if !js_patched {
             // v2.4+ unpacked by an older build of this tool: undo the unpack.
             restore_pristine_asar(&resources)?;
+        }
+        #[cfg(target_os = "macos")]
+        if install.extension().map_or(false, |ext| ext == "app") {
+            let _ = std::process::Command::new("codesign")
+                .args(["--force", "--deep", "-s", "-"])
+                .arg(install)
+                .status();
         }
         return Ok("Antigravity Desktop".to_string());
     } else if install.join("agy.exe").is_file() || install.join("agy").is_file() {
@@ -786,7 +886,7 @@ fn handle_revert_all() {
         // binary revert above cannot undo them; without this the full revert left
         // main.js patched (G25). Restores from the pristine backup patch_ide kept.
         n += patch_ide::unpatch_ide_js(inst);
-        if let Err(e) = restore_pristine_asar(&inst.join("resources")) {
+        if let Err(e) = restore_pristine_asar(&crate::utils::resources_dir(inst)) {
             println!("  \x1b[33m[ERR] {}\x1b[0m\x1b[92m", e);
         }
         if let Err(e) = endpoint::remove_ide(inst) {
@@ -1050,7 +1150,7 @@ fn install_label(install: &Path) -> &'static str {
     if install.join("agy.exe").is_file() || install.join("agy").is_file() {
         "Antigravity CLI"
     } else if install.join("Antigravity IDE.exe").exists()
-        || install.join("resources").join("app").join("out").exists()
+        || crate::utils::resources_dir(install).join("app").join("out").exists()
     {
         "Antigravity IDE"
     } else {

@@ -1,3 +1,4 @@
+#[cfg(windows)]
 extern crate winres;
 
 use sha2::{Digest, Sha256};
@@ -78,7 +79,7 @@ fn main() {
     let canary_src = fs::read_to_string("src/canary.rs").expect("src/canary.rs is missing");
     let seed = const_from_canary_rs(&canary_src, "CANARY_SEED");
     let sep = const_from_canary_rs(&canary_src, "CANARY_SEP");
-    let static_canary = const_from_canary_rs(&canary_src, "STATIC_CANARY");
+    let _static_canary = const_from_canary_rs(&canary_src, "STATIC_CANARY");
     let release_token = token_for(&seed, &sep, &version);
 
     // Emitted for canary.rs to include!(), so the token itself is a literal in
@@ -158,7 +159,8 @@ fn main() {
         relay, exits
     );
 
-    if env::var("CARGO_CFG_TARGET_OS").unwrap() == "windows" {
+    #[cfg(windows)]
+    if env::var("CARGO_CFG_TARGET_OS").unwrap_or_default() == "windows" {
         let mut res = winres::WindowsResource::new();
         res.set_icon("icon.ico");
         res.set("FileDescription", "Antigravity Configuration Tool");

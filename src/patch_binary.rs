@@ -97,7 +97,21 @@ fn write_atomic(bin_path: &Path, data: &[u8]) -> std::io::Result<()> {
     let mut tmp = bin_path.as_os_str().to_os_string();
     tmp.push(".agtmp");
     let tmp = PathBuf::from(tmp);
-    fs::write(&tmp, data)?;
+    let _ = fs::remove_file(&tmp);
+
+    #[cfg(target_os = "macos")]
+    crate::patch_ide::prepare_macos_target(bin_path);
+
+    if let Err(e) = fs::write(&tmp, data) {
+        #[cfg(target_os = "macos")]
+        {
+            crate::patch_ide::prepare_macos_target(bin_path);
+            fs::write(&tmp, data)?;
+        }
+        #[cfg(not(target_os = "macos"))]
+        return Err(e);
+    }
+
     // On Unix a fresh temp file is created 0644, and renaming it over the language
     // server would strip the execute bit - a non-executable binary the app then
     // cannot launch. Copy the original's mode onto the temp before the rename so
@@ -111,13 +125,46 @@ fn write_atomic(bin_path: &Path, data: &[u8]) -> std::io::Result<()> {
             .unwrap_or(0o755);
         let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(mode));
     }
-    match fs::rename(&tmp, bin_path) {
+    let res = match fs::rename(&tmp, bin_path) {
         Ok(()) => Ok(()),
         Err(e) => {
-            let _ = fs::remove_file(&tmp);
-            Err(e)
+            #[cfg(target_os = "macos")]
+            {
+                crate::patch_ide::prepare_macos_target(bin_path);
+                if fs::rename(&tmp, bin_path).is_ok() {
+                    Ok(())
+                } else {
+                    let _ = fs::remove_file(&tmp);
+                    Err(e)
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = fs::remove_file(&tmp);
+                Err(e)
+            }
+        }
+    };
+
+    if res.is_ok() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(bin_path, fs::Permissions::from_mode(0o755));
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            // Re-sign the modified binary with ad-hoc signature so Apple Silicon / ARM64
+            // doesn't kill it with SIGKILL upon execution (code signing violation).
+            let _ = std::process::Command::new("codesign")
+                .args(["--force", "-s", "-"])
+                .arg(bin_path)
+                .status();
         }
     }
+
+    res
 }
 
 fn rewrite(bin_path: &Path, from: &str, to: &str) -> Result<usize, String> {
@@ -213,9 +260,9 @@ pub fn repatch_if_needed(bin_path: &Path) -> RepatchOutcome {
 /// `language_server*` file - whatever the exact suffix, the signature scan then
 /// decides whether it is really a target.
 pub fn binary_targets(inst: &Path) -> Vec<PathBuf> {
-    let resources_bin = inst.join("resources").join("bin");
-    let ext_bin = inst
-        .join("resources")
+    let res = crate::utils::resources_dir(inst);
+    let resources_bin = res.join("bin");
+    let ext_bin = res
         .join("app")
         .join("extensions")
         .join("antigravity")
@@ -232,6 +279,13 @@ pub fn binary_targets(inst: &Path) -> Vec<PathBuf> {
         ext_bin.join("language_server_windows_x64.exe"),
         ext_bin.join("language_server.exe"),
     ];
+
+    #[cfg(target_os = "macos")]
+    {
+        let macos_dir = inst.join("Contents").join("MacOS");
+        targets.push(macos_dir.join("agy"));
+        targets.push(macos_dir.join("language_server"));
+    }
 
     // Any other `language_server*` in the two bin dirs - catches the Linux/macOS
     // platform-suffixed names (`language_server_linux_x64`, `..._darwin_arm64`, …)
@@ -307,7 +361,7 @@ fn kill_platform_processes() {
 fn kill_platform_processes() {
     // -f matches against the whole command line, so a full install path still
     // matches; the patterns are the binary basenames the patcher targets.
-    let patterns = ["language_server", "/agy"];
+    let patterns = ["language_server", "/agy", "Antigravity CLI"];
     for pat in patterns.iter() {
         Command::new("pkill")
             .args(["-f", pat])

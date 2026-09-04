@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.antigravity.proxy</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/Shared/agunlocker/ag_proxy</string>
+        <string>--proxy</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>/tmp/agunlocker_proxy.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/agunlocker_proxy.err</string>
+</dict>
+</plist>

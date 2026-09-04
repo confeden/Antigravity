@@ -55,7 +55,7 @@ pub enum Outcome {
 /// Derived from `product.json` rather than hardcoded: the folder is named after
 /// `nameShort`, so a rebranded or renamed build still resolves correctly.
 pub fn ide_settings_path(install: &Path) -> Option<PathBuf> {
-    let product = install.join("resources").join("app").join("product.json");
+    let product = crate::utils::resources_dir(install).join("app").join("product.json");
     let text = fs::read_to_string(product).ok()?;
     let name = Regex::new(r#""nameShort"\s*:\s*"([^"]+)""#)
         .ok()?
@@ -63,11 +63,24 @@ pub fn ide_settings_path(install: &Path) -> Option<PathBuf> {
         .get(1)?
         .as_str()
         .to_string();
-    // The user-config root is `%APPDATA%` on Windows and `~/.config` on Linux -
-    // the same VS Code layout underneath (`<root>/<nameShort>/User/settings.json`).
+    // The user-config root is `%APPDATA%` on Windows, `~/Library/Application Support` on macOS,
+    // and `~/.config` on Linux - the same VS Code layout underneath (`<root>/<nameShort>/User/settings.json`).
     #[cfg(target_os = "windows")]
     let root = PathBuf::from(std::env::var("APPDATA").ok()?);
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
+    let root = {
+        let home = if let Ok(user) = std::env::var("SUDO_USER") {
+            if !user.is_empty() && user != "root" {
+                format!("/Users/{}", user)
+            } else {
+                std::env::var("HOME").ok()?
+            }
+        } else {
+            std::env::var("HOME").ok()?
+        };
+        PathBuf::from(home).join("Library").join("Application Support")
+    };
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
     let root = {
         // An empty XDG_CONFIG_HOME (elevation can pass it through blank) is "unset",
         // not a relative root - fall back to ~/.config in that case.
@@ -225,7 +238,27 @@ pub fn apply_proxy(url: &str, ca_path: &str) -> Result<Outcome, String> {
 /// a freshly-launched app inherits it **without a full re-login** - the user only
 /// has to quit and reopen Antigravity. Lower-case aliases too, since Go reads
 /// `HTTPS_PROXY` but other tooling reads `https_proxy`.
-#[cfg(not(target_os = "windows"))]
+/// On macOS, sets environment variables for GUI apps and user sessions using launchctl.
+#[cfg(target_os = "macos")]
+pub fn apply_proxy(url: &str, _ca_path: &str) -> Result<Outcome, String> {
+    for (k, v) in [
+        (PROXY_ENV_VAR, url),
+        ("https_proxy", url),
+        (NO_PROXY_ENV_VAR, NO_PROXY_VALUE),
+        ("no_proxy", NO_PROXY_VALUE),
+    ] {
+        crate::utils::run_macos_launchctl(&["setenv", k, v]);
+    }
+    Ok(Outcome::Applied)
+}
+
+/// The Linux path uses **two** mechanisms so the language server the IDE spawns
+/// sees the proxy: a `~/.config/environment.d` drop-in makes it survive a reboot,
+/// and `systemctl --user set-environment` sets it in the running user manager, so
+/// a freshly-launched app inherits it **without a full re-login** - the user only
+/// has to quit and reopen Antigravity. Lower-case aliases too, since Go reads
+/// `HTTPS_PROXY` but other tooling reads `https_proxy`.
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 pub fn apply_proxy(url: &str, _ca_path: &str) -> Result<Outcome, String> {
     use std::process::Command;
     let path = environment_d_path()?;
@@ -259,7 +292,7 @@ pub fn apply_proxy(url: &str, _ca_path: &str) -> Result<Outcome, String> {
 }
 
 /// `~/.config/environment.d/ag-unlocker.conf`, honouring `XDG_CONFIG_HOME`.
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 fn environment_d_path() -> Result<PathBuf, String> {
     let base = match std::env::var("XDG_CONFIG_HOME") {
         Ok(x) if !x.is_empty() => PathBuf::from(x),
@@ -301,10 +334,19 @@ pub fn remove_proxy(url: &str, ca_path: &str) -> Result<(), String> {
     }
 }
 
+/// macOS: unsets proxy environment variables using launchctl.
+#[cfg(target_os = "macos")]
+pub fn remove_proxy(_url: &str, _ca_path: &str) -> Result<(), String> {
+    for k in [PROXY_ENV_VAR, "https_proxy", NO_PROXY_ENV_VAR, "no_proxy"] {
+        crate::utils::run_macos_launchctl(&["unsetenv", k]);
+    }
+    Ok(())
+}
+
 /// Linux: delete the `environment.d` drop-in and unset the live session vars.
 /// Only ever removes our own file, so a proxy the user set another way is left
 /// alone (the file path is ours by construction).
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 pub fn remove_proxy(_url: &str, _ca_path: &str) -> Result<(), String> {
     use std::process::Command;
     if let Ok(path) = environment_d_path() {
@@ -412,7 +454,21 @@ fn profile_root() -> Option<PathBuf> {
     std::env::var("APPDATA").ok().map(PathBuf::from)
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "macos")]
+fn profile_root() -> Option<PathBuf> {
+    let home = if let Ok(user) = std::env::var("SUDO_USER") {
+        if !user.is_empty() && user != "root" {
+            format!("/Users/{}", user)
+        } else {
+            std::env::var("HOME").ok()?
+        }
+    } else {
+        std::env::var("HOME").ok()?
+    };
+    Some(PathBuf::from(home).join("Library").join("Application Support"))
+}
+
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 fn profile_root() -> Option<PathBuf> {
     match std::env::var("XDG_CONFIG_HOME") {
         Ok(x) if !x.is_empty() => Some(PathBuf::from(x)),

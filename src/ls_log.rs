@@ -175,9 +175,23 @@ fn profile_root() -> Option<PathBuf> {
     std::env::var("APPDATA").ok().map(PathBuf::from)
 }
 
+#[cfg(target_os = "macos")]
+fn profile_root() -> Option<PathBuf> {
+    let home = if let Ok(user) = std::env::var("SUDO_USER") {
+        if !user.is_empty() && user != "root" {
+            format!("/Users/{}", user)
+        } else {
+            std::env::var("HOME").ok()?
+        }
+    } else {
+        std::env::var("HOME").ok()?
+    };
+    Some(PathBuf::from(home).join("Library").join("Application Support"))
+}
+
 /// Linux keeps the same layout under `~/.config`; nothing tails it there yet
 /// because the DNS layer it would steer is not ported, but the path is right.
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 fn profile_root() -> Option<PathBuf> {
     match std::env::var("XDG_CONFIG_HOME") {
         Ok(x) if !x.is_empty() => Some(PathBuf::from(x)),

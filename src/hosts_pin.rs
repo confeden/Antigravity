@@ -18,6 +18,12 @@ use std::path::PathBuf;
 const BEGIN: &str = "# AG_UNLOCKER_HOSTS_BEGIN";
 const END: &str = "# AG_UNLOCKER_HOSTS_END";
 
+#[cfg(target_os = "windows")]
+const EOL: &str = "\r\n";
+#[cfg(not(target_os = "windows"))]
+const EOL: &str = "\n";
+
+#[cfg(target_os = "windows")]
 pub fn hosts_path() -> PathBuf {
     let root = env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
     PathBuf::from(root)
@@ -27,20 +33,26 @@ pub fn hosts_path() -> PathBuf {
         .join("hosts")
 }
 
+#[cfg(not(target_os = "windows"))]
+pub fn hosts_path() -> PathBuf {
+    PathBuf::from("/etc/hosts")
+}
+
 fn render_block(entries: &[(String, Ipv4Addr)]) -> String {
     // The markers carry the canaries: unlike the binary, this file is readable
     // on a victim machine without access to the tool that wrote it.
     let mut out = format!(
-        "{} {} {}\r\n",
+        "{} {} {}{}",
         BEGIN,
         crate::canary::STATIC_CANARY,
-        crate::canary::RELEASE_TOKEN
+        crate::canary::RELEASE_TOKEN,
+        EOL
     );
     for (host, ip) in entries {
-        out.push_str(&format!("{} {}\r\n", ip, host));
+        out.push_str(&format!("{} {}{}", ip, host, EOL));
     }
     out.push_str(END);
-    out.push_str("\r\n");
+    out.push_str(EOL);
     out
 }
 
@@ -68,7 +80,7 @@ fn replace_block(existing: &str, block: Option<&str>) -> String {
     let mut out: String = kept.concat();
     if let Some(block) = block {
         if !out.is_empty() && !out.ends_with('\n') {
-            out.push_str("\r\n");
+            out.push_str(EOL);
         }
         out.push_str(block);
     }

@@ -222,8 +222,7 @@ fn repatch(target: &Path) -> RepatchOutcome {
 /// touched; only the IDE's `out/main.js` is.
 fn targets(inst: &Path) -> Vec<PathBuf> {
     let mut list = patch_binary::binary_targets(inst);
-    let ide_js = inst
-        .join("resources")
+    let ide_js = crate::utils::resources_dir(inst)
         .join("app")
         .join("out")
         .join("main.js");

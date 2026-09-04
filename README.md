@@ -1,6 +1,9 @@
 # Antigravity в России без VPN и смены региона аккаунта Google.
 
-Программа для windows и linux, которая позволяет аккаунту Google любой страны (в том числе России) использовать Antigravity.
+Программа для **Windows, macOS и Linux**, которая позволяет аккаунту Google любой страны (в том числе России) использовать Antigravity.
+
+* 🍏 **Инструкция для macOS**: [macos/README.md](macos/README.md) — установка в одну команду, поддержка Apple Silicon (M1-M4) и Intel.
+* 🐧 **Инструкция для Linux**: [linux/README.md](linux/README.md).
 
 Видеоинструкция: https://youtu.be/aybWT_7wtqA
 

@@ -18,14 +18,19 @@ webpki-roots = "1"
 # private src/relay.rs is the only user).
 aes-gcm = "0.10"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [build-dependencies]
-winres = "0.1"
 # build.rs derives the per-release canary with the same formula as canary.rs.
 sha2 = "0.10"
 hex = "0.4"
 # Encrypt the relay credential into the binary with a random per-build key.
 aes-gcm = "0.10"
 getrandom = "0.2"
+
+[target.'cfg(windows)'.build-dependencies]
+winres = "0.1"
 
 [profile.release]
 opt-level = "z"

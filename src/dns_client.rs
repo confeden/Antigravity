@@ -61,10 +61,37 @@ mod sys {
     }
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "macos")]
+mod sys {
+    const IPPROTO_IP: i32 = 0;
+    const IP_BOUND_IF: i32 = 25;
+
+    pub fn bind_socket_to_interface(
+        sock: &std::net::UdpSocket,
+        if_index: u32,
+    ) -> Result<(), String> {
+        use std::os::unix::io::AsRawFd;
+        let rc = unsafe {
+            libc::setsockopt(
+                sock.as_raw_fd(),
+                IPPROTO_IP,
+                IP_BOUND_IF,
+                &if_index as *const u32 as *const libc::c_void,
+                std::mem::size_of::<u32>() as libc::socklen_t,
+            )
+        };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err("не удалось привязать сокет к интерфейсу (IP_BOUND_IF)".to_string())
+        }
+    }
+}
+
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 mod sys {
     pub fn bind_socket_to_interface(_: &std::net::UdpSocket, _: u32) -> Result<(), String> {
-        Err("поддерживается только на Windows".to_string())
+        Err("поддерживается только на Windows и macOS".to_string())
     }
 }
 
