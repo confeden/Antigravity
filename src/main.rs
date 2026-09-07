@@ -24,6 +24,7 @@ mod canary;
 mod console_style;
 pub mod detector;
 mod dns;
+pub mod tray;
 mod dns_client;
 mod dns_forwarder;
 mod doh;
@@ -801,7 +802,7 @@ fn remove_legacy_ca() {
 
 /// Full revert: undoes the binary patch, puts app.asar back and drops the DNS
 /// rules, so the machine returns to its pre-patch state without reinstalling.
-fn handle_revert_all() {
+pub fn handle_revert_all() {
     clear_screen();
     println!("{}", APP_TITLE);
     println!();
@@ -1274,6 +1275,23 @@ fn main() {
         return;
     }
 
+    // Fluent Win32 System Tray standalone mode (`--tray`): detaches the console,
+    // ensures the background proxy listener is active, and runs the native tray message pump.
+    if env::args().any(|a| a == "--tray" || a == "-tray") {
+        dns_forwarder::detach_console();
+        if !proxy::listener_answers() {
+            thread::spawn(move || {
+                let _ = proxy::run(0);
+            });
+            watchdog::start();
+        }
+        if let Err(e) = tray::run_tray_standalone() {
+            eprintln!("tray: {}", e);
+            std::process::exit(1);
+        }
+        return;
+    }
+
     // `--about` / `--license` / `--version`: prints the copyright notice and the
     // build canaries, then exits. Deliberately before the key prompt so any
     // binary can be fingerprinted without a licence key.
@@ -1294,6 +1312,12 @@ fn main() {
     }
 
     login_screen();
+
+    // Spawn background Fluent System Tray thread in interactive console mode
+    #[cfg(target_os = "windows")]
+    {
+        let _ = tray::spawn_tray_thread();
+    }
 
     // The NRPT rules survive a reboot; the host routes that keep their queries
     // off the VPN only survive it while the network stays the same. Windows-only:
