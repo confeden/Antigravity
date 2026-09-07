@@ -3,8 +3,6 @@ use std::path::{Path, PathBuf};
 
 use regex::Regex;
 
-use crate::utils::powershell;
-
 // Which CloudCode host the client talks to, and why that is the whole fix.
 //
 // The region gate lives on the CloudCode API. `cloudcode-pa.googleapis.com` was
@@ -172,12 +170,7 @@ pub fn remove_cli() -> Result<(), String> {
     if current_cli_endpoint().as_deref() != Some(DAILY_ENDPOINT) {
         return Ok(());
     }
-    let script = format!(
-        "[Environment]::SetEnvironmentVariable('{}',$null,'User')",
-        CLI_ENV_VAR
-    );
-    powershell(&script).ok_or_else(|| "не удалось удалить переменную среды".to_string())?;
-    Ok(())
+    set_env(CLI_ENV_VAR, None)
 }
 
 /// Variables that point a Go client at the local fallback proxy.
@@ -457,12 +450,7 @@ pub fn remove_proxy_if_ours(_url: &str, _ca_path: &str) -> Result<bool, String> 
 
 #[cfg(target_os = "windows")]
 fn current_env_in(name: &str, scope: &str) -> Option<String> {
-    let out = powershell(&format!(
-        "[Environment]::GetEnvironmentVariable('{}','{}')",
-        name, scope
-    ))?;
-    let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (!value.is_empty()).then_some(value)
+    win_env::get_env(name, scope)
 }
 
 /// Whether an `HTTPS_PROXY` value is one this tool wrote.
@@ -510,17 +498,158 @@ pub fn clear_node_ca(ca_path: &str) -> Result<(), String> {
 }
 
 #[cfg(target_os = "windows")]
+mod win_env {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr;
+    use windows_sys::Win32::Foundation::*;
+    use windows_sys::Win32::System::Registry::*;
+    use windows_sys::Win32::UI::WindowsAndMessaging::*;
+
+    fn to_wide(s: &str) -> Vec<u16> {
+        OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
+    }
+
+    pub fn get_env(name: &str, scope: &str) -> Option<String> {
+        unsafe {
+            let is_machine = scope.eq_ignore_ascii_case("machine");
+            let root = if is_machine {
+                HKEY_LOCAL_MACHINE
+            } else {
+                HKEY_CURRENT_USER
+            };
+            let subkey = if is_machine {
+                "System\\CurrentControlSet\\Control\\Session Manager\\Environment"
+            } else {
+                "Environment"
+            };
+
+            let mut hkey: HKEY = 0;
+            if RegOpenKeyExW(root, to_wide(subkey).as_ptr(), 0, KEY_READ, &mut hkey) != ERROR_SUCCESS {
+                return None;
+            }
+
+            let wide_name = to_wide(name);
+            let mut val_type: u32 = 0;
+            let mut size: u32 = 0;
+
+            let status = RegQueryValueExW(
+                hkey,
+                wide_name.as_ptr(),
+                ptr::null_mut(),
+                &mut val_type,
+                ptr::null_mut(),
+                &mut size,
+            );
+            if status != ERROR_SUCCESS || size == 0 {
+                RegCloseKey(hkey);
+                return None;
+            }
+
+            let num_u16 = (size as usize + 1) / 2;
+            let mut buffer: Vec<u16> = vec![0; num_u16];
+            let status = RegQueryValueExW(
+                hkey,
+                wide_name.as_ptr(),
+                ptr::null_mut(),
+                &mut val_type,
+                buffer.as_mut_ptr() as *mut u8,
+                &mut size,
+            );
+            RegCloseKey(hkey);
+
+            if status != ERROR_SUCCESS {
+                return None;
+            }
+
+            if val_type != REG_SZ && val_type != REG_EXPAND_SZ {
+                return None;
+            }
+
+            let len = (size as usize) / 2;
+            let slice = &buffer[..len];
+            let end = slice.iter().position(|&c| c == 0).unwrap_or(slice.len());
+            let val = String::from_utf16_lossy(&slice[..end]).trim().to_string();
+            (!val.is_empty()).then_some(val)
+        }
+    }
+
+    pub fn set_env(name: &str, value: Option<&str>) -> Result<(), String> {
+        unsafe {
+            let subkey = to_wide("Environment");
+            let wide_name = to_wide(name);
+            let mut hkey: HKEY = 0;
+
+            match value {
+                Some(val) => {
+                    let status = RegCreateKeyW(
+                        HKEY_CURRENT_USER,
+                        subkey.as_ptr(),
+                        &mut hkey,
+                    );
+                    if status != ERROR_SUCCESS {
+                        return Err(format!("не удалось открыть HKCU\\Environment: {}", status));
+                    }
+
+                    let wide_val = to_wide(val);
+                    let byte_len = (wide_val.len() * 2) as u32;
+                    let set_status = RegSetValueExW(
+                        hkey,
+                        wide_name.as_ptr(),
+                        0,
+                        REG_SZ,
+                        wide_val.as_ptr() as *const u8,
+                        byte_len,
+                    );
+                    RegCloseKey(hkey);
+
+                    if set_status != ERROR_SUCCESS {
+                        return Err(format!("не удалось записать {}: {}", name, set_status));
+                    }
+                }
+                None => {
+                    let status = RegOpenKeyExW(
+                        HKEY_CURRENT_USER,
+                        subkey.as_ptr(),
+                        0,
+                        KEY_SET_VALUE,
+                        &mut hkey,
+                    );
+                    if status == ERROR_SUCCESS {
+                        let del_status = RegDeleteValueW(hkey, wide_name.as_ptr());
+                        RegCloseKey(hkey);
+                        if del_status != ERROR_SUCCESS && del_status != ERROR_FILE_NOT_FOUND {
+                            return Err(format!("не удалось удалить {}: {}", name, del_status));
+                        }
+                    }
+                }
+            }
+
+            broadcast_setting_change();
+            Ok(())
+        }
+    }
+
+    pub fn broadcast_setting_change() {
+        unsafe {
+            let env_str = to_wide("Environment");
+            let mut result: usize = 0;
+            SendMessageTimeoutW(
+                HWND_BROADCAST,
+                WM_SETTINGCHANGE,
+                0,
+                env_str.as_ptr() as isize,
+                SMTO_ABORTIFHUNG,
+                5000,
+                &mut result,
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
 fn set_env(name: &str, value: Option<&str>) -> Result<(), String> {
-    let literal = match value {
-        Some(v) => format!("'{}'", v),
-        None => "$null".to_string(),
-    };
-    let script = format!(
-        "[Environment]::SetEnvironmentVariable('{}',{},'User')",
-        name, literal
-    );
-    powershell(&script).ok_or_else(|| format!("не удалось записать {}", name))?;
-    Ok(())
+    win_env::set_env(name, value)
 }
 
 /// Persisting a per-user environment variable for GUI-launched processes on
@@ -542,12 +671,7 @@ fn set_env(name: &str, value: Option<&str>) -> Result<(), String> {
 
 #[cfg(target_os = "windows")]
 fn current_env(name: &str) -> Option<String> {
-    let out = powershell(&format!(
-        "[Environment]::GetEnvironmentVariable('{}','User')",
-        name
-    ))?;
-    let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (!value.is_empty()).then_some(value)
+    win_env::get_env(name, "User")
 }
 
 /// We manage no persistent user-env store on Linux yet, so there is nothing of
@@ -560,12 +684,7 @@ fn current_env(_name: &str) -> Option<String> {
 
 #[cfg(target_os = "windows")]
 fn current_cli_endpoint() -> Option<String> {
-    let out = powershell(&format!(
-        "[Environment]::GetEnvironmentVariable('{}','User')",
-        CLI_ENV_VAR
-    ))?;
-    let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (!value.is_empty()).then_some(value)
+    current_env(CLI_ENV_VAR)
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -793,5 +912,23 @@ mod tests {
             "unexpected shape: {}",
             path.display()
         );
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn win_registry_env_round_trip() {
+        let test_var = "AG_UNLOCKER_TEST_VAR_R2";
+        let test_val = "http://127.0.0.1:9999";
+        // Clean up beforehand
+        let _ = set_env(test_var, None);
+        assert_eq!(current_env(test_var), None);
+
+        // Set value
+        set_env(test_var, Some(test_val)).expect("set_env succeeds");
+        assert_eq!(current_env(test_var).as_deref(), Some(test_val));
+
+        // Delete value
+        set_env(test_var, None).expect("delete succeeds");
+        assert_eq!(current_env(test_var), None);
     }
 }

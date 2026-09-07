@@ -11,10 +11,7 @@
 //! third party we chose for them. It is asked for once, in menu 1, and may be
 //! skipped with Enter.
 //!
-//! HTTP CONNECT only. That is what proxy clients in this space overwhelmingly
-//! speak, it is the one protocol the rest of this file already implements for
-//! the relay, and guessing wrong about SOCKS would fail in a way a user cannot
-//! read. The prompt says so plainly.
+//! Supports HTTP CONNECT and SOCKS5 / SOCKS5h upstream proxies (RFC 1928, RFC 1929).
 
 use std::fs;
 use std::io::{Read, Write};
@@ -196,9 +193,18 @@ impl Route {
 /// The user's own proxy, as a route. Built-in exits carry one of these each.
 pub static OWN: Route = Route::new("свой прокси", crate::routes::Kind::Own);
 
-/// A user-supplied HTTP CONNECT proxy.
+/// The protocol kind for user upstream proxy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProxyKind {
+    Http,
+    Socks5,
+    Socks5h,
+}
+
+/// A user-supplied HTTP CONNECT or SOCKS5 upstream proxy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Upstream {
+    pub kind: ProxyKind,
     pub host: String,
     pub port: u16,
     /// `user:pass`, already joined; `None` when the proxy needs no credential.
@@ -210,20 +216,48 @@ impl Upstream {
     /// not need to see again and which has no business being on screen or in a
     /// screenshot attached to a bug report.
     pub fn display(&self) -> String {
+        let prefix = match self.kind {
+            ProxyKind::Http => "",
+            ProxyKind::Socks5 => "socks5://",
+            ProxyKind::Socks5h => "socks5h://",
+        };
+        let host_disp = if self.host.contains(':') && !self.host.starts_with('[') {
+            format!("[{}]", self.host)
+        } else {
+            self.host.clone()
+        };
         match &self.auth {
             Some(a) => {
                 let user = a.split(':').next().unwrap_or("");
-                format!("{}:{}@{}:{}", user, "***", self.host, self.port)
+                format!("{}{}:***@{}:{}", prefix, user, host_disp, self.port)
             }
-            None => format!("{}:{}", self.host, self.port),
+            None => format!("{}{}:{}", prefix, host_disp, self.port),
         }
     }
 
     fn as_line(&self) -> String {
+        let prefix = match self.kind {
+            ProxyKind::Http => "",
+            ProxyKind::Socks5 => "socks5://",
+            ProxyKind::Socks5h => "socks5h://",
+        };
+        let host_disp = if self.host.contains(':') && !self.host.starts_with('[') {
+            format!("[{}]", self.host)
+        } else {
+            self.host.clone()
+        };
         match &self.auth {
-            Some(a) => format!("{}@{}:{}", a, self.host, self.port),
-            None => format!("{}:{}", self.host, self.port),
+            Some(a) => format!("{}{}@{}:{}", prefix, a, host_disp, self.port),
+            None => format!("{}{}:{}", prefix, host_disp, self.port),
         }
+    }
+}
+
+fn strip_prefix_ignore_case<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    if s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix) {
+        Some(&s[prefix.len()..])
+    } else {
+        None
     }
 }
 
@@ -238,23 +272,46 @@ pub fn parse(input: &str) -> Result<Upstream, String> {
     if raw.is_empty() {
         return Err("пустая строка".to_string());
     }
-    let rest = raw
-        .strip_prefix("http://")
-        .or_else(|| raw.strip_prefix("https://"))
-        .unwrap_or(raw);
-    if rest.contains("://") {
-        return Err("поддерживается только HTTP-прокси (http://…)".to_string());
+
+    let (kind, rest) = if let Some(stripped) = strip_prefix_ignore_case(raw, "socks5h://") {
+        (ProxyKind::Socks5h, stripped)
+    } else if let Some(stripped) = strip_prefix_ignore_case(raw, "socks5://") {
+        (ProxyKind::Socks5, stripped)
+    } else if let Some(stripped) = strip_prefix_ignore_case(raw, "http://") {
+        (ProxyKind::Http, stripped)
+    } else if let Some(stripped) = strip_prefix_ignore_case(raw, "https://") {
+        (ProxyKind::Http, stripped)
+    } else if raw.contains("://") {
+        return Err("неподдерживаемый протокол прокси (поддерживаются http://, socks5://, socks5h://)".to_string());
+    } else {
+        (ProxyKind::Http, raw)
+    };
+
+    let rest = rest.trim();
+    if rest.is_empty() {
+        return Err("не указан адрес".to_string());
     }
+
     // Split on the LAST '@': a password may contain one, a hostname may not.
     let (auth, hostport) = match rest.rsplit_once('@') {
         Some((a, hp)) => {
-            if !a.contains(':') {
+            let Some((user, pass)) = a.split_once(':') else {
                 return Err("логин без пароля — нужно логин:пароль@хост:порт".to_string());
+            };
+            if user.is_empty() {
+                return Err("пустой логин".to_string());
+            }
+            if user.len() > 255 {
+                return Err("длина логина превышает 255 байт".to_string());
+            }
+            if pass.len() > 255 {
+                return Err("длина пароля превышает 255 байт".to_string());
             }
             (Some(a.to_string()), hp)
         }
         None => (None, rest),
     };
+
     let hostport = hostport.trim_end_matches('/');
     let (host, port) = hostport
         .rsplit_once(':')
@@ -270,6 +327,7 @@ pub fn parse(input: &str) -> Result<Upstream, String> {
         return Err("порт не может быть 0".to_string());
     }
     Ok(Upstream {
+        kind,
         host: host.to_string(),
         port,
         auth,
@@ -382,6 +440,221 @@ fn connect_within_budget(host: &str, port: u16, deadline: Instant) -> Result<Tcp
 /// `budget` covers the **whole** step - resolve, connect and read the answer -
 /// because that is the thing a waiting client experiences. Bounding each part
 /// separately is how three seconds of patience turns into fifteen (I43).
+fn socks5_connect(
+    sock: &mut TcpStream,
+    up: &Upstream,
+    target_host: &str,
+    target_port: u16,
+    deadline: Instant,
+) -> Result<(), String> {
+    let check_deadline = || -> Result<Duration, String> {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            Err("прокси не ответил вовремя".to_string())
+        } else {
+            Ok(left)
+        }
+    };
+
+    // --- Phase 1: Method Greeting ---
+    let left = check_deadline()?;
+    sock.set_read_timeout(Some(left)).ok();
+    sock.set_write_timeout(Some(left)).ok();
+
+    if up.auth.is_some() {
+        // Offer NO AUTH (0x00) and USERNAME/PASSWORD (0x02)
+        sock.write_all(&[0x05, 0x02, 0x00, 0x02])
+            .map_err(|e| format!("не отправить приветствие SOCKS: {}", e))?;
+    } else {
+        // Offer only NO AUTH (0x00)
+        sock.write_all(&[0x05, 0x01, 0x00])
+            .map_err(|e| format!("не отправить приветствие SOCKS: {}", e))?;
+    }
+
+    let mut method_reply = [0u8; 2];
+    sock.read_exact(&mut method_reply)
+        .map_err(|e| format!("прокси закрыл соединение: {}", e))?;
+
+    if method_reply[0] != 0x05 {
+        return Err("неверная версия SOCKS-сервера".to_string());
+    }
+
+    match method_reply[1] {
+        0x00 => {
+            // No authentication required
+        }
+        0x02 => {
+            // Username/Password authentication (RFC 1929)
+            let Some(ref auth) = up.auth else {
+                return Err("прокси требует логин и пароль".to_string());
+            };
+            let (user, pass) = auth.split_once(':').unwrap_or((auth.as_str(), ""));
+            let u_bytes = user.as_bytes();
+            let p_bytes = pass.as_bytes();
+            if u_bytes.len() > 255 || p_bytes.len() > 255 {
+                return Err("логин или пароль превышает 255 байт".to_string());
+            }
+
+            let left = check_deadline()?;
+            sock.set_read_timeout(Some(left)).ok();
+            sock.set_write_timeout(Some(left)).ok();
+
+            let mut auth_req = Vec::with_capacity(3 + u_bytes.len() + p_bytes.len());
+            auth_req.push(0x01); // RFC 1929 subnegotiation version 1
+            auth_req.push(u_bytes.len() as u8);
+            auth_req.extend_from_slice(u_bytes);
+            auth_req.push(p_bytes.len() as u8);
+            auth_req.extend_from_slice(p_bytes);
+
+            sock.write_all(&auth_req)
+                .map_err(|e| format!("ошибка отправки аутентификации SOCKS: {}", e))?;
+
+            let mut auth_reply = [0u8; 2];
+            sock.read_exact(&mut auth_reply)
+                .map_err(|e| format!("нет ответа аутентификации SOCKS: {}", e))?;
+
+            if auth_reply[0] != 0x01 {
+                return Err("неверная версия ответа аутентификации SOCKS".to_string());
+            }
+            if auth_reply[1] != 0x00 {
+                return Err(format!(
+                    "неверный логин или пароль SOCKS-прокси (статус 0x{:02X})",
+                    auth_reply[1]
+                ));
+            }
+        }
+        0xFF => {
+            return Err("прокси отклонил методы аутентификации (0xFF)".to_string());
+        }
+        other => {
+            return Err(format!(
+                "неподдерживаемый метод аутентификации SOCKS: 0x{:02X}",
+                other
+            ));
+        }
+    }
+
+    // --- Phase 2: CONNECT Request ---
+    let left = check_deadline()?;
+    sock.set_read_timeout(Some(left)).ok();
+    sock.set_write_timeout(Some(left)).ok();
+
+    let mut connect_req = vec![0x05, 0x01, 0x00];
+
+    if up.kind == ProxyKind::Socks5 {
+        if let Ok(ip) = target_host.parse::<std::net::Ipv4Addr>() {
+            connect_req.push(0x01);
+            connect_req.extend_from_slice(&ip.octets());
+        } else if let Ok(ip) = target_host.parse::<std::net::Ipv6Addr>() {
+            connect_req.push(0x04);
+            connect_req.extend_from_slice(&ip.octets());
+        } else if let Ok(mut addrs) = (target_host, target_port).to_socket_addrs() {
+            if let Some(addr) = addrs.next() {
+                match addr.ip() {
+                    std::net::IpAddr::V4(v4) => {
+                        connect_req.push(0x01);
+                        connect_req.extend_from_slice(&v4.octets());
+                    }
+                    std::net::IpAddr::V6(v6) => {
+                        connect_req.push(0x04);
+                        connect_req.extend_from_slice(&v6.octets());
+                    }
+                }
+            } else {
+                if target_host.len() > 255 {
+                    return Err("имя хоста превышает 255 байт".to_string());
+                }
+                connect_req.push(0x03);
+                connect_req.push(target_host.len() as u8);
+                connect_req.extend_from_slice(target_host.as_bytes());
+            }
+        } else {
+            if target_host.len() > 255 {
+                return Err("имя хоста превышает 255 байт".to_string());
+            }
+            connect_req.push(0x03);
+            connect_req.push(target_host.len() as u8);
+            connect_req.extend_from_slice(target_host.as_bytes());
+        }
+    } else {
+        // Socks5h: Remote proxy-side resolution
+        if let Ok(ip) = target_host.parse::<std::net::Ipv4Addr>() {
+            connect_req.push(0x01);
+            connect_req.extend_from_slice(&ip.octets());
+        } else if let Ok(ip) = target_host.parse::<std::net::Ipv6Addr>() {
+            connect_req.push(0x04);
+            connect_req.extend_from_slice(&ip.octets());
+        } else {
+            if target_host.len() > 255 {
+                return Err("имя хоста превышает 255 байт".to_string());
+            }
+            connect_req.push(0x03);
+            connect_req.push(target_host.len() as u8);
+            connect_req.extend_from_slice(target_host.as_bytes());
+        }
+    }
+    connect_req.extend_from_slice(&target_port.to_be_bytes());
+
+    sock.write_all(&connect_req)
+        .map_err(|e| format!("не отправить SOCKS CONNECT: {}", e))?;
+
+    // --- Phase 3: SOCKS5 Reply Header & Status ---
+    let mut resp_header = [0u8; 4];
+    sock.read_exact(&mut resp_header)
+        .map_err(|e| format!("нет ответа на SOCKS CONNECT: {}", e))?;
+
+    if resp_header[0] != 0x05 {
+        return Err("неверная версия ответа SOCKS".to_string());
+    }
+
+    match resp_header[1] {
+        0x00 => {} // Success
+        0x01 => return Err("общая ошибка SOCKS-сервера".to_string()),
+        0x02 => return Err("соединение запрещено правилами SOCKS-сервера".to_string()),
+        0x03 => return Err("сеть недоступна".to_string()),
+        0x04 => return Err("целевой хост недоступен".to_string()),
+        0x05 => return Err("соединение отклонено целевым узлом".to_string()),
+        0x06 => return Err("время жизни пакета (TTL) истекло".to_string()),
+        0x07 => return Err("команда не поддерживается SOCKS-сервером".to_string()),
+        0x08 => return Err("тип адреса не поддерживается SOCKS-сервером".to_string()),
+        code => return Err(format!("ошибка SOCKS CONNECT: 0x{:02X}", code)),
+    }
+
+    // --- Phase 4: Read & Discard Bound Address and Port ---
+    match resp_header[3] {
+        0x01 => {
+            // IPv4: 4 bytes IP + 2 bytes port = 6 bytes
+            let mut buf = [0u8; 6];
+            sock.read_exact(&mut buf)
+                .map_err(|e| format!("ошибка чтения адреса ответа SOCKS: {}", e))?;
+        }
+        0x03 => {
+            // Domain name: 1 byte len + L bytes domain + 2 bytes port
+            let mut len_buf = [0u8; 1];
+            sock.read_exact(&mut len_buf)
+                .map_err(|e| format!("ошибка чтения длины адреса SOCKS: {}", e))?;
+            let dlen = len_buf[0] as usize;
+            let mut buf = vec![0u8; dlen + 2];
+            sock.read_exact(&mut buf)
+                .map_err(|e| format!("ошибка чтения адреса SOCKS: {}", e))?;
+        }
+        0x04 => {
+            // IPv6: 16 bytes IP + 2 bytes port = 18 bytes
+            let mut buf = [0u8; 18];
+            sock.read_exact(&mut buf)
+                .map_err(|e| format!("ошибка чтения IPv6 адреса SOCKS: {}", e))?;
+        }
+        atyp => {
+            return Err(format!(
+                "неподдерживаемый тип адреса привязки SOCKS: 0x{:02X}",
+                atyp
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 pub fn open(up: &Upstream, host: &str, port: u16, budget: Duration) -> Result<TcpStream, String> {
     let deadline = Instant::now() + budget;
     let mut sock = connect_within_budget(&up.host, up.port, deadline)?;
@@ -391,61 +664,72 @@ pub fn open(up: &Upstream, host: &str, port: u16, budget: Duration) -> Result<Tc
     if left().is_zero() {
         return Err("прокси не ответил вовремя".to_string());
     }
-    sock.set_read_timeout(Some(left())).ok();
-    sock.set_write_timeout(Some(left())).ok();
 
-    let mut req = format!("CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n");
-    if let Some(a) = &up.auth {
-        req.push_str(&format!("Proxy-Authorization: Basic {}\r\n", basic(a)));
-    }
-    req.push_str("\r\n");
-    sock.write_all(req.as_bytes())
-        .map_err(|e| format!("не отправить CONNECT: {}", e))?;
+    match up.kind {
+        ProxyKind::Http => {
+            sock.set_read_timeout(Some(left())).ok();
+            sock.set_write_timeout(Some(left())).ok();
 
-    let mut head = Vec::new();
-    let mut byte = [0u8; 1];
-    while !head.ends_with(b"\r\n\r\n") {
-        if head.len() > 8 * 1024 {
-            return Err("прокси ответил чем-то очень длинным".to_string());
+            let mut req = format!("CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n");
+            if let Some(a) = &up.auth {
+                req.push_str(&format!("Proxy-Authorization: Basic {}\r\n", basic(a)));
+            }
+            req.push_str("\r\n");
+            sock.write_all(req.as_bytes())
+                .map_err(|e| format!("не отправить CONNECT: {}", e))?;
+
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                if head.len() > 8 * 1024 {
+                    return Err("прокси ответил чем-то очень длинным".to_string());
+                }
+                // The socket timeout bounds one `read`; this bounds the loop, so a proxy
+                // dribbling a byte at a time cannot outlast the budget by repeating.
+                if left().is_zero() {
+                    return Err("прокси не ответил вовремя".to_string());
+                }
+                match sock.read(&mut byte) {
+                    Ok(0) => return Err("прокси закрыл соединение".to_string()),
+                    Ok(_) => head.push(byte[0]),
+                    Err(e) => return Err(format!("нет ответа: {}", e)),
+                }
+            }
+            let status = String::from_utf8_lossy(&head)
+                .lines()
+                .next()
+                .unwrap_or("")
+                .to_string();
+            // Not `starts_with("HTTP/1.1 200")`: a CONNECT proxy is free to answer on
+            // HTTP/1.0, and tinyproxy - which is what the built-in exits run - does.
+            if !status.contains(" 200") {
+                // Two statuses are worth naming, because neither is an outage and neither
+                // fixes itself however long the route is benched: 407 is a credential
+                // problem, and 403 means this proxy filters by destination and does not
+                // carry the host we asked for.
+                if status.contains(" 407") {
+                    return Err("прокси требует логин и пароль".to_string());
+                }
+                if status.contains(" 403") {
+                    return Err(format!("прокси не пропускает этот хост: {}", host));
+                }
+                return Err(format!("прокси отказал: {}", status));
+            }
+            // The budgets above bounded reaching the proxy and reading its answer. They
+            // are mine, not the caller's, so the socket goes back clean - a caller that
+            // wants one of its own (`probe`, `exit_info`) sets it immediately, and a
+            // tunnel wants none (see `proxy::splice`, and I37).
+            sock.set_read_timeout(None).ok();
+            sock.set_write_timeout(None).ok();
+            Ok(sock)
         }
-        // The socket timeout bounds one `read`; this bounds the loop, so a proxy
-        // dribbling a byte at a time cannot outlast the budget by repeating.
-        if left().is_zero() {
-            return Err("прокси не ответил вовремя".to_string());
-        }
-        match sock.read(&mut byte) {
-            Ok(0) => return Err("прокси закрыл соединение".to_string()),
-            Ok(_) => head.push(byte[0]),
-            Err(e) => return Err(format!("нет ответа: {}", e)),
+        ProxyKind::Socks5 | ProxyKind::Socks5h => {
+            socks5_connect(&mut sock, up, host, port, deadline)?;
+            sock.set_read_timeout(None).ok();
+            sock.set_write_timeout(None).ok();
+            Ok(sock)
         }
     }
-    let status = String::from_utf8_lossy(&head)
-        .lines()
-        .next()
-        .unwrap_or("")
-        .to_string();
-    // Not `starts_with("HTTP/1.1 200")`: a CONNECT proxy is free to answer on
-    // HTTP/1.0, and tinyproxy - which is what the built-in exits run - does.
-    if !status.contains(" 200") {
-        // Two statuses are worth naming, because neither is an outage and neither
-        // fixes itself however long the route is benched: 407 is a credential
-        // problem, and 403 means this proxy filters by destination and does not
-        // carry the host we asked for.
-        if status.contains(" 407") {
-            return Err("прокси требует логин и пароль".to_string());
-        }
-        if status.contains(" 403") {
-            return Err(format!("прокси не пропускает этот хост: {}", host));
-        }
-        return Err(format!("прокси отказал: {}", status));
-    }
-    // The budgets above bounded reaching the proxy and reading its answer. They
-    // are mine, not the caller's, so the socket goes back clean - a caller that
-    // wants one of its own (`probe`, `exit_info`) sets it immediately, and a
-    // tunnel wants none (see `proxy::splice`, and I37).
-    sock.set_read_timeout(None).ok();
-    sock.set_write_timeout(None).ok();
-    Ok(sock)
 }
 
 /// A full request through the proxy: TLS to Google inside the tunnel, and an
@@ -647,6 +931,7 @@ mod tests {
     #[test]
     fn reads_the_shapes_people_actually_paste() {
         let plain = Upstream {
+            kind: ProxyKind::Http,
             host: "127.0.0.1".into(),
             port: 1371,
             auth: None,
@@ -657,6 +942,7 @@ mod tests {
         assert_eq!(
             parse("http://user:pw@proxy.example.com:8080").unwrap(),
             Upstream {
+                kind: ProxyKind::Http,
                 host: "proxy.example.com".into(),
                 port: 8080,
                 auth: Some("user:pw".into())
@@ -666,6 +952,35 @@ mod tests {
         assert_eq!(
             parse("user:p@ss@proxy.example.com:8080").unwrap().auth,
             Some("user:p@ss".into())
+        );
+
+        // SOCKS5 and SOCKS5h parsing
+        assert_eq!(
+            parse("socks5://127.0.0.1:1080").unwrap(),
+            Upstream {
+                kind: ProxyKind::Socks5,
+                host: "127.0.0.1".into(),
+                port: 1080,
+                auth: None,
+            }
+        );
+        assert_eq!(
+            parse("SOCKS5://127.0.0.1:1080").unwrap(),
+            Upstream {
+                kind: ProxyKind::Socks5,
+                host: "127.0.0.1".into(),
+                port: 1080,
+                auth: None,
+            }
+        );
+        assert_eq!(
+            parse("socks5h://user:secret@127.0.0.1:1080").unwrap(),
+            Upstream {
+                kind: ProxyKind::Socks5h,
+                host: "127.0.0.1".into(),
+                port: 1080,
+                auth: Some("user:secret".into()),
+            }
         );
     }
 
@@ -680,7 +995,8 @@ mod tests {
             "proxy.example.com:",
             "proxy.example.com:port",
             "proxy.example.com:0",
-            "socks5://127.0.0.1:1080",
+            "socks4://127.0.0.1:1080",
+            "ftp://127.0.0.1:1080",
             "user@proxy.example.com:8080",
         ] {
             assert!(parse(bad).is_err(), "should have been refused: {:?}", bad);
@@ -694,6 +1010,11 @@ mod tests {
         let shown = up.display();
         assert!(!shown.contains("hunter2"), "{}", shown);
         assert!(shown.contains("bob") && shown.contains("proxy.example.com:8080"));
+
+        let socks_up = parse("socks5://bob:hunter2@proxy.example.com:1080").unwrap();
+        let socks_shown = socks_up.display();
+        assert!(!socks_shown.contains("hunter2"), "{}", socks_shown);
+        assert!(socks_shown.starts_with("socks5://"));
     }
 
     /// Round-trip through the file format, since that is what the relay reads.
@@ -703,10 +1024,124 @@ mod tests {
             "127.0.0.1:1371",
             "bob:hunter2@proxy.example.com:8080",
             "[::1]:3128",
+            "socks5://127.0.0.1:1080",
+            "socks5://bob:hunter2@proxy.example.com:1080",
+            "socks5h://127.0.0.1:10808",
+            "socks5h://bob:hunter2@proxy.example.com:10808",
         ] {
             let up = parse(raw).unwrap();
             assert_eq!(parse(&up.as_line()).unwrap(), up, "{}", raw);
         }
+    }
+
+    #[test]
+    fn socks5_handshake_no_auth_mock() {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            // Expect greeting [0x05, 0x01, 0x00]
+            let mut buf = [0u8; 3];
+            stream.read_exact(&mut buf).unwrap();
+            assert_eq!(buf, [0x05, 0x01, 0x00]);
+            // Reply [0x05, 0x00] (No Auth)
+            stream.write_all(&[0x05, 0x00]).unwrap();
+
+            // Read CONNECT request: [0x05, 0x01, 0x00, ...]
+            let mut req_hdr = [0u8; 4];
+            stream.read_exact(&mut req_hdr).unwrap();
+            assert_eq!(req_hdr[0..3], [0x05, 0x01, 0x00]);
+            if req_hdr[3] == 0x01 {
+                let mut ip_port = [0u8; 6];
+                stream.read_exact(&mut ip_port).unwrap();
+            } else if req_hdr[3] == 0x03 {
+                let mut len = [0u8; 1];
+                stream.read_exact(&mut len).unwrap();
+                let mut dom = vec![0u8; len[0] as usize + 2];
+                stream.read_exact(&mut dom).unwrap();
+            }
+
+            // Reply Success: [0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0x1f, 0x90]
+            stream
+                .write_all(&[0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0x1f, 0x90])
+                .unwrap();
+        });
+
+        let up = Upstream {
+            kind: ProxyKind::Socks5,
+            host: "127.0.0.1".to_string(),
+            port,
+            auth: None,
+        };
+        let sock = open(&up, "127.0.0.1", 8080, Duration::from_secs(3)).unwrap();
+        assert!(sock.read_timeout().unwrap().is_none());
+        assert!(sock.write_timeout().unwrap().is_none());
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn socks5_handshake_user_pass_mock() {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            // Expect greeting [0x05, 0x02, 0x00, 0x02]
+            let mut buf = [0u8; 4];
+            stream.read_exact(&mut buf).unwrap();
+            assert_eq!(buf, [0x05, 0x02, 0x00, 0x02]);
+            // Reply [0x05, 0x02] (User/Pass)
+            stream.write_all(&[0x05, 0x02]).unwrap();
+
+            // Read Auth Request: [0x01, ulen, user..., plen, pass...]
+            let mut ver_ulen = [0u8; 2];
+            stream.read_exact(&mut ver_ulen).unwrap();
+            assert_eq!(ver_ulen[0], 0x01);
+            let ulen = ver_ulen[1] as usize;
+            let mut user = vec![0u8; ulen];
+            stream.read_exact(&mut user).unwrap();
+            assert_eq!(&user, b"alice");
+
+            let mut plen = [0u8; 1];
+            stream.read_exact(&mut plen).unwrap();
+            let mut pass = vec![0u8; plen[0] as usize];
+            stream.read_exact(&mut pass).unwrap();
+            assert_eq!(&pass, b"secret123");
+
+            // Reply Auth Success: [0x01, 0x00]
+            stream.write_all(&[0x01, 0x00]).unwrap();
+
+            // Read CONNECT
+            let mut req_hdr = [0u8; 4];
+            stream.read_exact(&mut req_hdr).unwrap();
+            assert_eq!(req_hdr[0..3], [0x05, 0x01, 0x00]);
+            if req_hdr[3] == 0x03 {
+                let mut len = [0u8; 1];
+                stream.read_exact(&mut len).unwrap();
+                let mut dom = vec![0u8; len[0] as usize + 2];
+                stream.read_exact(&mut dom).unwrap();
+            } else if req_hdr[3] == 0x01 {
+                let mut ip_port = [0u8; 6];
+                stream.read_exact(&mut ip_port).unwrap();
+            }
+
+            // Reply Success: [0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]
+            stream.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).unwrap();
+        });
+
+        let up = Upstream {
+            kind: ProxyKind::Socks5h,
+            host: "127.0.0.1".to_string(),
+            port,
+            auth: Some("alice:secret123".to_string()),
+        };
+        let sock = open(&up, "example.com", 443, Duration::from_secs(3)).unwrap();
+        assert!(sock.read_timeout().unwrap().is_none());
+        assert!(sock.write_timeout().unwrap().is_none());
+        handle.join().unwrap();
     }
 
     /// A blocked exit stands the route down, and only a *different* address

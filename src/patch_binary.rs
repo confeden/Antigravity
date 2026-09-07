@@ -279,16 +279,16 @@ pub fn kill_affected_processes() {
 /// Stops the language server / CLI so their files can be replaced. Never the
 /// editor shell itself - that would lose the user's unsaved work (D9).
 #[cfg(target_os = "windows")]
+pub const KILL_TARGET_PROCESSES: &[&str] = &[
+    "language_server*.exe",
+    "language_server.exe",
+    "language_server_windows_x64.exe",
+    "agy.exe",
+];
+
+#[cfg(target_os = "windows")]
 fn kill_platform_processes() {
-    let processes = [
-        "Antigravity.exe",
-        "Antigravity CLI.exe",
-        "Antigravity IDE.exe",
-        "agy.exe",
-        "language_server.exe",
-        "language_server_windows_x64.exe",
-    ];
-    for p in processes.iter() {
+    for p in KILL_TARGET_PROCESSES.iter() {
         Command::new("taskkill")
             .args(["/F", "/IM", p])
             .stdout(Stdio::null())
@@ -474,6 +474,18 @@ mod tests {
         assert_ne!(data, original);
         replace_all(&mut data, b"inexigible", b"ineligible");
         assert_eq!(data, original);
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn kill_platform_processes_excludes_editor_shells() {
+        assert!(!KILL_TARGET_PROCESSES.contains(&"Antigravity.exe"));
+        assert!(!KILL_TARGET_PROCESSES.contains(&"Antigravity CLI.exe"));
+        assert!(!KILL_TARGET_PROCESSES.contains(&"Antigravity IDE.exe"));
+        assert!(KILL_TARGET_PROCESSES.contains(&"language_server*.exe"));
+        assert!(KILL_TARGET_PROCESSES.contains(&"language_server.exe"));
+        assert!(KILL_TARGET_PROCESSES.contains(&"language_server_windows_x64.exe"));
+        assert!(KILL_TARGET_PROCESSES.contains(&"agy.exe"));
     }
 }
 

@@ -18,6 +18,14 @@ webpki-roots = "1"
 # private src/relay.rs is the only user).
 aes-gcm = "0.10"
 
+[target.'cfg(windows)'.dependencies.windows-sys]
+version = "0.52.0"
+features = [
+    "Win32_Foundation",
+    "Win32_System_Registry",
+    "Win32_UI_WindowsAndMessaging",
+]
+
 [build-dependencies]
 winres = "0.1"
 # build.rs derives the per-release canary with the same formula as canary.rs.
