@@ -6,7 +6,6 @@ mod common;
 use common::*;
 use std::fs;
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::time::Duration;
 
 // =========================================================================
@@ -259,6 +258,7 @@ fn test_r3_safe_regex_capture_returns_err_on_signature_mismatch() {
 }
 
 #[test]
+#[allow(non_snake_case)]
 fn test_r3_obsolete_broken_js_getUserStatus_rejected() {
     let broken_inline_js = r#"
         let auth = ...getUserStatus({}))).userStatus;

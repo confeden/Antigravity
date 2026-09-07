@@ -27,7 +27,7 @@ fn test_r1_r3_patch_workflow_with_safe_process_lifecycle() {
     // 2. Safely extract regex groups (R3)
     let extracted = SafeRegexInspector::safe_extract_captures(pristine_bundle);
     assert!(extracted.is_ok(), "R3: Extraction must succeed");
-    let groups = extracted.unwrap();
+    let _groups = extracted.unwrap();
 
     // 3. Construct patch payload
     let patch_marker = "// UNLOCKED\n";

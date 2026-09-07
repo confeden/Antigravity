@@ -208,21 +208,21 @@ impl SafeRegexInspector {
             .map(|m| m.as_str().to_string())
             .ok_or_else(|| "Группа 4 (var_y) не найдена".to_string())?;
         let var_i = caps
+            .get(7)
+            .map(|m| m.as_str().to_string())
+            .ok_or_else(|| "Группа 7 (var_i) не найдена".to_string())?;
+        let var_func = caps
             .get(8)
             .map(|m| m.as_str().to_string())
-            .ok_or_else(|| "Группа 8 (var_i) не найдена".to_string())?;
-        let var_func = caps
+            .ok_or_else(|| "Группа 8 (var_func) не найдена".to_string())?;
+        let var_f = caps
             .get(9)
             .map(|m| m.as_str().to_string())
-            .ok_or_else(|| "Группа 9 (var_func) не найдена".to_string())?;
-        let var_f = caps
+            .ok_or_else(|| "Группа 9 (var_f) не найдена".to_string())?;
+        let var_h = caps
             .get(10)
             .map(|m| m.as_str().to_string())
-            .ok_or_else(|| "Группа 10 (var_f) не найдена".to_string())?;
-        let var_h = caps
-            .get(11)
-            .map(|m| m.as_str().to_string())
-            .ok_or_else(|| "Группа 11 (var_h) не найдена".to_string())?;
+            .ok_or_else(|| "Группа 10 (var_h) не найдена".to_string())?;
 
         Ok(IdePatchCaptureGroups {
             full_match_range: (full.start(), full.end()),
@@ -519,8 +519,9 @@ impl MockSocks5Server {
                     Ok((mut stream, _)) => {
                         let cfg = config.clone();
                         let st = Arc::clone(&stats_clone);
+                        let sd = Arc::clone(&shutdown_clone);
                         thread::spawn(move || {
-                            Self::handle_connection(&mut stream, &cfg, &st);
+                            Self::handle_connection(&mut stream, &cfg, &st, &sd);
                         });
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -543,9 +544,11 @@ impl MockSocks5Server {
         stream: &mut TcpStream,
         config: &MockSocks5ServerConfig,
         stats: &Arc<Mutex<MockSocks5Stats>>,
+        shutdown: &Arc<AtomicBool>,
     ) {
+        stream.set_nonblocking(false).ok();
         stream
-            .set_read_timeout(Some(Duration::from_secs(3)))
+            .set_read_timeout(Some(Duration::from_millis(500)))
             .ok();
         stream
             .set_write_timeout(Some(Duration::from_secs(3)))
@@ -710,7 +713,7 @@ impl MockSocks5Server {
 
         // 4. Server Reply
         let reply_rep = config.reply_rep_code;
-        let mut reply = vec![
+        let reply = vec![
             Socks5Constants::VER_SOCKS5,
             reply_rep,
             0x00, // RSV
@@ -720,23 +723,50 @@ impl MockSocks5Server {
         ];
 
         if stream.write_all(&reply).is_err() || reply_rep != Socks5Constants::REP_SUCCESS {
+            stream.flush().ok();
             return;
         }
+        stream.flush().ok();
 
         // 5. Echo or relay traffic
+        let mut buf = [0u8; 1024];
         if config.echo_data {
-            let mut buf = [0u8; 1024];
-            while let Ok(n) = stream.read(&mut buf) {
-                if n == 0 {
-                    break;
+            while !shutdown.load(Ordering::Relaxed) {
+                match stream.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if let Ok(mut st) = stats.try_lock() {
+                            st.bytes_tunneled += n;
+                        }
+                        if stream.write_all(&buf[..n]).is_err() {
+                            break;
+                        }
+                        stream.flush().ok();
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut || e.kind() == std::io::ErrorKind::WouldBlock => {
+                        continue;
+                    }
+                    Err(_) => break,
                 }
-                if stream.write_all(&buf[..n]).is_err() {
-                    break;
+            }
+        } else {
+            // Drain until client closes (EOF) or server shuts down
+            while !shutdown.load(Ordering::Relaxed) {
+                match stream.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if let Ok(mut st) = stats.try_lock() {
+                            st.bytes_tunneled += n;
+                        }
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut || e.kind() == std::io::ErrorKind::WouldBlock => {
+                        continue;
+                    }
+                    Err(_) => break,
                 }
-                let mut st = stats.lock().unwrap();
-                st.bytes_tunneled += n;
             }
         }
+        stream.flush().ok();
     }
 }
 

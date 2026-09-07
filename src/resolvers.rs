@@ -449,6 +449,28 @@ fn remember_liveness(addr: IpAddr, alive: bool) {
     }
 }
 
+/// Whether an address is a non-routable documentation/test netblock (RFC 5737, RFC 3849).
+/// These addresses can never be legitimate proxies, but TUN adapters (e.g. happ-xray)
+/// may intercept TCP packets destined to them.
+fn is_blackhole(addr: &IpAddr) -> bool {
+    match addr {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            // RFC 5737 TEST-NET-1 (192.0.2.0/24), TEST-NET-2 (198.51.100.0/24), TEST-NET-3 (203.0.113.0/24)
+            (o[0] == 192 && o[1] == 0 && o[2] == 2)
+                || (o[0] == 198 && o[1] == 51 && o[2] == 100)
+                || (o[0] == 203 && o[1] == 0 && o[2] == 113)
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+        }
+        IpAddr::V6(v6) => {
+            // RFC 3849 documentation prefix 2001:db8::/32
+            let s = v6.segments();
+            (s[0] == 0x2001 && s[1] == 0xdb8) || v6.is_unspecified()
+        }
+    }
+}
+
 /// Whether `addr` will actually serve `sni` inside `budget`.
 ///
 /// TCP alone is not the question the client asks. Measured within one minute on
@@ -456,22 +478,24 @@ fn remember_liveness(addr: IpAddr, alive: bool) {
 /// the TLS handshake, while xbox's did the whole handshake in 249 ms. A
 /// TCP-only probe calls both healthy and the client pays the difference.
 ///
-/// With no `sni` - the client path, where the cache normally answers and a
-/// handshake is far too expensive - it falls back to the connection alone.
+/// When `sni` is `None`, fallback to default probe hostname (`PREFERRED_NAMES[0]`)
+/// and complete TLS handshake validation to avoid false positives on blackhole IPs
+/// intercepted by active TUN adapters.
 fn reachable(addr: IpAddr, budget: Duration, sni: Option<&str>) -> bool {
+    if is_blackhole(&addr) {
+        return false;
+    }
     let Ok(sock) =
         std::net::TcpStream::connect_timeout(&SocketAddr::new(addr, LIVENESS_PORT), budget)
     else {
         return false;
     };
-    let Some(name) = sni else {
-        return true;
-    };
+    let name = sni.unwrap_or(PREFERRED_NAMES[0]);
     let Ok(server) = ServerName::try_from(name.to_string()) else {
-        return true;
+        return false;
     };
     let Ok(mut conn) = ClientConnection::new(crate::proxy::probe_config(), server) else {
-        return true;
+        return false;
     };
     sock.set_read_timeout(Some(budget)).ok();
     sock.set_write_timeout(Some(budget)).ok();
@@ -2339,4 +2363,20 @@ mod tests {
             Some("warm-unseen.example")
         );
     }
+
+    #[test]
+    fn test_is_blackhole_classifies_rfc5737_and_rfc3849() {
+        assert!(is_blackhole(&v4("203.0.113.9")));
+        assert!(is_blackhole(&v4("192.0.2.1")));
+        assert!(is_blackhole(&v4("198.51.100.254")));
+        assert!(is_blackhole(&v4("0.0.0.0")));
+        assert!(is_blackhole(&v4("255.255.255.255")));
+        let v6_doc: IpAddr = "2001:db8::1".parse().unwrap();
+        assert!(is_blackhole(&v6_doc));
+        let v6_unspec: IpAddr = "::".parse().unwrap();
+        assert!(is_blackhole(&v6_unspec));
+        assert!(!is_blackhole(&v4("87.228.47.204")));
+        assert!(!is_blackhole(&v4("172.217.113.4")));
+    }
 }
+

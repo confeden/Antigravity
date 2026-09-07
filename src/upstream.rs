@@ -15,7 +15,7 @@
 
 use std::fs;
 use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -86,6 +86,14 @@ impl Route {
     /// coming out somewhere Google will accept.
     pub fn usable(&self) -> bool {
         self.bad_exit().is_none() && !self.health.is_benched()
+    }
+
+    /// Clears any pinned bad exit status so a newly applied proxy
+    /// is immediately active without waiting for route benching or address changes.
+    pub fn clear_bad_exit(&self) {
+        if let Ok(mut lock) = self.bad_exit.lock() {
+            *lock = None;
+        }
     }
 
     /// How this route is named in the log. Only the built-in exits ask - every
@@ -405,14 +413,43 @@ fn basic(auth: &str) -> String {
 /// then hangs on the OS default - about 21 s on Windows - with a live client
 /// waiting behind it. The budget is spent across every candidate address rather
 /// than granted to each, so the whole step is bounded however many a name has.
-fn connect_within_budget(host: &str, port: u16, deadline: Instant) -> Result<TcpStream, String> {
-    let addrs: Vec<_> = (host, port)
-        .to_socket_addrs()
-        .map_err(|e| format!("адрес не разрешается: {}", e))?
-        .collect();
-    if addrs.is_empty() {
-        return Err("адрес не разрешается".to_string());
+/// Resolves `host:port` to `SocketAddr`s within `deadline`, avoiding blocking on synchronous DNS.
+/// If `host` parses directly as an IP, no DNS lookup or thread spawn is performed.
+fn resolve_within_budget(host: &str, port: u16, deadline: Instant) -> Result<Vec<SocketAddr>, String> {
+    let clean_host = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = clean_host.parse::<IpAddr>() {
+        return Ok(vec![SocketAddr::new(ip, port)]);
     }
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return Err("время вышло".to_string());
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    let host_s = clean_host.to_string();
+    std::thread::spawn(move || {
+        let res = (host_s.as_str(), port)
+            .to_socket_addrs()
+            .map(|iter| iter.collect::<Vec<_>>());
+        let _ = tx.send(res);
+    });
+    match rx.recv_timeout(left) {
+        Ok(Ok(addrs)) if !addrs.is_empty() => Ok(addrs),
+        Ok(Ok(_)) => Err("адрес не разрешается: пустой список".to_string()),
+        Ok(Err(e)) => Err(format!("адрес не разрешается: {}", e)),
+        Err(_) => Err("время вышло при разрешении адреса".to_string()),
+    }
+}
+
+/// Reaches the proxy itself, inside `deadline` whatever shape its address is in.
+///
+/// A hostname has to be resolved before `connect_timeout` can be used at all,
+/// and the obvious `parse().unwrap_or_else(|_| TcpStream::connect(..))` silently
+/// drops the budget for exactly that case: a named proxy whose address black-holes
+/// then hangs on the OS default - about 21 s on Windows - with a live client
+/// waiting behind it. The budget is spent across every candidate address rather
+/// than granted to each, so the whole step is bounded however many a name has.
+fn connect_within_budget(host: &str, port: u16, deadline: Instant) -> Result<TcpStream, String> {
+    let addrs = resolve_within_budget(host, port, deadline)?;
     let mut last = String::from("время вышло");
     for addr in addrs {
         let left = deadline.saturating_duration_since(Instant::now());
@@ -541,26 +578,38 @@ fn socks5_connect(
 
     let mut connect_req = vec![0x05, 0x01, 0x00];
 
+    let clean_target = target_host.trim_start_matches('[').trim_end_matches(']');
     if up.kind == ProxyKind::Socks5 {
-        if let Ok(ip) = target_host.parse::<std::net::Ipv4Addr>() {
+        if let Ok(ip) = clean_target.parse::<std::net::Ipv4Addr>() {
             connect_req.push(0x01);
             connect_req.extend_from_slice(&ip.octets());
-        } else if let Ok(ip) = target_host.parse::<std::net::Ipv6Addr>() {
+        } else if let Ok(ip) = clean_target.parse::<std::net::Ipv6Addr>() {
             connect_req.push(0x04);
             connect_req.extend_from_slice(&ip.octets());
-        } else if let Ok(mut addrs) = (target_host, target_port).to_socket_addrs() {
-            if let Some(addr) = addrs.next() {
-                match addr.ip() {
-                    std::net::IpAddr::V4(v4) => {
-                        connect_req.push(0x01);
-                        connect_req.extend_from_slice(&v4.octets());
-                    }
-                    std::net::IpAddr::V6(v6) => {
-                        connect_req.push(0x04);
-                        connect_req.extend_from_slice(&v6.octets());
+        } else {
+            // Target is a domain name.
+            // Bounded local resolution: if local DNS cannot resolve quickly within budget,
+            // fall back immediately to remote DNS resolution via SOCKS5 ATYP 0x03 (DOMAINNAME).
+            let local_dns_budget = Duration::from_millis(150).min(left);
+            let local_deadline = Instant::now() + local_dns_budget;
+            let mut resolved = false;
+            if let Ok(addrs) = resolve_within_budget(target_host, target_port, local_deadline) {
+                if let Some(addr) = addrs.first() {
+                    match addr.ip() {
+                        std::net::IpAddr::V4(v4) => {
+                            connect_req.push(0x01);
+                            connect_req.extend_from_slice(&v4.octets());
+                            resolved = true;
+                        }
+                        std::net::IpAddr::V6(v6) => {
+                            connect_req.push(0x04);
+                            connect_req.extend_from_slice(&v6.octets());
+                            resolved = true;
+                        }
                     }
                 }
-            } else {
+            }
+            if !resolved {
                 if target_host.len() > 255 {
                     return Err("имя хоста превышает 255 байт".to_string());
                 }
@@ -568,20 +617,13 @@ fn socks5_connect(
                 connect_req.push(target_host.len() as u8);
                 connect_req.extend_from_slice(target_host.as_bytes());
             }
-        } else {
-            if target_host.len() > 255 {
-                return Err("имя хоста превышает 255 байт".to_string());
-            }
-            connect_req.push(0x03);
-            connect_req.push(target_host.len() as u8);
-            connect_req.extend_from_slice(target_host.as_bytes());
         }
     } else {
         // Socks5h: Remote proxy-side resolution
-        if let Ok(ip) = target_host.parse::<std::net::Ipv4Addr>() {
+        if let Ok(ip) = clean_target.parse::<std::net::Ipv4Addr>() {
             connect_req.push(0x01);
             connect_req.extend_from_slice(&ip.octets());
-        } else if let Ok(ip) = target_host.parse::<std::net::Ipv6Addr>() {
+        } else if let Ok(ip) = clean_target.parse::<std::net::Ipv6Addr>() {
             connect_req.push(0x04);
             connect_req.extend_from_slice(&ip.octets());
         } else {
@@ -1226,4 +1268,106 @@ mod tests {
         assert!(!region_is_blocked("NL"));
         assert!(!region_is_blocked(""));
     }
+
+    #[test]
+    fn resolve_within_budget_handles_bracketed_ips() {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let addrs = resolve_within_budget("[127.0.0.1]", 8080, deadline).expect("bracketed v4");
+        assert_eq!(addrs, vec![SocketAddr::new("127.0.0.1".parse().unwrap(), 8080)]);
+        let addrs_v6 = resolve_within_budget("[::1]", 9090, deadline).expect("bracketed v6");
+        assert_eq!(addrs_v6, vec![SocketAddr::new("::1".parse().unwrap(), 9090)]);
+    }
+
+    #[test]
+    fn connect_within_budget_times_out_strictly_within_deadline() {
+        let start = Instant::now();
+        let deadline = start + Duration::from_millis(150);
+        let res = connect_within_budget("nonexistent.test", 80, deadline);
+        let elapsed = start.elapsed();
+        assert!(res.is_err());
+        assert!(elapsed < Duration::from_millis(500), "must not hang on OS DNS timeout: {:?}", elapsed);
+    }
+
+    #[test]
+    fn socks5_connect_falls_back_to_domainname_atyp_when_dns_unresolved() {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 3];
+            stream.read_exact(&mut buf).unwrap();
+            assert_eq!(buf, [0x05, 0x01, 0x00]);
+            stream.write_all(&[0x05, 0x00]).unwrap();
+
+            let mut req_hdr = [0u8; 4];
+            stream.read_exact(&mut req_hdr).unwrap();
+            assert_eq!(req_hdr[0..3], [0x05, 0x01, 0x00]);
+            assert_eq!(req_hdr[3], 0x03);
+
+            let mut len = [0u8; 1];
+            stream.read_exact(&mut len).unwrap();
+            let mut dom = vec![0u8; len[0] as usize];
+            stream.read_exact(&mut dom).unwrap();
+            assert_eq!(&dom, b"unresolvable.invalid");
+
+            let mut port_bytes = [0u8; 2];
+            stream.read_exact(&mut port_bytes).unwrap();
+            assert_eq!(u16::from_be_bytes(port_bytes), 443);
+
+            stream.write_all(&[0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0x01, 0xbb]).unwrap();
+        });
+
+        let up = Upstream {
+            kind: ProxyKind::Socks5,
+            host: "127.0.0.1".to_string(),
+            port,
+            auth: None,
+        };
+        let sock = open(&up, "unresolvable.invalid", 443, Duration::from_millis(500)).unwrap();
+        drop(sock);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn socks5h_sends_domainname_directly() {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 3];
+            stream.read_exact(&mut buf).unwrap();
+            stream.write_all(&[0x05, 0x00]).unwrap();
+
+            let mut req_hdr = [0u8; 4];
+            stream.read_exact(&mut req_hdr).unwrap();
+            assert_eq!(req_hdr, [0x05, 0x01, 0x00, 0x03]);
+
+            let mut len = [0u8; 1];
+            stream.read_exact(&mut len).unwrap();
+            let mut dom = vec![0u8; len[0] as usize];
+            stream.read_exact(&mut dom).unwrap();
+            assert_eq!(&dom, b"example.remote");
+
+            let mut port_bytes = [0u8; 2];
+            stream.read_exact(&mut port_bytes).unwrap();
+            assert_eq!(u16::from_be_bytes(port_bytes), 80);
+
+            stream.write_all(&[0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0x00, 0x50]).unwrap();
+        });
+
+        let up = Upstream {
+            kind: ProxyKind::Socks5h,
+            host: "127.0.0.1".to_string(),
+            port,
+            auth: None,
+        };
+        let sock = open(&up, "example.remote", 80, Duration::from_millis(500)).unwrap();
+        drop(sock);
+        handle.join().unwrap();
+    }
 }
+
