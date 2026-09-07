@@ -51,7 +51,6 @@ pub fn verify_key(key: &str) -> bool {
     for (x, y) in k[12..].chars().zip(expected.chars()) {
         result |= (x as u8) ^ (y as u8);
     }
-    thread::sleep(Duration::from_millis(300));
     result == 0
 }
 
@@ -157,8 +156,6 @@ pub fn try_cached_login() -> bool {
     };
     let key = content.trim().replace('"', "");
     if verify_key(&key) {
-        println!("Ключ лицензии подтверждён (сохранён в профиле).");
-        thread::sleep(Duration::from_millis(500));
         true
     } else {
         false
@@ -202,11 +199,11 @@ pub fn login_screen() {
         if verify_key(&k) {
             save_license_key(&k);
             println!("{}", "Доступ разрешён.");
-            thread::sleep(Duration::from_secs(1));
+            thread::sleep(Duration::from_millis(200));
             return;
         } else {
             println!("{}", "Доступ запрещён. Неверный ключ.");
-            thread::sleep(Duration::from_secs(2));
+            thread::sleep(Duration::from_millis(1000));
         }
     }
 }
