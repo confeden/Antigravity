@@ -22,6 +22,7 @@ mod background;
 mod canary;
 #[cfg(target_os = "windows")]
 mod console_style;
+pub mod detector;
 mod dns;
 mod dns_client;
 mod dns_forwarder;
@@ -638,6 +639,28 @@ fn ask_for_own_proxy() {
         None => println!("  Enter — пропустить, всё будет работать как и раньше."),
     }
 
+    let detected = detector::detect_clients();
+    if !detected.is_empty() {
+        println!();
+        println!("  \x1b[38;5;154mНайдены запущенные VPN/прокси клиенты:\x1b[0m\x1b[92m");
+        for (i, c) in detected.iter().enumerate() {
+            let proto_str = match c.protocol {
+                detector::DetectedProtocol::Socks5 => "SOCKS5",
+                detector::DetectedProtocol::Http => "HTTP",
+            };
+            println!(
+                "    [{}] {} ({} {}:{}, {} мс)",
+                i + 1,
+                c.name,
+                proto_str,
+                c.host,
+                c.port,
+                c.latency_ms
+            );
+        }
+        println!("  Введите номер для выбора в 1 клик, свой адрес, или '-' для отключения:");
+    }
+
     let answer = prompt("> ");
     let answer = answer.trim();
     if answer.is_empty() {
@@ -648,6 +671,37 @@ fn ask_for_own_proxy() {
         println!("Свой прокси убран — трафик пойдёт прежним путём.");
         thread::sleep(Duration::from_secs(2));
         return;
+    }
+
+    if let Ok(choice) = answer.parse::<usize>() {
+        if choice >= 1 && choice <= detected.len() {
+            let client = &detected[choice - 1];
+            match detector::apply_detected_client(client) {
+                Ok(()) => {
+                    let proto_str = match client.protocol {
+                        detector::DetectedProtocol::Socks5 => "socks5",
+                        detector::DetectedProtocol::Http => "http",
+                    };
+                    println!(
+                        "Применён клиент: {} ({}://{}:{})",
+                        client.name, proto_str, client.host, client.port
+                    );
+                    println!(
+                        "Свой прокси сохранён: {}://{}:{}",
+                        proto_str, client.host, client.port
+                    );
+                    println!("Если он перестанет отвечать, трафик сам пойдёт прежним путём,");
+                    println!("а когда заработает снова — вернётся на него.");
+                    thread::sleep(Duration::from_secs(3));
+                    return;
+                }
+                Err(why) => {
+                    println!("\x1b[33mНе удалось применить: {}\x1b[0m\x1b[92m", why);
+                    thread::sleep(Duration::from_secs(3));
+                    return;
+                }
+            }
+        }
     }
 
     let up = match upstream::parse(answer) {
