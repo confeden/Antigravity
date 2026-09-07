@@ -76,10 +76,21 @@ const IPV4_PREFIX_PREFERRED_PRECEDENCE: &str = "46";
 // explicitly whenever we change the rules ourselves.
 static NRPT_CACHE: Mutex<Option<bool>> = Mutex::new(None);
 
-fn invalidate_cache() {
+#[allow(dead_code)]
+pub fn invalidate_cache() {
     if let Ok(mut c) = NRPT_CACHE.lock() {
         *c = None;
     }
+}
+
+/// Queries whether NRPT rules are currently active after explicitly dropping the cache.
+///
+/// Expensive: shells out to PowerShell on Windows, so this is intended for on-demand
+/// checks (e.g. user toggles, periodic health checks), not for every UI render frame.
+#[allow(dead_code)]
+pub fn is_nrpt_applied_fresh() -> bool {
+    invalidate_cache();
+    is_nrpt_applied()
 }
 
 fn ps_string_list(items: &[&str]) -> String {
@@ -404,7 +415,8 @@ fn pin_substituted_hosts(namespaces: &[&str], if_index: u32) -> Result<Vec<Strin
 /// One character of progress on the caller's line.
 fn tick() {
     use std::io::Write;
-    print!(".");
+    // Was a progress dot on the console line. The window has no console, and the
+    // step is reported as a whole when it finishes.
     std::io::stdout().flush().ok();
 }
 
@@ -476,7 +488,11 @@ pub fn setup_dns_nrpt() -> Result<DnsOutcome, String> {
     // measured one, and the absence of a measurement installs the rules rather
     // than skipping them; `egress::stand_down_for_vpn` carries the whole rule and
     // the reason for it.
-    let (stand_down, client) = egress::vpn_verdict(egress.as_ref());
+    // The switch only ever *suppresses* the stand-down; it can never cause one.
+    // Measuring stays unconditional so `DnsOutcome` still reports the tunnel it
+    // saw, which is what the window's indicator is drawn from.
+    let (measured_stand_down, client) = egress::vpn_verdict(egress.as_ref());
+    let stand_down = measured_stand_down && crate::settings::vpn_detect_enabled();
     if stand_down {
         return Ok(DnsOutcome {
             vpn_active: true,
@@ -727,7 +743,7 @@ pub fn refresh_pinned_hosts() {
     // only when the client is measured inside it - and here the measurement is
     // usually available, because a user opens this tool while Antigravity is
     // running.
-    if egress::vpn_verdict(egress::detect().as_ref()).0 {
+    if egress::vpn_verdict(egress::detect().as_ref()).0 && crate::settings::vpn_detect_enabled() {
         // Takes the pinned block with it - `remove_dns_nrpt` owns both, because
         // the addresses only ever existed to serve the rules.
         remove_dns_nrpt();

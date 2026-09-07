@@ -1,7 +1,4 @@
 use sha2::{Digest, Sha256};
-use std::io::{self, Write};
-use std::thread;
-use std::time::Duration;
 
 // License model (intentionally soft — keys are free):
 //
@@ -28,7 +25,13 @@ fn key_secret() -> String {
     )
 }
 
-fn verify_key(key: &str) -> bool {
+/// Constant-time check of a licence key against this build's version salt.
+///
+/// Deliberately does no sleeping: the throttle that used to live here cost
+/// 300 ms on the one screen every start goes through, and it bought nothing —
+/// the secret is committed on purpose (see above), so rate-limiting a local
+/// guess protects nothing. Any pacing belongs in the caller's UI, not here.
+pub fn verify_key(key: &str) -> bool {
     let k: String = key.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
     let k = k.to_uppercase();
     if k.len() != 24 {
@@ -49,7 +52,6 @@ fn verify_key(key: &str) -> bool {
     for (x, y) in k[12..].chars().zip(expected.chars()) {
         result |= (x as u8) ^ (y as u8);
     }
-    thread::sleep(Duration::from_millis(300));
     result == 0
 }
 
@@ -96,32 +98,3 @@ mod tests {
     }
 }
 
-pub fn login_screen() {
-    loop {
-        crate::utils::clear_screen();
-        println!("{}", "=== ПРОВЕРКА ДОСТУПА ===");
-        println!();
-        println!("Бесплатный ключ можно взять в группе t.me/nova_txt в комнате \"Antigravity\", для каждой версии анлокера ключи разные");
-        println!();
-        print!("{}", "Введите лицензионный ключ: ");
-        io::stdout().flush().unwrap();
-
-        let mut key = String::new();
-        let bytes_read = io::stdin().read_line(&mut key).unwrap_or(0);
-
-        if bytes_read == 0 {
-            std::process::exit(1);
-        }
-
-        let k = key.trim().replace("\"", "");
-
-        if verify_key(&k) {
-            println!("{}", "Доступ разрешён.");
-            thread::sleep(Duration::from_secs(1));
-            return;
-        } else {
-            println!("{}", "Доступ запрещён. Неверный ключ.");
-            thread::sleep(Duration::from_secs(2));
-        }
-    }
-}

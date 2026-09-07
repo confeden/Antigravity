@@ -74,22 +74,38 @@ mod windows_impl {
         install_dir().join(EXE_NAME)
     }
 
-    /// True when the logon task exists. Says nothing about whether the relay is
-    /// running right now - `is_running` answers that.
-    pub fn is_enabled() -> bool {
-        let cmd = format!(
-            "if (Get-ScheduledTask -TaskName '{}' -ErrorAction SilentlyContinue) {{ 'yes' }} else {{ 'no' }}",
-            TASK_NAME
-        );
-        powershell(&cmd).map_or(false, |o| {
-            String::from_utf8_lossy(&o.stdout).trim() == "yes"
-        })
-    }
-
     /// Limit for the small helpers here (`tasklist`, `taskkill`). Short, because
     /// they answer in milliseconds when they answer at all - and this runs on the
     /// path a user is watching.
     const HELPER_LIMIT: Duration = Duration::from_secs(15);
+
+    /// Whether the scheduled task exists, asked of `schtasks.exe` rather than of
+    /// PowerShell.
+    ///
+    /// Same question, same answer, roughly a tenth of the wall clock: starting
+    /// PowerShell costs several hundred milliseconds before it reads the first
+    /// character of the script, and this is asked twice on every status refresh —
+    /// which is a large part of why flipping a switch took seconds. `schtasks` is
+    /// a plain Win32 binary shipped with every Windows since XP; it exits 0 when
+    /// the task is there and non-zero when it is not, and the task is registered
+    /// in the root folder, so the bare name is the whole query.
+    fn task_exists(task_name: &str) -> bool {
+        let mut cmd = Command::new("schtasks");
+        cmd.args(["/Query", "/TN", task_name]);
+        bounded_output(no_window(&mut cmd), HELPER_LIMIT).is_some_and(|o| o.status.success())
+    }
+
+    /// True when the logon task exists. Says nothing about whether the relay is
+    /// running right now - `is_running` answers that.
+    pub fn is_enabled() -> bool {
+        task_exists(TASK_NAME)
+    }
+
+    /// True when the watchdog's own logon task exists.
+    #[allow(dead_code)]
+    pub fn is_watchdog_enabled() -> bool {
+        task_exists(WATCHDOG_TASK_NAME)
+    }
 
     pub fn is_running() -> bool {
         let mut cmd = Command::new("tasklist");
@@ -356,6 +372,43 @@ mod windows_impl {
     mod tests {
         use super::*;
 
+        /// A name nothing could have registered must read as absent — i.e. a
+        /// non-zero exit from `schtasks` is "no such task", not "the query
+        /// failed". Deterministic on any machine.
+        #[test]
+        fn a_task_that_cannot_exist_reads_as_absent() {
+            assert!(!task_exists("AG Unlocker no-such-task 4f2b9c"));
+        }
+
+        /// Live: `schtasks` and PowerShell must give the same answer for the two
+        /// real task names.
+        ///
+        /// The point of the swap is speed (35 ms against 830 ms, and it is asked
+        /// twice per status refresh) and speed is only worth having if the answer
+        /// is the same one — a reader that silently says "no task" would draw both
+        /// switches off on a machine where they are on. Ignored because it can
+        /// only assert anything on a machine that has actually installed the
+        /// relay:
+        ///
+        ///     cargo test schtasks_and_powershell_agree -- --ignored --nocapture
+        #[test]
+        #[ignore = "needs the relay/watchdog tasks registered on this machine"]
+        fn schtasks_and_powershell_agree_about_the_tasks() {
+            for name in [TASK_NAME, WATCHDOG_TASK_NAME] {
+                let via_ps = powershell(&format!(
+                    "if (Get-ScheduledTask -TaskName '{}' -ErrorAction SilentlyContinue) \
+                     {{ 'yes' }} else {{ 'no' }}",
+                    name
+                ))
+                .map_or(false, |o| {
+                    String::from_utf8_lossy(&o.stdout).trim() == "yes"
+                });
+                let via_schtasks = task_exists(name);
+                println!("{name}: schtasks={via_schtasks} powershell={via_ps}");
+                assert_eq!(via_schtasks, via_ps, "readers disagree about {name}");
+            }
+        }
+
         /// The exe must not sit under the user profile: a scheduled task cannot
         /// launch anything from there on a machine with anti-persistence
         /// heuristics.
@@ -471,6 +524,14 @@ mod unix_impl {
     /// The unit file existing is what "enabled" means here.
     pub fn is_enabled() -> bool {
         unit_path().exists()
+    }
+
+    /// Linux does not have a separate watchdog task or systemd unit: the proxy
+    /// unit's own `Restart=` handles crash restarts, and auto-update does not
+    /// replace binaries out from under the running user on Linux.
+    #[allow(dead_code)]
+    pub fn is_watchdog_enabled() -> bool {
+        false
     }
 
     pub fn is_running() -> bool {

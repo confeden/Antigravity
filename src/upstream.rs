@@ -579,13 +579,22 @@ fn trace_through(up: &Upstream, host: &'static str) -> Option<(String, String)> 
 ///
 /// Same trace hosts and parsing as `exit_info`, just dialed directly. Bounded so
 /// a dead network cannot hang the menu.
+#[allow(dead_code)]
 pub fn machine_exit() -> Option<(String, String)> {
     TRACE_HOSTS.iter().find_map(|h| trace_direct(h))
 }
 
+#[allow(dead_code)]
 fn trace_direct(host: &'static str) -> Option<(String, String)> {
-    let addr = (host, 443u16);
-    let mut sock = std::net::TcpStream::connect(addr).ok()?;
+    let addrs: Vec<_> = (host, 443u16).to_socket_addrs().ok()?.collect();
+    let mut sock = None;
+    for addr in addrs {
+        if let Ok(s) = TcpStream::connect_timeout(&addr, Duration::from_secs(5)) {
+            sock = Some(s);
+            break;
+        }
+    }
+    let mut sock = sock?;
     sock.set_read_timeout(Some(PROBE_BUDGET)).ok();
     sock.set_write_timeout(Some(PROBE_BUDGET)).ok();
     let name = ServerName::try_from(host).ok()?;

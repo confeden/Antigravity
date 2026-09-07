@@ -73,6 +73,14 @@ fn token_for(seed: &str, sep: &str, version: &str) -> String {
 fn main() {
     println!("cargo:rerun-if-changed=src/canary.rs");
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-env-changed=AG_FULL_VERSION");
+
+    if let Ok(full_ver) = env::var("AG_FULL_VERSION") {
+        let trimmed = full_ver.trim();
+        if !trimmed.is_empty() {
+            println!("cargo:rustc-env=AG_FULL_VERSION={}", trimmed);
+        }
+    }
 
     let version = env::var("CARGO_PKG_VERSION").unwrap_or_default();
     let canary_src = fs::read_to_string("src/canary.rs").expect("src/canary.rs is missing");

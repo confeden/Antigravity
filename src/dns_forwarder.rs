@@ -564,16 +564,40 @@ pub fn run() -> Result<(), String> {
     // spent that window with no network.
     #[cfg(target_os = "windows")]
     thread::spawn(|| {
+        let var = crate::endpoint::PROXY_ENV_VAR;
+        // Before the wait, and unconditionally: retiring the user-wide pair an
+        // older build wrote has nothing to do with whether *our* listener came
+        // up. Behind the wait it would be skipped on exactly the machines that
+        // need it most - the ones where 53129 is taken or reserved, where the old
+        // value names a port that no longer answers and takes the whole machine's
+        // proxy-aware traffic with it (G20, G31).
+        match crate::endpoint::remove_legacy_proxy_env(&proxy::proxy_url()) {
+            Ok(true) => log_proxy("снята прежняя общесистемная HTTPS_PROXY"),
+            Ok(false) => {}
+            Err(e) => log_proxy(&format!("прежняя HTTPS_PROXY не снята: {}", e)),
+        }
         if !proxy::wait_for_listener(PROXY_START_BUDGET) {
-            log_proxy("HTTPS_PROXY не выставлена: локальный прокси не поднялся");
+            log_proxy(&format!(
+                "{} не выставлена: локальный прокси не поднялся",
+                var
+            ));
+            return;
+        }
+        // The window's switch, honoured here as well as there. Without it a user
+        // who turned the local proxy off got it back at the next relay start -
+        // the relay wrote the variable unconditionally - and the switch looked
+        // like it had simply not worked. The legacy-pair removal above stays
+        // unconditional: that is cleanup, not a route.
+        if !crate::settings::local_proxy_wanted() {
+            log_proxy(&format!("{} не выставлена: выключена в настройках", var));
             return;
         }
         match crate::endpoint::ensure_proxy_env(&proxy::proxy_url()) {
             Ok(crate::endpoint::Outcome::Applied) => {
-                log_proxy("HTTPS_PROXY снова указывает на локальный прокси")
+                log_proxy(&format!("{} снова указывает на локальный прокси", var))
             }
             Ok(crate::endpoint::Outcome::AlreadySet) => {}
-            Err(e) => log_proxy(&format!("HTTPS_PROXY не восстановлена: {}", e)),
+            Err(e) => log_proxy(&format!("{} не восстановлена: {}", var, e)),
         }
     });
 
