@@ -342,12 +342,13 @@ const WARM_EVERY: Duration = Duration::from_secs(15);
 /// not reliably fit in that second (race, then a liveness probe, and a provider
 /// that goes quiet costs the whole timeout), and it does not have to: doing the
 /// work on a timer instead means the client's query is answered from memory.
-/// How often the relay route is checked while it is being used. Rare, because a
-/// working route needs no supervision and the probe is a real request.
+/// How often the user's own proxy, the built-in exits and the direct route are
+/// re-timed while healthy. Rare, because a working route needs no supervision
+/// and each probe is a real request. The relay is deliberately kept off this
+/// clock - see the warm loop below for why.
 const PROBE_HEALTHY_EVERY: Duration = Duration::from_secs(2 * 60);
 
 fn warm_forever() {
-    let mut since_probe = PROBE_HEALTHY_EVERY;
     let mut since_upstream = PROBE_HEALTHY_EVERY;
     let mut since_exits = PROBE_HEALTHY_EVERY;
     let mut since_direct = PROBE_HEALTHY_EVERY;
@@ -408,14 +409,17 @@ fn warm_forever() {
             answer_region_400(&refusals);
         }
         resolvers::warm(dns::core_namespaces(), egress);
-        // Checked on our own time rather than with someone's request. While the
-        // route is benched this runs every pass, because the cost being paid then
-        // is every client sitting on the slow route for as long as it takes to
-        // notice the relay came back - which was twenty minutes after a flap that
-        // lasted seconds.
-        if proxy::relay_is_benched() || since_probe >= PROBE_HEALTHY_EVERY {
+        // The relay is somebody else's server, so it is the one route we never
+        // probe on a timer. A health check every two minutes, from every machine
+        // running this tool, is precisely the `handshake_completed` beacon a relay
+        // operator can count and attribute (kb/rivals.md) - and the "considerate
+        // guest" rule the built-in exits follow just below applies with far more
+        // force to a route we do not own. Left unmeasured, the route table already
+        // treats it as a last resort (an unmeasured route sorts after every
+        // measured one); it is touched unbidden only to lift a bench a real
+        // failure set, so a transient fault is not made permanent.
+        if proxy::relay_is_benched() {
             proxy::probe_relay();
-            since_probe = Duration::ZERO;
         }
         // The user's own proxy is checked the same way and for the same reason:
         // it must be stood down before a request meets it, and picked back up
@@ -446,7 +450,6 @@ fn warm_forever() {
         }
         routes::refresh_leader(|k| proxy::route_usable(k, ROUTE_PROBE_HOST));
         thread::sleep(WARM_EVERY);
-        since_probe += WARM_EVERY;
         since_upstream += WARM_EVERY;
         since_exits += WARM_EVERY;
         since_direct += WARM_EVERY;

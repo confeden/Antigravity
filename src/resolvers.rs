@@ -86,12 +86,6 @@ pub const PROVIDERS: &[Provider] = &[
         transport: Transport::Doh(&DNS_AI),
     },
     Provider {
-        name: "xbox-dns.ru",
-        v4: &["111.88.96.50", "111.88.96.51"],
-        v6: &["2a00:ab00:1233:26::50", "2a00:ab00:1233:26::51"],
-        transport: Transport::Udp,
-    },
-    Provider {
         name: "comss.one",
         v4: &["83.220.169.155", "212.109.195.93", "195.133.25.16"],
         v6: &[],
@@ -101,6 +95,19 @@ pub const PROVIDERS: &[Provider] = &[
         name: "geohide.ru",
         v4: &["45.155.204.190", "37.230.192.51"],
         v6: &["2a0c:9300:0:54::1"],
+        transport: Transport::Udp,
+    },
+    // Last on purpose (owner). It returns genuine Google for the two gate hosts
+    // (kb/routes.md), so it never wins a race as `Substituted` and its place at
+    // the back costs the pool nothing; and its resolver is a third party's, so
+    // leaning on it least is the same "considerate guest" rule the relay now
+    // follows. It stays in the pool - it still recognises an unsubstituted answer
+    // - but sits at the tail of the compiled default order (rotation-off single
+    // choice, the window's list, and tie-break preference all follow from this).
+    Provider {
+        name: "xbox-dns.ru",
+        v4: &["111.88.96.50", "111.88.96.51"],
+        v6: &["2a00:ab00:1233:26::50", "2a00:ab00:1233:26::51"],
         transport: Transport::Udp,
     },
 ];
