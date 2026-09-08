@@ -360,7 +360,11 @@ fn connect_bounded(host: &str, port: u16, budget: Duration) -> Result<TcpStream,
 pub fn route_usable(kind: routes::Kind, host: &str) -> bool {
     match kind {
         routes::Kind::Own => upstream::available() && !routes::is_penalised(routes::Kind::Own),
-        routes::Kind::Exits => exits_available(),
+        // The window's switch, checked at the one place the route is offered
+        // from. Off means the route is simply not usable, which the table
+        // already knows how to deal with - it is the same answer an exit that
+        // failed its probe gives.
+        routes::Kind::Exits => crate::settings::builtin_exits_enabled() && exits_available(),
         routes::Kind::Relay => relay_usable(),
         routes::Kind::Direct => direct_usable(host),
     }

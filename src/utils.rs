@@ -1,5 +1,4 @@
 use std::env;
-use std::io::{self, Write};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -102,32 +101,131 @@ fn drain<R: std::io::Read + Send + 'static>(mut pipe: R) -> thread::JoinHandle<V
     })
 }
 
-pub fn clear_screen() {
-    // VT is enabled at startup, so the escape sequence works everywhere and
-    // avoids spawning a cmd.exe just to clear the screen.
-    print!("\x1b[2J\x1b[3J\x1b[1;1H");
-    io::stdout().flush().ok();
+/// Attaches this process to the console of whoever launched it, if there is
+/// one, so a windows-subsystem binary can still answer `--about` on stdout.
+/// Does nothing when launched from a shortcut (no parent console) - the caller
+/// must not depend on output appearing.
+#[cfg(target_os = "windows")]
+pub fn attach_parent_console() {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn AttachConsole(dw_process_id: u32) -> i32;
+        fn GetStdHandle(n_std_handle: u32) -> *mut std::ffi::c_void;
+        fn SetStdHandle(n_std_handle: u32, h_handle: *mut std::ffi::c_void) -> i32;
+        fn CreateFileW(
+            lp_file_name: *const u16,
+            dw_desired_access: u32,
+            dw_share_mode: u32,
+            lp_security_attributes: *mut std::ffi::c_void,
+            dw_creation_disposition: u32,
+            dw_flags_and_attributes: u32,
+            h_template_file: *mut std::ffi::c_void,
+        ) -> *mut std::ffi::c_void;
+    }
+
+    const ATTACH_PARENT_PROCESS: u32 = 0xFFFF_FFFF;
+    const STD_OUTPUT_HANDLE: u32 = (-11i32) as u32;
+    const STD_ERROR_HANDLE: u32 = (-12i32) as u32;
+    const GENERIC_READ: u32 = 0x8000_0000;
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const FILE_SHARE_READ: u32 = 1;
+    const FILE_SHARE_WRITE: u32 = 2;
+    const OPEN_EXISTING: u32 = 3;
+    let invalid_handle = (-1isize) as *mut std::ffi::c_void;
+
+    unsafe {
+        AttachConsole(ATTACH_PARENT_PROCESS);
+
+        let conout: Vec<u16> = "CONOUT$\0".encode_utf16().collect();
+        // Only a stream that has nowhere to go gets repointed at the console.
+        //
+        // A windows-subsystem process started from a shell normally has no std
+        // handles at all, which is why they have to be opened here. But
+        // `AG_2.12.2.exe --about > provenance.txt` starts with a perfectly good
+        // handle to that file, and repointing stdout at CONOUT$ regardless would
+        // put the banner on screen and leave the file empty — breaking the one
+        // use the flag exists for.
+        for which in [STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+            let existing = GetStdHandle(which);
+            if !existing.is_null() && existing != invalid_handle {
+                continue;
+            }
+            let h = CreateFileW(
+                conout.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                std::ptr::null_mut(),
+                OPEN_EXISTING,
+                0,
+                std::ptr::null_mut(),
+            );
+            if h != invalid_handle && !h.is_null() {
+                SetStdHandle(which, h);
+            }
+        }
+    }
 }
 
-/// True when the host terminal renders OSC 8 hyperlinks (Windows Terminal and
-/// most modern emulators). The legacy conhost window does not, so links are
-/// printed as plain text there and opened through the menu instead.
-pub fn supports_hyperlinks() -> bool {
-    env::var("WT_SESSION").is_ok()
-        || env::var("TERM_PROGRAM").is_ok()
-        || env::var("ConEmuANSI").map(|v| v == "ON").unwrap_or(false)
+#[cfg(not(target_os = "windows"))]
+pub fn attach_parent_console() {}
+
+/// A last-resort message box, for failures that happen before or instead of the
+/// window. Nothing else can be shown at that point: a windows-subsystem process
+/// has no console to print to.
+#[cfg(target_os = "windows")]
+pub fn message_box(title: &str, text: &str) {
+    #[link(name = "user32")]
+    extern "system" {
+        fn MessageBoxW(
+            hwnd: *mut std::ffi::c_void,
+            text: *const u16,
+            caption: *const u16,
+            utype: u32,
+        ) -> i32;
+    }
+    let wide_text: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    let wide_title: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            wide_text.as_ptr(),
+            wide_title.as_ptr(),
+            0x10, // MB_ICONERROR
+        );
+    }
 }
 
-// Format a URL for display. On terminals that support it the text becomes a
-// real hyperlink (Ctrl+Click); elsewhere it stays a readable, selectable URL.
-pub fn link(url: &str, text: &str) -> String {
-    if supports_hyperlinks() {
-        format!(
-            "\x1b[94;4m\x1b]8;;{}\x1b\\{}\x1b]8;;\x1b\\\x1b[0m\x1b[92m",
-            url, text
-        )
-    } else {
-        format!("\x1b[94;4m{}\x1b[0m\x1b[92m", text)
+/// The same on Linux, and it has to be a *dialog* for the same reason it is one
+/// on Windows.
+///
+/// The only caller is `gui::run` failing to open a window at all — no GL driver,
+/// no adapter, no X11 and no Wayland. That user started the tool by double
+/// clicking a launcher, so there is no terminal for `eprintln!` to reach and the
+/// program appears to do nothing whatsoever. stderr still gets the text (for a
+/// run from a shell); the dialog is the copy the desktop user can see. Best
+/// effort by design: none of these three is guaranteed to be installed, and a
+/// missing one must not turn a diagnostic into a second failure.
+#[cfg(not(target_os = "windows"))]
+pub fn message_box(title: &str, text: &str) {
+    eprintln!("{}: {}", title, text);
+    let tried = [
+        (
+            "zenity",
+            vec!["--error", "--no-markup", "--title", title, "--text", text],
+        ),
+        ("kdialog", vec!["--title", title, "--error", text]),
+        ("xmessage", vec!["-center", text]),
+    ];
+    for (bin, args) in tried {
+        if Command::new(bin)
+            .args(args)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok()
+        {
+            return;
+        }
     }
 }
 
@@ -135,10 +233,37 @@ pub fn link(url: &str, text: &str) -> String {
 pub fn open_url(url: &str) {
     #[cfg(target_os = "windows")]
     {
-        Command::new("cmd")
-            .args(["/C", "start", "", url])
-            .status()
-            .ok();
+        // ShellExecuteW rather than `cmd /C start`: the GUI build has no console
+        // of its own, so spawning cmd.exe flashes a black window on screen for
+        // every link the user clicks. This asks the shell directly and shows
+        // nothing.
+        #[link(name = "shell32")]
+        extern "system" {
+            fn ShellExecuteW(
+                hwnd: *mut std::ffi::c_void,
+                op: *const u16,
+                file: *const u16,
+                params: *const u16,
+                dir: *const u16,
+                show: i32,
+            ) -> *mut std::ffi::c_void;
+        }
+        fn wide(s: &str) -> Vec<u16> {
+            s.encode_utf16().chain(std::iter::once(0)).collect()
+        }
+        const SW_SHOWNORMAL: i32 = 1;
+        let op = wide("open");
+        let file = wide(url);
+        unsafe {
+            ShellExecuteW(
+                std::ptr::null_mut(),
+                op.as_ptr(),
+                file.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                SW_SHOWNORMAL,
+            );
+        }
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -146,13 +271,69 @@ pub fn open_url(url: &str) {
     }
 }
 
-/// Prints a prompt and returns the trimmed line the user typed.
-pub fn prompt(label: &str) -> String {
-    print!("{}", label);
-    io::stdout().flush().ok();
-    let mut input = String::new();
-    io::stdin().read_line(&mut input).unwrap_or(0);
-    input.trim().to_string()
+/// The clipboard as text, or `None` if it holds none.
+///
+/// Through `arboard` rather than a hand-rolled `OpenClipboard`/`GetClipboardData`
+/// pair, and it costs nothing to do so: eframe's own clipboard support is
+/// `arboard`, so the crate is already linked into this binary — this only asks it
+/// a question eframe never exposes. egui hands a *paste* to the focused widget
+/// when the user presses Ctrl+V and offers no way to ask for one, which is why
+/// the right-click-to-paste on the licence field needs to read the clipboard
+/// itself.
+pub fn clipboard_text() -> Option<String> {
+    let mut cb = arboard::Clipboard::new().ok()?;
+    let text = cb.get_text().ok()?;
+    (!text.trim().is_empty()).then_some(text)
+}
+
+/// Starts this exe again through the shell's `runas` verb, i.e. behind a UAC
+/// prompt, and reports whether the new process was actually launched.
+///
+/// There is no way to gain elevation in place: on Windows it is a property of
+/// the process token, fixed at creation. The window therefore cannot "become"
+/// admin — the honest button is one that starts over. A user who dismisses the
+/// UAC dialog gets `false` here and keeps the window they had.
+#[cfg(target_os = "windows")]
+pub fn relaunch_elevated() -> bool {
+    #[link(name = "shell32")]
+    extern "system" {
+        fn ShellExecuteW(
+            hwnd: *mut std::ffi::c_void,
+            op: *const u16,
+            file: *const u16,
+            params: *const u16,
+            dir: *const u16,
+            show: i32,
+        ) -> *mut std::ffi::c_void;
+    }
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    let Ok(exe) = env::current_exe() else {
+        return false;
+    };
+    let op = wide("runas");
+    let file = wide(&exe.to_string_lossy());
+    let dir = exe
+        .parent()
+        .map(|p| wide(&p.to_string_lossy()))
+        .unwrap_or_else(|| wide(""));
+    const SW_SHOWNORMAL: i32 = 1;
+    // ShellExecuteW returns a value <= 32 for every failure, including the user
+    // saying no to the prompt (SE_ERR_ACCESSDENIED). Anything above that means a
+    // process really started.
+    let rc = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            op.as_ptr(),
+            file.as_ptr(),
+            std::ptr::null(),
+            dir.as_ptr(),
+            SW_SHOWNORMAL,
+        )
+    };
+    rc as isize > 32
 }
 
 #[cfg(target_os = "windows")]
@@ -177,27 +358,6 @@ pub fn mask_path(path: &str) -> String {
         Ok(home) if !home.is_empty() => path.replace(&home, "~"),
         _ => path.to_string(),
     }
-}
-
-/// A path short enough to sit in a progress line: the last few components,
-/// with anything above them elided.
-///
-/// `mask_path` replaces the profile directories with their variable names, which
-/// keeps a log honest but still runs long. This is for the screen, where the
-/// only question is "which of my installs is this".
-pub fn short_path(path: &str) -> String {
-    // Written as a code point so no tool that rewrites escapes can turn one
-    // separator into two, or none. Backslash on Windows, forward slash elsewhere.
-    #[cfg(target_os = "windows")]
-    const SEP: char = '\u{5C}';
-    #[cfg(not(target_os = "windows"))]
-    const SEP: char = '/';
-    let parts: Vec<&str> = path.split(SEP).filter(|p| !p.is_empty()).collect();
-    if parts.len() <= 3 {
-        return path.to_string();
-    }
-    let sep = SEP.to_string();
-    format!("...{}{}", sep, parts[parts.len() - 3..].join(&sep))
 }
 
 #[cfg(target_os = "windows")]
@@ -301,31 +461,4 @@ mod tests {
         assert_eq!(bare, "VISIBLE", "the bug should reproduce without the flag");
         assert_ne!(flagged, "VISIBLE", "CREATE_NO_WINDOW must hide the console");
     }
-}
-
-pub fn print_results(successes: &[String], failures: &[String]) {
-    println!(
-        "\n{}",
-        "============================================================"
-    );
-    println!("{}", "ИТОГИ:");
-    if !successes.is_empty() {
-        println!("{}", "Успешно разблокированы:");
-        for s in successes {
-            println!("  {} {}", "[+]", s);
-        }
-    }
-    if !failures.is_empty() {
-        println!("{}", "Ошибки:");
-        for f in failures {
-            println!("  \x1b[33m[-] {}\x1b[0m\x1b[92m", f);
-        }
-    }
-    println!(
-        "{}",
-        "============================================================"
-    );
-    println!("{}", "Чтобы вернуться в главное меню, нажмите Enter");
-    let mut wait = String::new();
-    io::stdin().read_line(&mut wait).unwrap();
 }

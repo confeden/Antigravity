@@ -1,6 +1,6 @@
 [package]
 name = "ag_unlocker"
-version = "2.11.0"
+version = "2.12.2"
 edition = "2021"
 description = "Antigravity Configuration Tool"
 authors = ["Brent t.me/nova_txt"]
@@ -17,6 +17,18 @@ webpki-roots = "1"
 # Decrypts the relay credential baked in by build.rs (owner build only; the
 # private src/relay.rs is the only user).
 aes-gcm = "0.10"
+# The GUI. Immediate mode, pure Rust, one static exe with no runtime to install
+# (no WebView2, no GTK) - that is what makes it drop onto an arbitrary Windows
+# 10/11 machine and still start. eframe 0.36 defaults to the wgpu backend
+# (DirectX 12 on Windows); `glow` is added on top so a machine where wgpu finds
+# no usable adapter can still fall back to plain OpenGL. See gui::run.
+eframe = { version = "0.36", features = ["glow"] }
+# Reading the clipboard (right-click on the licence field pastes into it). Not a
+# new dependency in any real sense: eframe's own clipboard support is arboard, so
+# the crate is already linked in - this only asks it a question egui does not
+# expose. `default-features = false` because the image half is eframe's business,
+# not ours; features unify, so the build is unchanged either way.
+arboard = { version = "3.6", default-features = false }
 
 [target.'cfg(windows)'.dependencies.windows-sys]
 version = "0.52.0"
@@ -38,11 +50,13 @@ getrandom = "0.2"
 
 [profile.release]
 opt-level = "z"
-# LTO off by request (faster builds). The release exe is UPX-compressed in place
-# by build_rust.py, so final on-disk size is dominated by the packer, not LTO.
-# Note: turning LTO back on would shrink the (pre- and post-pack) binary a little
-# further and does NOT affect startup - flip if size matters more than build time.
-lto = false
+# LTO on since 2.12.2_1. It was off for build speed while the exe was ~1 MB and
+# UPX made the on-disk size somebody else's problem; the GUI took the binary to
+# ~12.5 MB and UPX is off for good (D1-D2, antivirus), so the tradeoff flipped.
+# It costs build time only: link-time optimisation happens in the linker, and the
+# file that comes out starts no slower than the one that went in - which is the
+# whole reason it is the size lever to reach for first, ahead of any packer.
+lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = true

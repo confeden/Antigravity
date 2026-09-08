@@ -50,7 +50,24 @@ const LOG_LIMIT_BYTES: u64 = 64 * 1024;
 struct FileState {
     handled: Option<(u64, SystemTime)>,
     pending: Option<(u64, SystemTime)>,
+    /// How many times the patch has been deferred *for this exact file shape*
+    /// because it was in use, and which shape that was.
+    ///
+    /// The shape is part of the state on purpose. Acting clears `pending`, so
+    /// the next poll always takes the "a change I have not seen before" branch —
+    /// and a counter reset there is a counter that never reaches its limit. That
+    /// is a `taskkill` every four seconds, for ever.
+    blocked: u32,
+    blocked_for: Option<(u64, SystemTime)>,
 }
+
+/// How many times a settled-but-locked target is worth closing the app for.
+///
+/// The point is to hold the *launch*, not to fight the user: the update itself
+/// is never interrupted (a file mid-write never settles, so this code is not
+/// even reached), and after this many tries the app is left alone unpatched
+/// rather than being killed forever.
+const MAX_LAUNCH_HOLDS: u32 = 3;
 
 /// Spawns the watcher. Returns immediately; the relay's own loop keeps the
 /// process alive. A panic here must not take the relay down (release builds
@@ -86,9 +103,19 @@ fn run() {
         }
         cycles = cycles.wrapping_add(1);
 
-        for inst in &installs {
-            for target in targets(inst) {
-                inspect(&target, states.entry(target.clone()).or_default());
+        // Read per cycle rather than once at start: the task stays registered
+        // while the switch is off, so the setting is what has to take effect
+        // immediately. Cached with a short TTL, so this is not a file read per
+        // two seconds.
+        // Both switches, not just the auto-patch one. `client_patch` off means
+        // the user asked for the patch to be *gone*; a watchdog that only reads
+        // `auto_patch` would treat the unpatched binary as an update and put the
+        // patch straight back.
+        if crate::settings::auto_patch_enabled() && crate::settings::client_patch_enabled() {
+            for inst in &installs {
+                for target in targets(inst) {
+                    inspect(&target, states.entry(target.clone()).or_default());
+                }
             }
         }
 
@@ -100,22 +127,23 @@ fn run() {
 const LISTENER_CHECK_EVERY: u32 = 15;
 /// Consecutive misses before the variable comes off: 3 x 30 s. A relay
 /// restarting under its task (3 tries a minute apart) is back well inside that;
-/// one that is not coming back has by then cost every proxy-aware program on
-/// the machine ninety seconds, which is enough.
+/// one that is not coming back has by then cost Antigravity ninety seconds of
+/// `connection refused` on every request, which is enough.
 const LISTENER_DEAD_AFTER: u32 = 3;
 /// Once the variable was found absent or removed, how long before the (slow,
 /// PowerShell-backed) environment read is worth repeating.
 const ENV_RECHECK: Duration = Duration::from_secs(10 * 60);
 
-/// Keeps `HTTPS_PROXY` from outliving the listener it names.
+/// Keeps the proxy variable from outliving the listener it names.
 ///
-/// The variable is user-wide, so everything that honours it - not only
-/// Antigravity - goes through `127.0.0.1:53129`. A relay that has died and is not
-/// coming back would then take the machine's network with it (G20, seen once
-/// after a revert). This is the runtime half of that fix: no listener for a
-/// while and the variable is ours, off it comes; the relay puts it back when it
-/// starts again (`endpoint::ensure_proxy_env`). A value that is not ours is never
-/// touched.
+/// Originally this guarded the machine: the variable was `HTTPS_PROXY`, user-wide,
+/// so a relay that died and did not come back took everything proxy-aware down
+/// with it (G20, seen once after a revert). Since `2.11.0_5` the name is private
+/// to the patched binaries, so what is at stake is Antigravity alone - but that
+/// still means no models and no sign-in, so the guard stays: no listener for a
+/// while and off the variable comes; the relay puts it back when it starts again
+/// (`endpoint::ensure_proxy_env`). A proxy the user set is under a different name
+/// entirely and is never touched.
 #[derive(Default)]
 struct ListenerGuard {
     misses: u32,
@@ -143,12 +171,17 @@ impl ListenerGuard {
         let ca = crate::proxy::ca_cert_path().to_string_lossy().to_string();
         match crate::endpoint::remove_proxy_if_ours(&url, &ca) {
             Ok(true) => log(&format!(
-                "прокси {} не отвечает {} с — HTTPS_PROXY снята, чтобы не ронять сеть",
+                "прокси {} не отвечает {} с — переменная {} снята",
                 url,
-                LISTENER_DEAD_AFTER * LISTENER_CHECK_EVERY * POLL.as_secs() as u32
+                LISTENER_DEAD_AFTER * LISTENER_CHECK_EVERY * POLL.as_secs() as u32,
+                crate::endpoint::PROXY_ENV_VAR
             )),
             Ok(false) => {}
-            Err(e) => log(&format!("не удалось снять HTTPS_PROXY: {}", e)),
+            Err(e) => log(&format!(
+                "не удалось снять {}: {}",
+                crate::endpoint::PROXY_ENV_VAR,
+                e
+            )),
         }
     }
 }
@@ -168,6 +201,13 @@ fn inspect(target: &Path, st: &mut FileState) {
     // never read or patched.
     if st.pending != Some(cur) {
         st.pending = Some(cur);
+        // Only a genuinely different file restarts the count. Comparing against
+        // the shape the count was raised for, rather than resetting on sight,
+        // is what keeps MAX_LAUNCH_HOLDS a limit instead of decoration.
+        if st.blocked_for != Some(cur) {
+            st.blocked = 0;
+            st.blocked_for = None;
+        }
         return;
     }
     st.pending = None;
@@ -184,6 +224,8 @@ fn inspect(target: &Path, st: &mut FileState) {
                 show(target),
                 n
             ));
+            st.blocked = 0;
+            st.blocked_for = None;
             // The rename is same-length, so len is unchanged and only mtime
             // moved; re-stat so our own write is not seen as a new change.
             st.handled = stat(target).or(Some(cur));
@@ -199,9 +241,58 @@ fn inspect(target: &Path, st: &mut FileState) {
             st.handled = Some(cur);
         }
         RepatchOutcome::Failed(e) => {
-            // Transient - usually locked mid-update. Leave `handled` alone so
-            // the unchanged file is re-detected and retried on a later poll.
+            // The file is settled but the write did not land. Usually that is
+            // Antigravity having been launched between the update finishing and
+            // this patch: the image is locked, and left alone it stays locked
+            // for as long as the app is open, so the user runs an unpatched
+            // build indefinitely with the patch "deferred" for ever.
+            //
+            // The *launch* is what gets undone, never the update — a file still
+            // being written never settles, so this branch is not reached while
+            // one is in progress.
             log(&format!("deferred, will retry: {} - {}", show(target), e));
+
+            // Only a lock. A permission error, a full disk or a read failure is
+            // not something closing Antigravity can fix, and `write_binary` has
+            // already killed the holder and retried once by the time a genuine
+            // lock reaches here — so a second kill is only worth attempting for
+            // the case it addresses.
+            let looks_locked = {
+                let low = e.to_lowercase();
+                low.contains("used by another process")
+                    || low.contains("занят")
+                    || low.contains("access is denied")
+                    || low.contains("отказано в доступе")
+                    || low.contains("os error 32")
+                    || low.contains("os error 33")
+            };
+            // `kill_holder` closes processes by image name, so it only means
+            // anything for a native binary; asking Windows to kill `main.js`
+            // would be a wasted spawn.
+            let is_native = target.extension().and_then(|e| e.to_str()) != Some("js");
+
+            if !is_native || !looks_locked {
+                return;
+            }
+            if st.blocked >= MAX_LAUNCH_HOLDS {
+                if st.blocked == MAX_LAUNCH_HOLDS {
+                    st.blocked += 1;
+                    log(&format!(
+                        "файл занят не Antigravity - оставляю как есть: {}",
+                        show(target)
+                    ));
+                }
+                return;
+            }
+            st.blocked += 1;
+            st.blocked_for = Some(cur);
+            log(&format!(
+                "закрываю запущенный Antigravity, чтобы применить патч ({}/{}): {}",
+                st.blocked,
+                MAX_LAUNCH_HOLDS,
+                show(target)
+            ));
+            patch_binary::kill_holder(target);
         }
     }
 }

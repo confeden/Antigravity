@@ -57,6 +57,15 @@ pub struct Provider {
 /// blocked region. All three were verified to answer over plain UDP:53 and to
 /// front a real SNI proxy (see kb/dns.md); their lists differ and change
 /// without notice, which is exactly why the choice is made per query.
+/// The provider names, in pool order, for the window's per-provider switches.
+///
+/// Names only. The addresses stay where they are: a switch list is a new place
+/// for them to be read out of, and what a user needs in order to turn one off is
+/// the name they already see in the log line.
+pub fn provider_names() -> Vec<&'static str> {
+    PROVIDERS.iter().map(|p| p.name).collect()
+}
+
 pub const PROVIDERS: &[Provider] = &[
     // First on purpose. Measured 2026-08-30 against 8.8.8.8: it substitutes
     // `cloudcode-pa.googleapis.com` -> 186.246.45.126 (TTL 60), and that address
@@ -318,20 +327,39 @@ static CHOICE: Mutex<Option<HashMap<(String, u16), (usize, Verdict, Instant)>>> 
 /// these only when the relay is off - with the relay up a v6 nameserver would
 /// let Windows send the query straight out, skipping the relay entirely.
 pub fn all_v6() -> Vec<&'static str> {
-    PROVIDERS
-        .iter()
+    let mut list: Vec<&'static str> = in_user_order()
+        .into_iter()
+        .filter(|p| !denied(p.name))
         .flat_map(|p| p.v6.iter().copied())
-        .collect()
+        .collect();
+    if !crate::settings::rotation_enabled() {
+        // Rotation off narrows the nameserver list too, or Windows would still
+        // be pointed at providers the user took out of the pool.
+        list.truncate(1);
+    }
+    list
 }
 
 /// One address per provider - what goes into an NRPT rule. Windows tries the
 /// nameservers in order, so listing every address of one provider ahead of the
 /// next provider would make a provider outage look like a total failure.
 pub fn fallback_v4() -> Vec<&'static str> {
-    PROVIDERS
-        .iter()
+    // Filtered by the deny-list only, *then* truncated: the head of `PROVIDERS`
+    // speaks DoH and carries no UDP address at all (I49), so narrowing by name
+    // first would leave Windows a rule with no nameserver in it. Truncating the
+    // assembled addresses picks the first enabled provider that actually has
+    // one, which is what a nameserver list needs.
+    // Windows tries nameservers in the order given, so the user's order is what
+    // decides which service sees a lookup first.
+    let mut list: Vec<&'static str> = in_user_order()
+        .into_iter()
+        .filter(|p| !denied(p.name))
         .filter_map(|p| p.v4.first().copied())
-        .collect()
+        .collect();
+    if !crate::settings::rotation_enabled() {
+        list.truncate(1);
+    }
+    list
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -474,9 +502,16 @@ fn is_blackhole(addr: &IpAddr) -> bool {
 /// Whether `addr` will actually serve `sni` inside `budget`.
 ///
 /// TCP alone is not the question the client asks. Measured within one minute on
-/// one machine: geohide's proxy accepted TCP in 34 ms and then spent 10.5 s on
-/// the TLS handshake, while xbox's did the whole handshake in 249 ms. A
+/// one machine: one provider's proxy accepted TCP in 34 ms and then spent 10.5 s
+/// on the TLS handshake, while another did the whole handshake in 249 ms. A
 /// TCP-only probe calls both healthy and the client pays the difference.
+///
+/// With `sni` set the handshake is also the **security** check: rustls validates
+/// the chain against the public roots and the name against the certificate, so
+/// an address that fronts anything other than a genuine Google endpoint fails
+/// here rather than in the client. That is why the three "could not even try"
+/// paths below answer `false`: giving an unverifiable address the benefit of the
+/// doubt is exactly the doubt the check exists to remove.
 ///
 /// When `sni` is `None`, fallback to default probe hostname (`PREFERRED_NAMES[0]`)
 /// and complete TLS handshake validation to avoid false positives on blackhole IPs
@@ -561,7 +596,14 @@ fn dead_addrs(addrs: &[IpAddr], fresh: bool, sni: Option<&str>) -> Vec<IpAddr> {
     for a in &unknown {
         let tx = tx.clone();
         let addr = *a;
-        let sni = sni.map(|s| s.to_string());
+        // The switch is read here, at the one place the probe is started, so an
+        // answer already in the liveness cache is not re-judged by a rule that
+        // changed after it was measured — the cache entry expires on its own.
+        let sni = if crate::settings::verify_tls_enabled() {
+            sni.map(|s| s.to_string())
+        } else {
+            None
+        };
         thread::spawn(move || {
             let ok = reachable(addr, budget, sni.as_deref());
             tx.send((addr, ok)).ok();
@@ -826,12 +868,109 @@ pub fn warm(names: &[&str], if_index: u32) {
 
 /// Sends `query` to every address of one provider in turn, stopping at the
 /// first that answers.
+/// Whether the user switched this provider off in the window.
+///
+/// Checked here, at the single point every racing path goes through, rather than
+/// by rebuilding the candidate list in each of them — the loops index `PROVIDERS`
+/// directly in half a dozen places and one of them would have been missed. A
+/// provider that is off simply never answers, which is a state the race already
+/// handles: it is what a dead front-end looks like.
+///
+/// The deny-list only ever *subtracts*, which is what keeps this safe: I22 says a
+/// rule's fallbacks list only providers measured to substitute that name, and a
+/// subset of a measured set is still measured. Adding one would not be.
+///
+/// Takes the settings cache's own lock and calls back into nothing, so it cannot
+/// take part in the reentrancy that I50 forbids.
+/// With rotation off, only this provider may answer: the first one in pool order
+/// the user has not switched off.
+///
+/// Pool order, not "whichever answered last" — the list is ordered by measured
+/// substitution, so its head is the one most likely to still be substituting.
+fn only_provider() -> Option<&'static str> {
+    let disabled = crate::settings::disabled_providers_cached();
+    in_user_order()
+        .into_iter()
+        .map(|p| p.name)
+        .find(|n| !disabled.iter().any(|d| d.eq_ignore_ascii_case(n)))
+}
+
+/// The pool laid out the way the user arranged it.
+///
+/// The compiled order is by measured substitution and is the default; a user who
+/// dragged the list into a different order gets theirs. Anything they never
+/// touched keeps its compiled position at the end, so a provider added in a later
+/// release still appears instead of being silently dropped by a saved order that
+/// predates it.
+fn in_user_order() -> Vec<&'static Provider> {
+    let wanted = crate::settings::provider_order_cached();
+    if wanted.is_empty() {
+        return PROVIDERS.iter().collect();
+    }
+    let mut out: Vec<&'static Provider> = Vec::new();
+    for name in &wanted {
+        if let Some(p) = PROVIDERS.iter().find(|p| p.name.eq_ignore_ascii_case(name)) {
+            if !out.iter().any(|q| q.name == p.name) {
+                out.push(p);
+            }
+        }
+    }
+    for p in PROVIDERS {
+        if !out.iter().any(|q| q.name == p.name) {
+            out.push(p);
+        }
+    }
+    out
+}
+
+/// The providers that can be handed to Windows as a nameserver.
+///
+/// A DoH provider carries no UDP address by construction (I49), so it can answer
+/// through the relay and still be useless in an NRPT rule. Leaving *only* those
+/// enabled empties the rule's fallback list, and a rule with no nameserver is
+/// worse than no rule at all — hence the guard in `ops`.
+pub fn udp_provider_names() -> Vec<&'static str> {
+    in_user_order()
+        .into_iter()
+        .filter(|p| !p.v4.is_empty())
+        .map(|p| p.name)
+        .collect()
+}
+
+/// The provider names in the user's order — what the window's list draws.
+pub fn ordered_provider_names() -> Vec<&'static str> {
+    in_user_order().into_iter().map(|p| p.name).collect()
+}
+
+/// Switched off by name in the window.
+fn denied(name: &str) -> bool {
+    crate::settings::disabled_providers_cached()
+        .iter()
+        .any(|d| d.eq_ignore_ascii_case(name))
+}
+
+fn provider_disabled(name: &str) -> bool {
+    if denied(name) {
+        return true;
+    }
+    // Rotation off: everything below the head of the list is treated exactly the
+    // way a switched-off provider is, so the race, the fallback list and the
+    // NRPT nameservers all narrow together instead of disagreeing.
+    if !crate::settings::rotation_enabled() {
+        return only_provider() != Some(name);
+    }
+    false
+}
+
 fn ask_provider(
     provider: &Provider,
     query: &[u8],
     if_index: u32,
     timeout: Duration,
 ) -> Option<Vec<u8>> {
+    if provider_disabled(provider.name) {
+        return None;
+    }
     match provider.transport {
         Transport::Udp => {
             for server in provider.v4 {

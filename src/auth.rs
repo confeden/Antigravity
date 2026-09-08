@@ -1,9 +1,6 @@
 use sha2::{Digest, Sha256};
 use std::fs;
-use std::io::{self, Write};
 use std::path::PathBuf;
-use std::thread;
-use std::time::Duration;
 
 // License model (intentionally soft — keys are free):
 //
@@ -30,6 +27,12 @@ fn key_secret() -> String {
     )
 }
 
+/// Constant-time check of a licence key against this build's version salt.
+///
+/// Deliberately does no sleeping: the throttle that used to live here cost
+/// 300 ms on the one screen every start goes through, and it bought nothing —
+/// the secret is committed on purpose (see above), so rate-limiting a local
+/// guess protects nothing. Any pacing belongs in the caller's UI, not here.
 pub fn verify_key(key: &str) -> bool {
     let k: String = key.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
     let k = k.to_uppercase();
@@ -169,41 +172,5 @@ pub fn save_license_key(key: &str) {
             let _ = fs::create_dir_all(parent);
         }
         let _ = fs::write(&path, key.trim());
-    }
-}
-
-pub fn login_screen() {
-    // Check cached key first: if valid for CARGO_PKG_VERSION, bypass prompt
-    if try_cached_login() {
-        return;
-    }
-
-    loop {
-        crate::utils::clear_screen();
-        println!("{}", "=== ПРОВЕРКА ДОСТУПА ===");
-        println!();
-        println!("Бесплатный ключ можно взять в группе t.me/nova_txt в комнате \"Antigravity\", для каждой версии анлокера ключи разные");
-        println!();
-        print!("{}", "Введите лицензионный ключ: ");
-        io::stdout().flush().unwrap();
-
-        let mut key = String::new();
-        let bytes_read = io::stdin().read_line(&mut key).unwrap_or(0);
-
-        if bytes_read == 0 {
-            std::process::exit(1);
-        }
-
-        let k = key.trim().replace("\"", "");
-
-        if verify_key(&k) {
-            save_license_key(&k);
-            println!("{}", "Доступ разрешён.");
-            thread::sleep(Duration::from_millis(200));
-            return;
-        } else {
-            println!("{}", "Доступ запрещён. Неверный ключ.");
-            thread::sleep(Duration::from_millis(1000));
-        }
     }
 }

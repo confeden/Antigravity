@@ -173,11 +173,25 @@ pub fn remove_cli() -> Result<(), String> {
     set_env(CLI_ENV_VAR, None)
 }
 
-/// Variables that point a Go client at the local fallback proxy.
+/// The variable that points the language server at the local gate proxy.
 ///
-/// `HTTPS_PROXY` is what `net/http` reads, and the language server is a Go
-/// program - which is the whole reason no binary patch is needed to route it.
-pub const PROXY_ENV_VAR: &str = "HTTPS_PROXY";
+/// **Not** `HTTPS_PROXY`. It is a private name that only the patched binaries
+/// read, because `patch_binary` renames the lower-case literal in their
+/// `httpproxy.getEnvAny("HTTPS_PROXY", "https_proxy")` to exactly this. The full
+/// argument is on `patch_binary::PROXY_VAR_NEW`; the short version is that the
+/// variable has to be user-wide (nothing spawns the language server for us) and
+/// a user-wide `HTTPS_PROXY` put every program on the machine through
+/// `127.0.0.1:53129`. Same reach for the language server, no reach at all for
+/// anything else.
+pub const PROXY_ENV_VAR: &str = crate::patch_binary::PROXY_VAR_NEW;
+
+/// What builds up to `2.11.0_4` wrote into the User environment, and what every
+/// machine upgrading from one still carries. Removed on sight - but only when
+/// the value is one of ours (I45) - by `remove_legacy_proxy_env`.
+///
+/// `HTTPS_PROXY` doubles as the name a *user's own* proxy lives under, which is
+/// why removal is value-scoped and why `foreign_proxy` still reads it.
+pub const LEGACY_PROXY_ENV_VAR: &str = "HTTPS_PROXY";
 pub const NO_PROXY_ENV_VAR: &str = "NO_PROXY";
 /// Node keeps its own bundled trust store and does not read the Windows one, so
 /// installing the CA as a system root is not enough: Antigravity's extension
@@ -186,24 +200,36 @@ pub const NO_PROXY_ENV_VAR: &str = "NO_PROXY";
 /// per-machine CA that is already in the user's root store, so it widens nothing
 /// that was not already trusted.
 pub const NODE_CA_ENV_VAR: &str = "NODE_EXTRA_CA_CERTS";
-/// Loopback never goes through the proxy: the language server serves its own
-/// gRPC on 127.0.0.1 and talks to the extension host there.
+/// The companion `NO_PROXY` those builds wrote, kept only so the value can be
+/// recognised as ours and taken back off.
+///
+/// Nothing writes it any more, and nothing needs to: `httpproxy.useProxy`
+/// bypasses `localhost` and every loopback address unconditionally, in the
+/// library, so the one thing this value protected - the language server's own
+/// gRPC on `127.0.0.1` - was never at risk. It existed for the Node side, which
+/// only ever saw it because the variable was user-wide.
 const NO_PROXY_VALUE: &str = "127.0.0.1,localhost,::1";
 
-/// Routes this user's Go clients through the local proxy.
+/// Points the patched language server at the local proxy.
 ///
-/// Set for the whole user rather than one process because the language server is
-/// launched by the IDE, not by us - there is no parent to inject an environment
-/// into. That breadth is the cost of the design, and the reason the proxy
-/// tunnels everything it does not carry straight through instead of failing:
-/// anything else on the machine that picks the variable up keeps working.
+/// Still a user-wide variable - the language server is launched by the IDE, not
+/// by us, so there is no parent process to inject an environment into, and
+/// Windows has no per-image environment. What changed in `2.11.0_5` is the
+/// *name*: `PROXY_ENV_VAR` is read by nothing but the binaries this tool has
+/// patched, so the breadth that used to be the cost of the design is gone. A
+/// leftover from the old scheme is taken off in the same step, since a machine
+/// upgrading passes through here and through no undo path.
 #[cfg(target_os = "windows")]
 pub fn apply_proxy(url: &str, ca_path: &str) -> Result<Outcome, String> {
+    let migrated = remove_legacy_proxy_env(url).unwrap_or(false);
     if current_env(PROXY_ENV_VAR).as_deref() == Some(url) {
-        return Ok(Outcome::AlreadySet);
+        return Ok(if migrated {
+            Outcome::Applied
+        } else {
+            Outcome::AlreadySet
+        });
     }
     set_env(PROXY_ENV_VAR, Some(url))?;
-    set_env(NO_PROXY_ENV_VAR, Some(NO_PROXY_VALUE))?;
     // The relay route terminates no TLS and installs no CA, so it needs no
     // `NODE_EXTRA_CA_CERTS`; only the legacy carrier route passes a real path.
     if !ca_path.is_empty() {
@@ -212,42 +238,169 @@ pub fn apply_proxy(url: &str, ca_path: &str) -> Result<Outcome, String> {
     Ok(Outcome::Applied)
 }
 
+/// Takes the user-wide `HTTPS_PROXY`/`NO_PROXY` of builds up to `2.11.0_4` back
+/// off, and only when the values are the ones this tool wrote.
+///
+/// This is the migration that has to happen on *every* path a machine can take
+/// out of an old build: menu 1 (via `apply_proxy`), the relay's
+/// `ensure_proxy_env`, and both undo paths. Skipping it would leave the exact
+/// state the owner asked to be rid of - and, worse, one naming a port that the
+/// new scheme still binds, so it would keep silently working and nobody would
+/// notice the whole machine was still routed through loopback.
+///
+/// `Ok(true)` when something came off. A value that is not ours is never
+/// touched: `HTTPS_PROXY` is also where a user's own proxy lives (I45).
+#[cfg(target_os = "windows")]
+pub fn remove_legacy_proxy_env(url: &str) -> Result<bool, String> {
+    let (drop_proxy, drop_no_proxy) = legacy_removals(
+        current_env(LEGACY_PROXY_ENV_VAR).as_deref(),
+        current_env(NO_PROXY_ENV_VAR).as_deref(),
+        url,
+    );
+    let mut removed = false;
+    let mut trouble: Vec<String> = Vec::new();
+
+    if drop_proxy {
+        match set_env(LEGACY_PROXY_ENV_VAR, None) {
+            Ok(()) => removed = true,
+            Err(e) => trouble.push(e),
+        }
+    }
+    if drop_no_proxy {
+        match set_env(NO_PROXY_ENV_VAR, None) {
+            Ok(()) => removed = true,
+            Err(e) => trouble.push(e),
+        }
+    }
+
+    if trouble.is_empty() {
+        Ok(removed)
+    } else {
+        Err(trouble.join("; "))
+    }
+}
+
+/// Which of the two legacy variables this tool may take off, given what they
+/// currently hold. Pure, so the one rule that can destroy a user's configuration
+/// is testable without an environment.
+///
+/// `NO_PROXY` goes **only alongside** ours, and that condition is the whole
+/// safety of this step. It carries no address to recognise, so the only evidence
+/// it is ours is the exact value - and `127.0.0.1,localhost,::1` is an entirely
+/// ordinary thing for someone to set for themselves. Since `_5` this runs on the
+/// *patch* path and at every relay start, not only on an undo, so an
+/// unconditional match would delete that user's variable, and delete it again
+/// after every reboot they re-set it. Our `HTTPS_PROXY` sitting beside it is the
+/// evidence that the pair was written by an older build of this tool.
+fn legacy_removals(https: Option<&str>, no_proxy: Option<&str>, url: &str) -> (bool, bool) {
+    let drop_proxy = https.is_some_and(|v| is_our_proxy_value(v, url));
+    (drop_proxy, drop_proxy && no_proxy == Some(NO_PROXY_VALUE))
+}
+
+/// Linux keeps the persistent half in the drop-in file, which `apply_proxy`
+/// rewrites in place - so upgrading drops the old names from the next session by
+/// itself. What survives is the *running* user manager, which an older build
+/// filled with `systemctl --user set-environment`, and which would otherwise keep
+/// the whole session pointed at loopback until the user logs out.
+///
+/// Value-scoped, unlike the blanket unset `remove_proxy` does: this runs on the
+/// patch path, where a `https_proxy` the user exported for themselves is none of
+/// our business.
+#[cfg(not(target_os = "windows"))]
+pub fn remove_legacy_proxy_env(url: &str) -> Result<bool, String> {
+    use std::process::Command;
+    let Ok(out) = Command::new("systemctl")
+        .args(["--user", "show-environment"])
+        .output()
+    else {
+        return Ok(false);
+    };
+    let env = String::from_utf8_lossy(&out.stdout);
+    let mut removed = false;
+    for name in [
+        LEGACY_PROXY_ENV_VAR,
+        "https_proxy",
+        NO_PROXY_ENV_VAR,
+        "no_proxy",
+    ] {
+        let prefix = format!("{}=", name);
+        let Some(value) = env
+            .lines()
+            .find_map(|l| l.strip_prefix(prefix.as_str()))
+            .map(str::trim)
+        else {
+            continue;
+        };
+        // `NO_PROXY` only once one of ours has already been recognised, for the
+        // reason spelled out in the Windows arm: the value is a plausible thing
+        // for a user to have set. The proxy names come first in the list, so
+        // `removed` is already decided by the time it is reached.
+        let ours = if name.eq_ignore_ascii_case(NO_PROXY_ENV_VAR) {
+            removed && value == NO_PROXY_VALUE
+        } else {
+            is_our_proxy_value(value, url)
+        };
+        if !ours {
+            continue;
+        }
+        // `.success()`, not `.is_ok()`: the latter is true for any process that
+        // merely started, so a failed unset would be reported as a removal.
+        if Command::new("systemctl")
+            .args(["--user", "unset-environment", name])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+        {
+            removed = true;
+        }
+    }
+    Ok(removed)
+}
+
 /// The Linux path uses **two** mechanisms so the language server the IDE spawns
 /// sees the proxy: a `~/.config/environment.d` drop-in makes it survive a reboot,
 /// and `systemctl --user set-environment` sets it in the running user manager, so
 /// a freshly-launched app inherits it **without a full re-login** - the user only
-/// has to quit and reopen Antigravity. Lower-case aliases too, since Go reads
-/// `HTTPS_PROXY` but other tooling reads `https_proxy`.
+/// has to quit and reopen Antigravity.
+///
+/// Both carry `PROXY_ENV_VAR` and nothing else now. The drop-in used to export
+/// `HTTPS_PROXY`/`https_proxy`/`NO_PROXY`/`no_proxy`, which is session-wide on
+/// Linux exactly as the User environment is machine-wide on Windows - every
+/// shell, every `curl`, every package manager through `127.0.0.1:53129`. The
+/// private name reaches the patched binaries and nothing else; rewriting the
+/// file in place is also what retires the old names on an upgrade.
 #[cfg(not(target_os = "windows"))]
 pub fn apply_proxy(url: &str, _ca_path: &str) -> Result<Outcome, String> {
     use std::process::Command;
     let path = environment_d_path()?;
     let body = format!(
-        "# Antigravity Unlocker — гейт-хосты через локальный прокси. Удалите файл,\n\
-         # чтобы отключить.\n\
-         HTTPS_PROXY={u}\nhttps_proxy={u}\nNO_PROXY={np}\nno_proxy={np}\n",
+        "# Antigravity Unlocker — гейт-хосты через локальный прокси. Переменную\n\
+         # читает только пропатченный language server. Удалите файл, чтобы\n\
+         # отключить.\n\
+         {k}={u}\n",
+        k = PROXY_ENV_VAR,
         u = url,
-        np = NO_PROXY_VALUE,
     );
-    if fs::read_to_string(&path).ok().as_deref() == Some(body.as_str()) {
+    let already = fs::read_to_string(&path).ok().as_deref() == Some(body.as_str());
+    let migrated = remove_legacy_proxy_env(url).unwrap_or(false);
+    if already && !migrated {
         return Ok(Outcome::AlreadySet);
     }
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir).map_err(|e| format!("не создать {}: {}", dir.display(), e))?;
+    if !already {
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir).map_err(|e| format!("не создать {}: {}", dir.display(), e))?;
+        }
+        fs::write(&path, &body).map_err(|e| format!("не записать {}: {}", path.display(), e))?;
     }
-    fs::write(&path, &body).map_err(|e| format!("не записать {}: {}", path.display(), e))?;
     // Immediate effect for newly-launched apps in this session (best-effort).
-    for (k, v) in [
-        (PROXY_ENV_VAR, url),
-        ("https_proxy", url),
-        (NO_PROXY_ENV_VAR, NO_PROXY_VALUE),
-        ("no_proxy", NO_PROXY_VALUE),
-    ] {
-        Command::new("systemctl")
-            .args(["--user", "set-environment", &format!("{}={}", k, v)])
-            .status()
-            .ok();
-    }
+    Command::new("systemctl")
+        .args([
+            "--user",
+            "set-environment",
+            &format!("{}={}", PROXY_ENV_VAR, url),
+        ])
+        .status()
+        .ok();
     Ok(Outcome::Applied)
 }
 
@@ -273,15 +426,19 @@ pub fn remove_proxy(url: &str, ca_path: &str) -> Result<(), String> {
     // reported from a real machine as "не работает выход в интернет".
     let mut trouble: Vec<String> = Vec::new();
 
-    if current_env(PROXY_ENV_VAR).is_some_and(|v| is_our_proxy_value(&v, url)) {
+    // Unconditional, unlike everything else here: `PROXY_ENV_VAR` is a name only
+    // this tool ever writes, so any value under it is ours whatever port it
+    // names. That matters for the day the listener moves off 53129 (P26) - a
+    // value-scoped removal would leave the old one behind forever.
+    if current_env(PROXY_ENV_VAR).is_some() {
         if let Err(e) = set_env(PROXY_ENV_VAR, None) {
             trouble.push(e);
         }
     }
-    if current_env(NO_PROXY_ENV_VAR).as_deref() == Some(NO_PROXY_VALUE) {
-        if let Err(e) = set_env(NO_PROXY_ENV_VAR, None) {
-            trouble.push(e);
-        }
+    // The user-wide variables of builds up to `2.11.0_4`, value-scoped because
+    // `HTTPS_PROXY` is also where a user's own proxy lives.
+    if let Err(e) = remove_legacy_proxy_env(url) {
+        trouble.push(e);
     }
     if let Err(e) = clear_node_ca(ca_path) {
         trouble.push(e);
@@ -295,31 +452,40 @@ pub fn remove_proxy(url: &str, ca_path: &str) -> Result<(), String> {
 }
 
 /// Linux: delete the `environment.d` drop-in and unset the live session vars.
-/// Only ever removes our own file, so a proxy the user set another way is left
-/// alone (the file path is ours by construction).
+/// Only ever removes our own file (the path is ours by construction) and our own
+/// variable; the standard names an older build exported are unset by value, so a
+/// proxy the user set another way survives the revert.
 #[cfg(not(target_os = "windows"))]
-pub fn remove_proxy(_url: &str, _ca_path: &str) -> Result<(), String> {
+pub fn remove_proxy(url: &str, _ca_path: &str) -> Result<(), String> {
     use std::process::Command;
     if let Ok(path) = environment_d_path() {
         let _ = fs::remove_file(&path);
     }
-    for k in [PROXY_ENV_VAR, "https_proxy", NO_PROXY_ENV_VAR, "no_proxy"] {
-        Command::new("systemctl")
-            .args(["--user", "unset-environment", k])
-            .status()
-            .ok();
-    }
+    Command::new("systemctl")
+        .args(["--user", "unset-environment", PROXY_ENV_VAR])
+        .status()
+        .ok();
+    remove_legacy_proxy_env(url).ok();
     Ok(())
 }
 
 /// A proxy the user set up themselves, which this tool must not get in front of.
 ///
 /// Two places one can live. `HTTPS_PROXY` in the User or Machine environment is
-/// what the language server (Go, `net/http`) actually reads; `http.proxy` in
-/// Antigravity's own `settings.json` is what the Node side reads, and whether
-/// the language server inherits it is **unverified** - so it is respected as a
-/// statement of intent either way. A value naming our own listener is not
-/// foreign; anything else is, and the answer says where it was found.
+/// still what the patched language server reads *first* - the rename left that
+/// literal alone precisely so this keeps working - and `http.proxy` in
+/// Antigravity's own `settings.json` is what the Node side reads, with the
+/// language server's inheritance of it **unverified** (P25), so it is respected
+/// as a statement of intent either way. A value naming our own listener is not
+/// foreign (a leftover from a build that wrote `HTTPS_PROXY` itself); anything
+/// else is, and the answer says where it was found.
+///
+/// Since `2.11.0_5` this is the **only** thing keeping a user's own proxy in
+/// front of ours. The first draft assumed lookup order would do it - `HTTPS_PROXY`
+/// is the first argument of `getEnvAny` - and the probe measured the opposite:
+/// with both variables set the patched server takes ours
+/// (`patch_binary::PROXY_VAR_NEW`). So every caller that could write ours has to
+/// ask this first and remove ours when the answer is `Some`, and every one does.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForeignProxy {
     pub value: String,
@@ -330,11 +496,11 @@ pub struct ForeignProxy {
 #[cfg(target_os = "windows")]
 pub fn foreign_proxy(ours: &str) -> Option<ForeignProxy> {
     for scope in ["User", "Machine"] {
-        if let Some(value) = current_env_in(PROXY_ENV_VAR, scope) {
+        if let Some(value) = current_env_in(LEGACY_PROXY_ENV_VAR, scope) {
             if !is_our_proxy_value(&value, ours) {
                 return Some(ForeignProxy {
                     value,
-                    found_in: format!("переменная среды {} ({})", PROXY_ENV_VAR, scope),
+                    found_in: format!("переменная среды {} ({})", LEGACY_PROXY_ENV_VAR, scope),
                 });
             }
         }
@@ -342,9 +508,65 @@ pub fn foreign_proxy(ours: &str) -> Option<ForeignProxy> {
     antigravity_proxy_setting(ours)
 }
 
+/// Linux has no User environment to read, so the same question is asked of the
+/// two places a session proxy can actually live: this process's own environment
+/// (which is the user's login session, since the unlocker is launched from it)
+/// and the systemd user manager, which is where a drop-in or an earlier build's
+/// `set-environment` ends up.
+///
+/// This used to be `antigravity_proxy_setting` alone - and until `_5` that was
+/// merely incomplete, because the old drop-in wrote `HTTPS_PROXY` too and which
+/// of the two won depended on how the app was launched. Now that ours outranks
+/// theirs inside the patched server (S42), silence here would mean a user behind
+/// a corporate proxy is routed into a loopback port that cannot reach anything -
+/// including their sign-in - with nothing on screen to say why.
 #[cfg(not(target_os = "windows"))]
 pub fn foreign_proxy(ours: &str) -> Option<ForeignProxy> {
+    for name in [LEGACY_PROXY_ENV_VAR, "https_proxy"] {
+        if let Ok(value) = std::env::var(name) {
+            let value = value.trim().to_string();
+            if !value.is_empty() && !is_our_proxy_value(&value, ours) {
+                return Some(ForeignProxy {
+                    value,
+                    found_in: format!("переменная среды {}", name),
+                });
+            }
+        }
+    }
+    if let Some(found) = session_manager_proxy(ours) {
+        return Some(found);
+    }
     antigravity_proxy_setting(ours)
+}
+
+/// `HTTPS_PROXY`/`https_proxy` as the systemd user manager holds it - what a
+/// `environment.d` drop-in or a `systemctl --user set-environment` leaves behind,
+/// and what every app launched from the desktop inherits.
+#[cfg(not(target_os = "windows"))]
+fn session_manager_proxy(ours: &str) -> Option<ForeignProxy> {
+    use std::process::Command;
+    let out = Command::new("systemctl")
+        .args(["--user", "show-environment"])
+        .output()
+        .ok()?;
+    let env = String::from_utf8_lossy(&out.stdout);
+    for name in [LEGACY_PROXY_ENV_VAR, "https_proxy"] {
+        let prefix = format!("{}=", name);
+        let Some(value) = env
+            .lines()
+            .find_map(|l| l.strip_prefix(prefix.as_str()))
+            .map(str::trim)
+        else {
+            continue;
+        };
+        if !value.is_empty() && !is_our_proxy_value(value, ours) {
+            return Some(ForeignProxy {
+                value: value.to_string(),
+                found_in: format!("{} в сессии systemd --user", name),
+            });
+        }
+    }
+    None
 }
 
 /// `http.proxy` from the `settings.json` of every Antigravity product under the
@@ -415,30 +637,53 @@ fn profile_root() -> Option<PathBuf> {
     }
 }
 
-/// Puts `HTTPS_PROXY` back on our listener when it has gone missing and nothing
-/// of the user's has taken its place. The relay calls this at start: the
-/// watchdog takes the variable off when the listener is dead for a while (so a
-/// dead relay cannot take the machine's network with it, G20), and this is the
-/// other half - the listener is back, so the route is too. A variable already
-/// pointing here, or a proxy the user set themselves, is left exactly as it is.
+/// Puts the proxy variable back on our listener when it has gone missing and
+/// nothing of the user's has taken its place. The relay calls this at start: the
+/// watchdog takes the variable off when the listener is dead for a while, and
+/// this is the other half - the listener is back, so the route is too. A variable
+/// already pointing here, or a proxy the user set themselves, is left exactly as
+/// it is.
+///
+/// It also runs the legacy migration on a machine that never opens menu 1 again:
+/// `apply_proxy` does that, and this is the only other caller of it. Without that
+/// an upgraded machine that just reboots would keep its user-wide `HTTPS_PROXY`
+/// indefinitely.
+///
+/// **The foreign check comes first, and that order is load bearing.** The patched
+/// server prefers our variable over the user's `HTTPS_PROXY` when both are set
+/// (measured - see `patch_binary::PROXY_VAR_NEW`), so a user who configures a
+/// proxy *after* being patched would silently keep going through ours. Menu 1
+/// catches that only if they run it again; this runs at every relay start, which
+/// is every boot, so at worst they are back on their own proxy after a restart.
 #[cfg(target_os = "windows")]
 pub fn ensure_proxy_env(ours: &str) -> Result<Outcome, String> {
-    if current_env(PROXY_ENV_VAR).is_some_and(|v| is_our_proxy_value(&v, ours)) {
+    if foreign_proxy(ours).is_some() {
+        // Theirs, not ours - and ours would win over it, so it has to go.
+        remove_proxy(ours, "")?;
         return Ok(Outcome::AlreadySet);
     }
-    if foreign_proxy(ours).is_some() {
-        return Ok(Outcome::AlreadySet);
+    if current_env(PROXY_ENV_VAR).is_some_and(|v| is_our_proxy_value(&v, ours)) {
+        // Still ours and still current - but an old user-wide pair may be sitting
+        // beside it, and this path is the one a rebooted machine takes.
+        return match remove_legacy_proxy_env(ours) {
+            Ok(true) => Ok(Outcome::Applied),
+            _ => Ok(Outcome::AlreadySet),
+        };
     }
     apply_proxy(ours, "")
 }
 
-/// Takes `HTTPS_PROXY` off only when it names our listener. `Ok(true)` when it
-/// did and was removed, `Ok(false)` when there was nothing of ours to remove.
-/// The watchdog's primitive: it must never touch a value the user set.
+/// Takes our proxy variable off. `Ok(true)` when there was one and it was
+/// removed, `Ok(false)` when there was nothing of ours.
+///
+/// The watchdog's primitive: it must never touch a value the user set. That is
+/// now true by the *name* - `PROXY_ENV_VAR` is written by nothing else - where it
+/// used to rest on matching the value under a shared name.
 #[cfg(target_os = "windows")]
 pub fn remove_proxy_if_ours(url: &str, ca_path: &str) -> Result<bool, String> {
-    if !current_env(PROXY_ENV_VAR).is_some_and(|v| is_our_proxy_value(&v, url)) {
-        return Ok(false);
+    if current_env(PROXY_ENV_VAR).is_none() {
+        // Nothing of ours under our own name; a legacy pair may still be there.
+        return remove_legacy_proxy_env(url);
     }
     remove_proxy(url, ca_path).map(|()| true)
 }
@@ -692,6 +937,21 @@ fn current_cli_endpoint() -> Option<String> {
     None
 }
 
+/// The value of our proxy variable as the user environment has it right now.
+/// Read-only; `None` when it is not set.
+#[allow(dead_code)]
+pub fn proxy_env_value() -> Option<String> {
+    current_env(PROXY_ENV_VAR)
+}
+
+/// True when the variable is set AND names our own local listener rather than
+/// something the user configured themselves.
+#[allow(dead_code)]
+pub fn proxy_env_is_ours() -> bool {
+    let ours = crate::proxy::proxy_url();
+    proxy_env_value().is_some_and(|v| is_our_proxy_value(&v, &ours))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -753,6 +1013,34 @@ mod tests {
                 shape
             );
         }
+    }
+
+    /// `NO_PROXY` is the one variable this tool can delete without being able to
+    /// recognise it: the value is all there is, and `127.0.0.1,localhost,::1` is
+    /// something a user may well have set. Since `_5` the migration runs on the
+    /// patch path and at every relay start, so an unconditional match would take
+    /// it off a machine that had never run this tool - and again after every
+    /// reboot they put it back. It goes only in company.
+    #[test]
+    fn no_proxy_is_only_removed_beside_a_proxy_value_of_ours() {
+        let url = "http://127.0.0.1:53129";
+        let ours = Some("http://127.0.0.1:53129");
+        let theirs = Some("http://corp.example:3128");
+        let np = Some(NO_PROXY_VALUE);
+
+        // The pair an older build wrote: both go.
+        assert_eq!(legacy_removals(ours, np, url), (true, true));
+        // Never used this tool, but happens to have that NO_PROXY: nothing goes.
+        assert_eq!(legacy_removals(None, np, url), (false, false));
+        // Their own proxy plus that NO_PROXY: still nothing.
+        assert_eq!(legacy_removals(theirs, np, url), (false, false));
+        // Ours, but a NO_PROXY they changed: only ours goes.
+        assert_eq!(
+            legacy_removals(ours, Some("127.0.0.1,corp.example"), url),
+            (true, false)
+        );
+        // Ours alone.
+        assert_eq!(legacy_removals(ours, None, url), (true, false));
     }
 
     /// The other half, and the more important one: a proxy the user chose for
@@ -930,5 +1218,11 @@ mod tests {
         // Delete value
         set_env(test_var, None).expect("delete succeeds");
         assert_eq!(current_env(test_var), None);
+    }
+
+    #[test]
+    fn proxy_env_queries_run_without_panic() {
+        let _ = proxy_env_value();
+        let _ = proxy_env_is_ours();
     }
 }

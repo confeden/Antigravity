@@ -89,22 +89,20 @@ fn restore_js(target: &Path) -> Result<bool, String> {
 
 /// Reverts our IDE JS edits (`main.js` and the extension) for one install.
 /// Returns how many files it restored.
-pub fn unpatch_ide_js(inst: &Path) -> usize {
-    let mut n = 0;
+/// Restores the IDE's JS from its pristine backups, one result per file.
+///
+/// Same reasoning as `patch_binary::unpatch_all_binaries`: a bare count turned a
+/// failed restore into a silent success, and the messages went to a console the
+/// window does not have.
+pub fn unpatch_ide_js(inst: &Path) -> Vec<(String, Result<bool, String>)> {
+    let mut out = Vec::new();
     let main_js = inst
         .join("resources")
         .join("app")
         .join("out")
         .join("main.js");
     if main_js.exists() {
-        match restore_js(&main_js) {
-            Ok(true) => {
-                println!("  [OK] main.js — возвращён из бэкапа");
-                n += 1;
-            }
-            Ok(false) => {}
-            Err(e) => println!("  \x1b[33m[ERR] main.js: {}\x1b[0m\x1b[92m", e),
-        }
+        out.push(("main.js".to_string(), restore_js(&main_js)));
     }
     let ext = inst
         .join("resources")
@@ -114,16 +112,9 @@ pub fn unpatch_ide_js(inst: &Path) -> usize {
         .join("dist")
         .join("extension.js");
     if ext.exists() {
-        match restore_js(&ext) {
-            Ok(true) => {
-                println!("  [OK] extension.js — возвращён из бэкапа");
-                n += 1;
-            }
-            Ok(false) => {}
-            Err(e) => println!("  \x1b[33m[ERR] extension.js: {}\x1b[0m\x1b[92m", e),
-        }
+        out.push(("extension.js".to_string(), restore_js(&ext)));
     }
-    n
+    out
 }
 
 fn detect_stacked_ide(content: &str) -> bool {

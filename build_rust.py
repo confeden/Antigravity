@@ -390,7 +390,7 @@ def main():
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
     print("[INFO] Starting build process...")
 
-    VERSION = "2.11.0_4"
+    VERSION = "2.12.2"
     version = VERSION
     # env!("CARGO_PKG_VERSION") only sees MAJOR.MINOR.PATCH, so the key salt uses
     # the same trimmed value the binary will compile with.
@@ -679,7 +679,9 @@ if __name__ == "__main__":
         # 3. Build the release binary (only the main target). No source edits are
         #    made, so there is nothing sensitive that could be left behind.
         print("[INFO] Запуск компиляции (Release mode)...")
-        subprocess.check_call(["cargo", "build", "--release", "--bin", "ag_unlocker"])
+        cargo_env = os.environ.copy()
+        cargo_env["AG_FULL_VERSION"] = version
+        subprocess.check_call(["cargo", "build", "--release", "--bin", "ag_unlocker"], env=cargo_env)
 
         import shutil
         os.makedirs("release", exist_ok=True)

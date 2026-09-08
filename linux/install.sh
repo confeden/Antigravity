@@ -27,7 +27,7 @@ Name=Antigravity Unlocker
 Comment=Разблокировать Antigravity 2.0 / IDE / CLI
 Exec=$APP_DIR/launch.sh
 $ICON_LINE
-Terminal=true
+Terminal=false
 Categories=Utility;Development;
 StartupNotify=false
 EOF
