@@ -1,5 +1,6 @@
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -170,18 +171,51 @@ fn frame(kind: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
     f
 }
 
+/// Where the next `query` begins its walk. One counter for the whole process:
+/// it only decides an offset, so a second endpoint would still be walked
+/// correctly, just phase-shifted.
+static NEXT_ADDR: AtomicUsize = AtomicUsize::new(0);
+
+/// The order `query` walks `n` addresses in, for a call that drew `start`.
+///
+/// Split out from `query` because `query` does network I/O and this does not:
+/// the property worth pinning is that the walk is still a PERMUTATION of every
+/// index — rotating the start must never cost an address its turn, or a rotation
+/// would trade one failure mode for a worse one.
+fn walk(n: usize, start: usize) -> impl Iterator<Item = usize> {
+    (0..n).map(move |step| start.wrapping_add(step) % n)
+}
+
 /// Asks `ep` for `wire`, an RFC 1035 query, and returns the raw reply bytes.
 ///
-/// Addresses are tried in order and the first that answers speaks for the
-/// endpoint, exactly as `ask_provider` treats a UDP provider's address list.
+/// Every address is tried, within the budget, and the first that answers speaks
+/// for the endpoint — exactly as `ask_provider` treats a UDP provider's address
+/// list. What differs is WHERE the walk starts: each call begins one further
+/// along, round-robin.
+///
+/// That rotation is not load-balancing politeness, it is a correctness fix for
+/// an assumption this function used to make. An `Endpoint`'s addresses are
+/// **peer machines of one service**, not a primary and a backup. Walking them
+/// from index 0 every time means the first one that works takes 100 % of the
+/// queries and the rest are touched only when it breaks — which is what
+/// happened: measured 2026-09-12, this tool was the entire reason one of
+/// dns-ai.ru's two nodes ran at 48 % of a core while the other sat at 15 %
+/// (G43). A counter costs nothing, spreads exactly, needs no RNG or new crate,
+/// and keeps the fall-through: a dead address still only costs its own slice.
 pub fn query(ep: &Endpoint, wire: &[u8], budget: Duration) -> Result<Vec<u8>, String> {
     let deadline = Instant::now() + budget;
     let mut last = "нет адресов".to_string();
-    for addr in ep.addrs {
+    let n = ep.addrs.len();
+    if n == 0 {
+        return Err(last);
+    }
+    let start = NEXT_ADDR.fetch_add(1, Ordering::Relaxed);
+    for idx in walk(n, start) {
         let now = Instant::now();
         if now >= deadline {
             break;
         }
+        let addr = ep.addrs[idx];
         let slice = PER_ADDR_BUDGET.min(deadline - now);
         let Ok(ip) = addr.parse::<IpAddr>() else {
             continue;
@@ -366,6 +400,51 @@ impl<T: Read + Write> ReadWrite for T {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The rotation must not cost an address its turn: whatever the start, the
+    /// walk is still every index exactly once. This is the half that makes the
+    /// fall-through safe, and it is the half a "just start somewhere random"
+    /// implementation gets wrong.
+    #[test]
+    fn walk_visits_every_address_once_from_any_start() {
+        for n in 1..=5usize {
+            for start in 0..(n * 3) {
+                let mut seen: Vec<usize> = walk(n, start).collect();
+                assert_eq!(seen.len(), n, "n={n} start={start}: wrong length");
+                seen.sort_unstable();
+                seen.dedup();
+                assert_eq!(seen.len(), n, "n={n} start={start}: an index repeated");
+                assert_eq!(
+                    *seen.last().unwrap(),
+                    n - 1,
+                    "n={n} start={start}: out of range"
+                );
+            }
+        }
+    }
+
+    /// Consecutive calls start one further along — that is the whole point, and
+    /// it is what splits the load across a service's peer machines instead of
+    /// pinning every query to whichever one happens to be first in the list.
+    #[test]
+    fn walk_advances_by_one_per_call() {
+        assert_eq!(walk(2, 0).next(), Some(0));
+        assert_eq!(walk(2, 1).next(), Some(1));
+        assert_eq!(walk(2, 2).next(), Some(0));
+        assert_eq!(walk(3, 7).collect::<Vec<_>>(), vec![1, 2, 0]);
+    }
+
+    /// `NEXT_ADDR` is a process-lifetime counter, so it wraps eventually. The
+    /// `wrapping_add` is why that is a non-event; without it this panics in a
+    /// debug build, months after release, on a machine nobody can reproduce.
+    #[test]
+    fn walk_survives_counter_wraparound() {
+        assert_eq!(
+            walk(2, usize::MAX).collect::<Vec<_>>(),
+            vec![usize::MAX % 2, 0]
+        );
+        assert_eq!(walk(3, usize::MAX - 1).count(), 3);
+    }
 
     #[test]
     fn base64url_matches_rfc_vectors() {

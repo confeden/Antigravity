@@ -117,9 +117,44 @@ pub enum ClientEgress {
     Physical,
     /// Measured: its connections are sourced from a tunnel adapter.
     Tunnel,
+    /// Measured: some of each, which is a state of its own and not a rounding
+    /// error.
+    ///
+    /// Seen live the moment the owner took our service out of his VPN's
+    /// exclusions: six sockets still on the physical link, two new ones already
+    /// sourced from `10.8.1.2`. For the DNS layer this counts as "outside" — the
+    /// rules are needed by the half that is out, exactly as for `Physical`. For
+    /// anything that asks "will a provider serving only Russian addresses accept
+    /// us", it counts as "inside": the connections that leave through the tunnel
+    /// will be refused whatever the others do.
+    Mixed,
+    /// Measured, and it settles nothing by itself: the client's traffic leaves
+    /// through **our own** local proxy, so where it goes after that is a
+    /// question about the relay's socket, not the client's.
+    ///
+    /// This is the ordinary state for a patched client with the proxy route on
+    /// (S40/S42), and it used to read as `Unknown` - "Antigravity has not asked
+    /// for anything yet" - about a client that was asking constantly. Measured
+    /// on the owner's machine: the IDE's language server held ten connections to
+    /// `127.0.0.1:53129` and not one to anything on 443.
+    ViaLocalProxy,
     /// Nothing to read. The client is not running, or has not opened an outbound
     /// connection yet.
     Unknown,
+}
+
+/// Where the two processes that can carry a gate connection leave the machine.
+///
+/// Both halves in one reading because they come from one query, and because the
+/// interesting answer is the *pair*: a client that talks only to our proxy
+/// (`ViaLocalProxy`) plus a relay in the tunnel is the state where a provider
+/// that serves only Russian clients refuses us, and the user sees a 400 with
+/// every switch in the window green.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Reading {
+    pub client: ClientEgress,
+    /// Our own service. `Unknown` when it is not running or holds nothing open.
+    pub relay: ClientEgress,
 }
 
 /// The language server under both names it ships as: `language_server.exe` in the
@@ -135,55 +170,123 @@ const CLIENT_PROBE_LIMIT: Duration = Duration::from_secs(15);
 
 /// Reads where the client's live connections are sourced from.
 ///
-/// Only port 443 counts: the client also holds loopback sockets to the Electron
-/// host bridge, and those say nothing about egress.
-pub fn client_egress() -> ClientEgress {
+/// Port 443 is what says something about egress - the client also holds loopback
+/// sockets to the Electron host bridge, and those do not. With one exception,
+/// and it is the one that matters most now: a connection to **our own proxy
+/// port** is the client telling us it is not making gate connections at all, and
+/// that its egress is the relay's to answer. Counted separately, never as a
+/// tunnel: loopback is not an adapter the routing table has an opinion about.
+pub fn read() -> Reading {
     let script = format!(
         "$ids=@(Get-Process -Name '{glob}' -ErrorAction SilentlyContinue | \
            ForEach-Object {{$_.Id}}); \
-         if ($ids.Count -eq 0) {{ 'none' }} else {{ \
+         $rid=@(Get-Process -Name '{relay}' -ErrorAction SilentlyContinue | \
+           ForEach-Object {{$_.Id}}); \
+         if ($ids.Count -eq 0 -and $rid.Count -eq 0) {{ 'none' }} else {{ \
            $phys=@(Get-NetAdapter -Physical -ErrorAction SilentlyContinue | \
              Where-Object {{$_.Status -eq 'Up'}} | ForEach-Object {{$_.ifIndex}}); \
            $ix=@{{}}; \
            foreach ($a in @(Get-NetIPAddress -ErrorAction SilentlyContinue)) {{ \
              $ix[($a.IPAddress -split '%')[0]]=$a.InterfaceIndex }}; \
-           $p=0; $t=0; \
-           foreach ($c in @(Get-NetTCPConnection -State Established -ErrorAction SilentlyContinue | \
-               Where-Object {{$ids -contains $_.OwningProcess -and $_.RemotePort -eq 443}})) {{ \
+           $p=0; $t=0; $l=0; $rp=0; $rt=0; \
+           foreach ($c in @(Get-NetTCPConnection -State Established -ErrorAction SilentlyContinue)) {{ \
+             $mine = $ids -contains $c.OwningProcess; \
+             $ours = $rid -contains $c.OwningProcess; \
+             if (-not $mine -and -not $ours) {{ continue }}; \
+             if ($mine -and $c.RemotePort -eq {port} -and $c.RemoteAddress -eq '{listen}') {{ \
+               $l++; continue }}; \
+             if ($c.RemotePort -ne 443) {{ continue }}; \
              $i=$ix[($c.LocalAddress -split '%')[0]]; \
              if ($null -eq $i) {{ continue }}; \
-             if ($phys -contains $i) {{ $p++ }} else {{ $t++ }} }}; \
-           '{{0}}|{{1}}' -f $p,$t }}",
-        glob = CLIENT_PROCESS_GLOB
+             $hw = $phys -contains $i; \
+             if ($mine) {{ if ($hw) {{ $p++ }} else {{ $t++ }} }} \
+             else {{ if ($hw) {{ $rp++ }} else {{ $rt++ }} }} }}; \
+           '{{0}}|{{1}}|{{2}}|{{3}}|{{4}}' -f $p,$t,$l,$rp,$rt }}",
+        glob = CLIENT_PROCESS_GLOB,
+        relay = relay_process_name(),
+        port = crate::proxy::LISTEN_PORT,
+        listen = crate::proxy::LISTEN_IP,
     );
 
     let Some(out) = powershell_within(&script, CLIENT_PROBE_LIMIT) else {
-        return ClientEgress::Unknown;
+        return Reading {
+            client: ClientEgress::Unknown,
+            relay: ClientEgress::Unknown,
+        };
     };
     String::from_utf8_lossy(&out.stdout)
         .lines()
         .rev()
         .find(|l| !l.trim().is_empty())
-        .map_or(ClientEgress::Unknown, parse_client_egress)
+        .map_or(
+            Reading {
+                client: ClientEgress::Unknown,
+                relay: ClientEgress::Unknown,
+            },
+            parse_reading,
+        )
 }
 
-fn parse_client_egress(line: &str) -> ClientEgress {
-    let Some((phys, tunnel)) = line.trim().split_once('|') else {
-        return ClientEgress::Unknown;
+/// `Get-Process` wants the image name without its extension. Taken from the
+/// installed path rather than spelled out again, so the two cannot drift.
+fn relay_process_name() -> String {
+    crate::background::installed_exe()
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "ag_dns".to_string())
+}
+
+fn parse_reading(line: &str) -> Reading {
+    let mut fields = line.trim().split('|').map(|f| f.trim().parse::<u32>().ok());
+    let counts = (
+        fields.next().flatten(),
+        fields.next().flatten(),
+        fields.next().flatten(),
+        fields.next().flatten(),
+        fields.next().flatten(),
+    );
+    let (Some(p), Some(t), Some(l), Some(rp), Some(rt)) = counts else {
+        return Reading {
+            client: ClientEgress::Unknown,
+            relay: ClientEgress::Unknown,
+        };
     };
-    let (Ok(phys), Ok(tunnel)) = (phys.trim().parse::<u32>(), tunnel.trim().parse::<u32>()) else {
-        return ClientEgress::Unknown;
-    };
-    match (phys, tunnel) {
-        // Running, but nothing outbound yet. Not evidence of anything.
-        (0, 0) => ClientEgress::Unknown,
+    Reading {
+        client: classify_client(p, t, l),
+        // No `ViaLocalProxy` for our own service: it *is* the local proxy, and
+        // the only question about it is which adapter its sockets sit on.
+        relay: classify_client(rp, rt, 0),
+    }
+}
+
+fn classify_client(phys: u32, tunnel: u32, ours: u32) -> ClientEgress {
+    match (phys, tunnel, ours) {
+        // Both sides at once — two language servers on different sides of a
+        // split tunnel, or a process whose old sockets outlive a rule change.
+        // Named rather than rounded to one of them: `vpn_verdict` treats it as
+        // "not in the tunnel" (the rules are needed by the half that is out,
+        // which is the same reason `Physical` does), while the window must not
+        // tell anyone "трафик идёт мимо VPN" about traffic that is half in it.
+        (p, t, _) if p > 0 && t > 0 => ClientEgress::Mixed,
         // One socket off the tunnel is enough. That traffic faces the gate
         // whatever the rest of it does, so the rules are needed either way, and
         // reading a split as "in the tunnel" would restore exactly the failure
         // this probe exists to catch.
-        (p, _) if p > 0 => ClientEgress::Physical,
-        _ => ClientEgress::Tunnel,
+        (p, _, _) if p > 0 => ClientEgress::Physical,
+        (_, t, _) if t > 0 => ClientEgress::Tunnel,
+        // Nothing of its own, everything through us: the honest answer is that
+        // this process no longer decides, not that it is idle.
+        (_, _, l) if l > 0 => ClientEgress::ViaLocalProxy,
+        // Running, but nothing outbound yet. Not evidence of anything.
+        _ => ClientEgress::Unknown,
     }
+}
+
+/// Kept for the one caller that only asks about the client: the stand-down
+/// decision, which is about the client and must not start answering a different
+/// question because a second one became measurable (D13, P34).
+pub fn client_egress() -> ClientEgress {
+    read().client
 }
 
 /// Whether the DNS layer must stand down for a tunnel (D13).
@@ -259,21 +362,81 @@ mod tests {
     /// would stand the layer down on no evidence at all.
     #[test]
     fn client_socket_counts_are_read_as_evidence() {
-        assert_eq!(parse_client_egress("2|0"), ClientEgress::Physical);
-        assert_eq!(parse_client_egress("0|3"), ClientEgress::Tunnel);
-        assert_eq!(parse_client_egress("0|0"), ClientEgress::Unknown);
-        // Half in, half out still needs the rules for the half that is out.
-        assert_eq!(parse_client_egress("1|4"), ClientEgress::Physical);
-        // The client is not running.
-        assert_eq!(parse_client_egress("none"), ClientEgress::Unknown);
-        assert_eq!(parse_client_egress(""), ClientEgress::Unknown);
-        assert_eq!(parse_client_egress("2|x"), ClientEgress::Unknown);
+        let client = |line| parse_reading(line).client;
+        assert_eq!(client("2|0|0|0|0"), ClientEgress::Physical);
+        assert_eq!(client("0|3|0|0|0"), ClientEgress::Tunnel);
+        assert_eq!(client("0|0|0|0|0"), ClientEgress::Unknown);
+        // Half in, half out: its own answer, and still not a stand-down (below).
+        assert_eq!(client("1|4|0|0|0"), ClientEgress::Mixed);
+        // The state a patched client with the proxy route on is normally in:
+        // every connection it holds is to our own listener. Measured on the
+        // owner's machine, where this used to read as `Unknown` and the window
+        // said «Antigravity ещё ничего не запрашивал» about a client that was
+        // being refused by the gate at that very moment.
+        assert_eq!(client("0|0|10|0|0"), ClientEgress::ViaLocalProxy);
+        // Its own traffic still outranks that: those sockets do face the gate.
+        assert_eq!(client("1|0|10|0|0"), ClientEgress::Physical);
+        assert_eq!(client("0|1|10|0|0"), ClientEgress::Tunnel);
+        assert_eq!(client("1|1|10|0|0"), ClientEgress::Mixed);
+        // Nothing running at all.
+        assert_eq!(client("none"), ClientEgress::Unknown);
+        assert_eq!(client(""), ClientEgress::Unknown);
+        assert_eq!(client("2|x|0|0|0"), ClientEgress::Unknown);
+        assert_eq!(client("2|0|0"), ClientEgress::Unknown);
+    }
+
+    /// The half the client can no longer answer (G46): with everything of its
+    /// own going to `127.0.0.1`, the socket that faces the gate is ours, and
+    /// which adapter *it* sits on is what a provider serving only Russian
+    /// clients will judge us by.
+    #[test]
+    fn the_relays_own_egress_is_read_beside_the_clients() {
+        let relay = |line| parse_reading(line).relay;
+        assert_eq!(relay("0|0|10|3|0"), ClientEgress::Physical);
+        assert_eq!(relay("0|0|10|0|3"), ClientEgress::Tunnel);
+        assert_eq!(relay("0|0|10|0|0"), ClientEgress::Unknown);
+        // A relay holding both: the connections that do leave through the
+        // tunnel will be refused by a provider that serves Russian addresses
+        // only, so this is not "outside" — measured live when the owner took
+        // `ag_dns.exe` out of his VPN's exclusions.
+        assert_eq!(relay("0|0|10|1|4"), ClientEgress::Mixed);
+        // The pair the owner's machine was in when the gate refused him: the
+        // client talks only to us, and we were the ones inside the tunnel.
+        let bad = parse_reading("0|0|10|0|4");
+        assert_eq!(bad.client, ClientEgress::ViaLocalProxy);
+        assert_eq!(bad.relay, ClientEgress::Tunnel);
     }
 
     /// The regression G29 is: a tunnel holding a default route was enough to
     /// stand the whole DNS layer down, so a client excluded from that tunnel sat
     /// in the blocked region with no assistance. Standing down now needs the
-    /// client to be measured *inside* the tunnel.
+    /// client to be measured *inside* the tunnel — and deliberately still only
+    /// the **client**, never the relay's own reading (P34).
+    /// `Mixed` must not stand the layer down: the half that is outside the
+    /// tunnel is the half the rules exist for (S37, G29).
+    #[test]
+    fn a_split_client_still_gets_the_rules() {
+        assert_eq!(
+            parse_reading("1|4|0|0|0").client,
+            ClientEgress::Mixed,
+            "the shape this test is about"
+        );
+        // `vpn_verdict`'s bool is `client == Tunnel`, and nothing else.
+        for (line, stands_down) in [
+            ("0|4|0|0|0", true),
+            ("1|4|0|0|0", false),
+            ("4|0|0|0|0", false),
+            ("0|0|4|0|0", false),
+            ("0|0|0|0|0", false),
+        ] {
+            assert_eq!(
+                parse_reading(line).client == ClientEgress::Tunnel,
+                stands_down,
+                "{line}"
+            );
+        }
+    }
+
     #[test]
     fn standing_down_needs_the_client_to_be_in_the_tunnel() {
         let no_vpn = Egress {
@@ -334,12 +497,13 @@ mod tests {
     #[ignore = "reads live processes and sockets; run with --ignored"]
     fn reads_where_the_client_actually_leaves() {
         let eg = detect();
-        let client = client_egress();
+        let reading = read();
         let (stand_down, _) = vpn_verdict(eg.as_ref());
         println!(
-            "vpn_active: {}\nclient:     {:?}\nstand down: {}  (правила DNS {})",
+            "vpn_active: {}\nclient:     {:?}\nслужба:     {:?}\nstand down: {}  (правила DNS {})",
             eg.as_ref().is_some_and(|e| e.vpn_active),
-            client,
+            reading.client,
+            reading.relay,
             stand_down,
             if stand_down {
                 "НЕ ставятся"

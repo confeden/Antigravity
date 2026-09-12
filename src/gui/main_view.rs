@@ -7,8 +7,11 @@
 
 use eframe::egui;
 
+use std::time::Duration;
+
 use super::{theme, widgets, App, DONATE_URL, TELEGRAM_GROUP_URL};
-use crate::ops::{Cap, Cmd, Level, State};
+use crate::egress::ClientEgress;
+use crate::ops::{Cap, Cmd, Level, State, VpnSeen};
 use crate::utils::mask_path;
 
 pub fn view(app: &mut App, ui: &mut egui::Ui) {
@@ -286,6 +289,7 @@ fn bypass_card(app: &mut App, ui: &mut egui::Ui) {
         ui.separator();
         ui.add_space(8.0);
 
+        gate_strip(app, ui);
         vpn_indicator(app, ui);
 
         cap_row(
@@ -355,41 +359,594 @@ fn bypass_card(app: &mut App, ui: &mut egui::Ui) {
     });
 }
 
-/// Says what the VPN measurement found, and only when it is worth saying.
+// ---------------------------------------------------------------------------
+// "Is the error being dealt with right now" — what the card is actually for.
+// ---------------------------------------------------------------------------
+
+/// How far *before* a refusal the relay's note may be stamped and still be an
+/// answer to it: a couple of seconds, for the whole-second quantisation both
+/// stamps carry. Deliberately not generous, and the direction matters.
 ///
-/// A tunnel that Antigravity does not use is not the user's problem and gets a
-/// quiet grey line; a tunnel that carries the client is the reason the bypass is
-/// not applied, and that has to be visible without opening the log.
+/// The note is written when the relay notices, which is up to a warm pass
+/// *after* the line — and that direction needs no allowance at all, since any
+/// later stamp passes. Slack the other way is nothing but a licence to call an
+/// old episode the answer to a new refusal: a relay killed after answering one
+/// would have the window saying «перехватил» about the next, for as long as the
+/// record stayed fresh, with nothing running to have caught anything (I58).
+const EPISODE_SLACK: u64 = 3;
+
+/// How long a refusal may sit unanswered before "обход перестраивается" stops
+/// being a description and starts being a guess. Two warm passes and change.
+const UNANSWERED_GRACE: Duration = Duration::from_secs(45);
+
+/// No new refusal for this long means it stopped, and the card stops shouting.
+///
+/// This is the state the owner's first live run ended in and the window had no
+/// word for: refusals at 14:58-15:00, the route switched to a built-in exit at
+/// 15:00:03, nothing since — and the card still read like an unsolved problem
+/// ten minutes later. Longer than the client's own retry burst, which keeps
+/// arriving on the pooled connection for about a minute after the route
+/// underneath it changed (I35).
+const SETTLED: Duration = Duration::from_secs(2 * 60);
+
+/// Whether the region 400 is happening, and whether anything is answering it.
+///
+/// Two facts from two places, and the split is the whole point (`gate`): the
+/// refusal is read from *Antigravity's own log*, so it shows even with every
+/// switch here off, and "перехвачена" comes from the relay's record, so it is
+/// claimed only when the side that acts wrote down that it acted. A window that
+/// inferred the second from a switch being on would tell a user with a dead
+/// relay that everything was fine.
+fn gate_strip(app: &App, ui: &mut egui::Ui) {
+    let Some(status) = &app.status else { return };
+    let bypass_on =
+        status.dns.is_on() || status.local_proxy.is_on() || status.builtin_exits.is_on();
+    let relay = app.gate.relay.as_ref();
+    // The watcher measured `ago` at its own tick and then went quiet; the window
+    // carries it forward rather than being sent a fresh one every three seconds.
+    let seen = app.gate.seen.map(|s| (s.ago + app.gate_at.elapsed(), s.count));
+
+    // Nothing here changes on input, so the repaint has to be asked for:
+    // without it «минуту назад» stays «минуту назад» until the user happens to
+    // move the mouse over the window.
+    if seen.is_some() || relay.is_some_and(|r| r.forced_left().is_some()) {
+        ui.ctx().request_repaint_after(Duration::from_secs(1));
+    }
+
+    let Some((ago, count)) = seen else {
+        gate_quiet(status, relay, bypass_on, ui);
+        return;
+    };
+
+    // The relay's note answers this refusal when it was written no earlier than
+    // the refusal itself, give or take the pass it was noticed on.
+    let refusal_at = crate::gate::now_unix().saturating_sub(ago.as_secs());
+    // A note about an answer is only worth anything while the thing that wrote
+    // it is still running: the local proxy lives in that same process, so a
+    // relay that answered a refusal and then died leaves the client with a
+    // proxy variable naming a dead port (G31) — and «перехватил, отправьте ещё
+    // раз» is the worst sentence to show at that moment. The record outlives
+    // the process by up to `STALE_AFTER`, so this cannot be left to staleness.
+    let answered = relay
+        .filter(|_| status.relay_running)
+        .and_then(|r| r.last_400.as_ref())
+        .filter(|e| answers(e.at, refusal_at));
+
+    // It happened, and then it stopped. Said quietly and with what is carrying
+    // the traffic now, because "is it being fixed" is answered by the silence
+    // since, not by the error that started it.
+    if ago > SETTLED && bypass_on && status.relay_running {
+        gate_settled(relay, answered, ago, ui);
+        return;
+    }
+
+    let accent = if answered.is_some() {
+        theme::OK
+    } else if bypass_on && status.relay_running {
+        theme::WARN
+    } else {
+        theme::BAD
+    };
+
+    widgets::notice(ui, accent, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            widgets::dot(ui, accent);
+            ui.label(
+                egui::RichText::new(headline(count as u64, ago))
+                    .size(13.0)
+                    .strong()
+                    .color(theme::TEXT),
+            );
+        });
+        ui.add_space(4.0);
+
+        let say = |ui: &mut egui::Ui, text: &str| {
+            ui.label(egui::RichText::new(text).size(12.5).color(theme::TEXT));
+        };
+        match (answered, bypass_on, status.relay_running, relay.is_some()) {
+            (Some(episode), ..) => {
+                say(
+                    ui,
+                    "Обход её перехватил. Отправьте сообщение в чате ещё раз — \
+                     оно пойдёт уже другим путём.",
+                );
+                if !episode.acted.is_empty() {
+                    widgets::hint(ui, &format!("Что сделано: {}.", episode.acted));
+                }
+            }
+            // The relay polls the log once per warm pass, so a refusal it has
+            // not answered yet is normal for a few seconds.
+            (None, true, true, true) if ago <= UNANSWERED_GRACE => say(
+                ui,
+                "Обход её видит и перестраивается — это занимает до 15 секунд. \
+                 После этого отправьте сообщение ещё раз.",
+            ),
+            // Past that it is not "about to": the relay takes each log from its
+            // end when it starts, so a refusal written before it was running is
+            // one it will never see. Saying «сейчас разберётся» for ten minutes
+            // would be the window inventing an answer nobody gave.
+            (None, true, true, true) => say(
+                ui,
+                "Обход её не отмечал — скорее всего она была ещё до его запуска. \
+                 Отправьте сообщение ещё раз: если ошибка повторится, он её поймает.",
+            ),
+            // Running and saying nothing. Two different reasons, and guessing
+            // at the wrong one hands out advice that cannot work: a service too
+            // old to write the record at all needs replacing, one that has
+            // simply not finished its first pass needs a few seconds. Only
+            // `relay_outdated` can tell them apart, and it is measured.
+            (None, true, true, false) if status.relay_outdated => say(
+                ui,
+                "Служба обхода старее программы и не сообщает, что делает. \
+                 Выключите и включите «Обход через DNS», чтобы обновить её.",
+            ),
+            (None, true, true, false) => say(
+                ui,
+                "Служба обхода запущена, но пока ничего не сообщила — после \
+                 включения ей нужно до минуты. Если строка не изменится, \
+                 выключите и включите «Обход через DNS».",
+            ),
+            (None, true, false, _) => say(
+                ui,
+                "Служба обхода не запущена — перехватывать ошибку сейчас некому. \
+                 Выключите и включите «Обход через DNS».",
+            ),
+            (None, false, ..) => say(
+                ui,
+                "Обход ошибки 400 выключен — включите переключатель выше, \
+                 и следующая попытка пойдёт уже через него.",
+            ),
+        }
+        if let Some(left) = relay.and_then(|r| r.forced_left()) {
+            widgets::hint(
+                ui,
+                &format!(
+                    "Подмена адресов держится принудительно ещё {} мин.",
+                    left.as_secs() / 60 + 1
+                ),
+            );
+        }
+    });
+    ui.add_space(8.0);
+}
+
+/// Refusals, and then quiet. The card keeps them on screen until they fall out
+/// of `gate::RECENT` — a user who saw the error deserves to know it was seen —
+/// but says plainly that nothing has come since, and names the route that is
+/// carrying the traffic now.
+fn gate_settled(
+    relay: Option<&crate::gate::Report>,
+    answered: Option<&crate::gate::Episode>,
+    ago: Duration,
+    ui: &mut egui::Ui,
+) {
+    // Silence is only evidence when something was *done* about the refusal. The
+    // relay reads each log from its end when it starts, so a refusal written
+    // before it was running is one it will never answer — and then the quiet
+    // means the user stopped asking, not that the route was changed. Saying
+    // «этим путём ошибка не повторялась» about the very route it happened on
+    // would be the window inventing a verdict out of an absence.
+    let repaired = answered.is_some();
+    widgets::notice(ui, if repaired { theme::OK } else { theme::MUTED }, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            widgets::dot(ui, if repaired { theme::OK } else { theme::MUTED });
+            ui.label(
+                egui::RichText::new(format!(
+                    "Ошибка 400 была {}, с тех пор её не было.",
+                    ago_text(ago)
+                ))
+                .size(13.0)
+                .strong()
+                .color(theme::TEXT),
+            );
+        });
+        ui.add_space(4.0);
+        let route = relay.map(|r| r.route.as_str()).filter(|r| !r.is_empty());
+        let line = match (repaired, route) {
+            (true, Some(route)) => format!(
+                "Обход её перехватил, и сейчас трафик идёт «{}» — этим путём ошибка не повторялась.",
+                route
+            ),
+            (true, None) => "Обход её перехватил, и с тех пор отказов не было.".to_string(),
+            (false, Some(route)) => format!(
+                "Обход её не отмечал — вероятно, она была ещё до его запуска. Сейчас трафик идёт «{}»; проверить можно только новым сообщением в чате.",
+                route
+            ),
+            (false, None) => "Обход её не отмечал — проверить можно только новым сообщением в чате."
+                .to_string(),
+        };
+        ui.label(egui::RichText::new(line).size(12.5).color(theme::TEXT));
+        if let Some(episode) = answered {
+            if !episode.acted.is_empty() {
+                widgets::hint(ui, &format!("Что было сделано: {}.", episode.acted));
+            }
+        }
+    });
+    ui.add_space(8.0);
+}
+
+/// The ordinary state: nothing has hit the gate for a while. One quiet line,
+/// because "it is working" is worth exactly one line — and one loud one when the
+/// service that would catch the next refusal is not there.
+fn gate_quiet(
+    status: &crate::ops::Status,
+    relay: Option<&crate::gate::Report>,
+    bypass_on: bool,
+    ui: &mut egui::Ui,
+) {
+    if !bypass_on {
+        // The master switch above already says it; repeating it here would be a
+        // second place for the same state to be wrong in.
+        return;
+    }
+    // Green needs both halves: a service that is running *and* one that is
+    // saying what it does. `relay_running` is re-probed at most every five
+    // minutes while the client is idle, so on its own it can be five minutes
+    // stale — the record going missing is the faster signal of the two.
+    let healthy = status.relay_running && relay.is_some();
+    ui.horizontal_wrapped(|ui| {
+        widgets::dot(ui, if healthy { theme::OK } else { theme::WARN });
+        ui.label(
+            egui::RichText::new(format!(
+                "Ошибка 400 не встречалась последние {} мин.",
+                crate::gate::RECENT.as_secs() / 60
+            ))
+            .size(12.5)
+            .color(theme::MUTED),
+        );
+    });
+    if !status.relay_running {
+        ui.label(
+            egui::RichText::new(
+                "Служба обхода не запущена — перехватывать её сейчас некому.",
+            )
+            .size(12.5)
+            .color(theme::WARN),
+        );
+    } else if let Some(route) = relay.map(|r| r.route.as_str()).filter(|r| !r.is_empty()) {
+        widgets::hint(
+            ui,
+            &format!("Трафик до серверов Google идёт «{}».", route),
+        );
+    }
+    ui.add_space(8.0);
+}
+
+/// Whether the relay's note is an answer to *this* refusal — the one claim on
+/// this screen that must never be made loosely (I58).
+///
+/// A note stamped after the refusal is one: the relay reads the log on its warm
+/// pass, so it always notices late, and any later stamp qualifies. A note
+/// stamped *before* it is not, however recent it looks — that is an answer to
+/// something else, and the case it comes from is a relay that answered one
+/// refusal and then died.
+fn answers(episode_at: u64, refusal_at: u64) -> bool {
+    episode_at.saturating_add(EPISODE_SLACK) >= refusal_at
+}
+
+/// The first line of the callout. One refusal is an event and reads like one;
+/// several are a pattern, and then the count is the news.
+fn headline(count: u64, ago: Duration) -> String {
+    if count <= 1 {
+        return format!("Ошибка 400 — {}.", ago_text(ago));
+    }
+    format!(
+        "Ошибка 400 — {} {} за {} мин, последняя {}.",
+        count,
+        plural(count, "раз", "раза", "раз"),
+        crate::gate::RECENT.as_secs() / 60,
+        ago_text(ago)
+    )
+}
+
+/// «15 секунд назад», «3 минуты назад». Nothing older than `gate::RECENT` ever
+/// reaches it, so hours have no form here.
+fn ago_text(d: Duration) -> String {
+    let secs = d.as_secs();
+    if secs < 15 {
+        return "только что".to_string();
+    }
+    if secs < 60 {
+        return format!(
+            "{} {} назад",
+            secs,
+            plural(secs, "секунду", "секунды", "секунд")
+        );
+    }
+    let mins = secs / 60;
+    format!(
+        "{} {} назад",
+        mins,
+        plural(mins, "минуту", "минуты", "минут")
+    )
+}
+
+/// Russian counts in three forms. Worth its eight lines: «2 минуты назад» and
+/// «5 минут назад» are both on this screen within a minute of each other.
+fn plural(n: u64, one: &'static str, few: &'static str, many: &'static str) -> &'static str {
+    if n % 100 / 10 == 1 {
+        return many;
+    }
+    match n % 10 {
+        1 => one,
+        2..=4 => few,
+        _ => many,
+    }
+}
+
+/// Which of the two VPN states the window is in, as one pure decision.
+///
+/// `Some(line)` is a fact worth one grey sentence; `None` means the callout —
+/// there is something the user can act on. Split out and tested because this is
+/// the table that decides whether the window tells somebody to go and edit their
+/// VPN configuration, and getting a cell wrong sends them after a file that
+/// would change nothing (G46, N25).
+///
+/// Our own service is what opens the connection to Google once the proxy route
+/// is on, so for `ViaLocalProxy` the question is about *it*, not the client.
+fn vpn_quiet_line(seen: VpnSeen, relay: Option<ClientEgress>) -> Option<&'static str> {
+    // Our own service first, and regardless of what the client is doing: it is
+    // what opens the connection to Google, and a provider that serves Russian
+    // addresses only will refuse it from a tunnel. `Mixed` counts as inside —
+    // the connections that do leave through the tunnel are refused whatever the
+    // others do.
+    if matches!(relay, Some(ClientEgress::Tunnel) | Some(ClientEgress::Mixed)) {
+        return None;
+    }
+    match seen {
+        // Unreachable: the caller returns on it first. Kept as an arm rather
+        // than a catch-all so adding a variant to `VpnSeen` fails to compile
+        // here instead of quietly falling into the callout.
+        VpnSeen::None => Some(""),
+        // Its own sockets in the tunnel, whole or in part: both face the gate
+        // from wherever that tunnel exits, and both are the user's to fix.
+        VpnSeen::CarryingClient | VpnSeen::PartlyCarryingClient => None,
+        VpnSeen::Unmeasured => Some(
+            "VPN активен. Antigravity ещё ничего не запрашивал — пойдёт ли его трафик \
+             в туннель, будет видно после первого обращения к Google.",
+        ),
+        VpnSeen::NotCarryingClient => {
+            Some("VPN активен, но трафик Antigravity идёт мимо него — обход применяется.")
+        }
+        // The working combination, and worth saying so: the client hands
+        // everything to us and we are outside the tunnel, which is what the
+        // unblock services require.
+        VpnSeen::ViaLocalProxy if relay == Some(ClientEgress::Physical) => Some(
+            "VPN активен. Antigravity ходит через локальный прокси, а служба обхода — \
+             мимо туннеля: то, что нужно.",
+        ),
+        VpnSeen::ViaLocalProxy => Some(
+            "VPN активен. Antigravity ходит через локальный прокси; куда пойдёт сама \
+             служба обхода, будет видно при первом запросе к Google.",
+        ),
+    }
+}
+
+/// Says where Antigravity's own traffic leaves, and what that means for the 400.
+///
+/// A tunnel Antigravity does not use is not the user's problem and gets a quiet
+/// grey line. A tunnel that carries the client decides the whole question — the
+/// gate is lifted by *their* server or not at all — so that one is a callout,
+/// with the two ways out of it.
+///
+/// `Unmeasured` is its own line and deliberately not a reassuring one: a window
+/// opened before Antigravity is started used to report it as «идёт мимо VPN»,
+/// which is a claim about a measurement nobody had taken.
 fn vpn_indicator(app: &App, ui: &mut egui::Ui) {
     let Some(status) = &app.status else { return };
     let Some(seen) = status.vpn else { return };
+    // No tunnel, nothing to say. Handled here rather than in the table below so
+    // that every arm of the table is a line somebody is meant to read.
+    if seen == VpnSeen::None {
+        return;
+    }
     let detect_on = status.vpn_detect.is_on();
 
-    let (color, text) = match (seen, detect_on) {
-        (crate::ops::VpnSeen::None, _) => return,
-        (crate::ops::VpnSeen::NotCarryingClient, _) => (
-            theme::MUTED,
-            "VPN активен, но Antigravity идёт мимо него — обход применяется.".to_string(),
-        ),
-        (crate::ops::VpnSeen::CarryingClient, true) => (
-            theme::WARN,
-            "Antigravity идёт через VPN — обход не применяется: правила DNS перебили бы \
-             резолвер туннеля, а нужный адрес достигается через него и так."
-                .to_string(),
-        ),
-        (crate::ops::VpnSeen::CarryingClient, false) => (
-            theme::WARN,
-            "Antigravity идёт через VPN, но определение VPN выключено — обход \
-             применяется поверх туннеля."
-                .to_string(),
-        ),
-    };
+    if let Some(text) = vpn_quiet_line(seen, status.relay_egress) {
+        ui.horizontal_wrapped(|ui| {
+            widgets::dot(ui, theme::MUTED);
+            ui.label(egui::RichText::new(text).size(12.5).color(theme::MUTED));
+        });
+        ui.add_space(8.0);
+        return;
+    }
 
-    ui.horizontal_wrapped(|ui| {
-        widgets::dot(ui, color);
-        ui.label(egui::RichText::new(text).size(12.5).color(color));
+    widgets::notice(ui, theme::WARN, |ui| {
+        // Which of the two is in there decides everything below: the headline,
+        // the explanation, and which executable the help offers.
+        let relay_in = matches!(
+            status.relay_egress,
+            Some(ClientEgress::Tunnel) | Some(ClientEgress::Mixed)
+        );
+        let partly = status.relay_egress == Some(ClientEgress::Mixed);
+        let via_us = relay_in;
+        ui.horizontal_wrapped(|ui| {
+            widgets::dot(ui, theme::WARN);
+            ui.label(
+                egui::RichText::new(match (relay_in, partly) {
+                    (true, true) => "Часть соединений службы обхода идёт через ваш VPN.",
+                    (true, false) => {
+                        "Служба обхода идёт через ваш VPN — из-за этого обход не сработает."
+                    }
+                    _ if seen == VpnSeen::PartlyCarryingClient => {
+                        "Часть трафика Antigravity идёт через ваш VPN."
+                    }
+                    _ => "Трафик Antigravity идёт через ваш VPN.",
+                })
+                .size(13.0)
+                .strong()
+                .color(theme::TEXT),
+            );
+        });
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new(if relay_in {
+                "Соединение до серверов Google открывает не Antigravity, а служба обхода, \
+                 и сейчас она идёт в туннель. Сервисы разблокировки отвечают только \
+                 российским адресам, поэтому из туннеля её надо вывести — а исключение \
+                 language_server из VPN ни на что не влияет, он ходит только до \
+                 локального прокси."
+            } else {
+                "Снятие ошибки 400 зависит от вашего сервера: если он в стране без \
+                 ограничений — её снимает он, и всё работает. Если ошибка повторяется — \
+                 сервер не подходит."
+            })
+            .size(12.5)
+            .color(theme::TEXT),
+        );
+        if !via_us {
+            widgets::hint(
+                ui,
+                if detect_on {
+                    "Правила DNS при этом не ставятся: они перебили бы резолвер туннеля, \
+                     а подменённый адрес достигается через него и так."
+                } else {
+                    "«Определять VPN» выключено — обход применяется поверх туннеля."
+                },
+            );
+        }
+        ui.add_space(6.0);
+        vpn_help(app, via_us, detect_on, ui);
     });
     ui.add_space(8.0);
+}
+
+/// The part a status line cannot do: what to change, and with which file.
+///
+/// The path is the whole value of this block. Every VPN client spells split
+/// tunnelling differently, but all of them ask for an executable, and finding
+/// the right one inside an Antigravity install is not something a user should
+/// have to do by hand. *Which* one depends on the route: with the local proxy on
+/// it is our own service that opens the connection (G46), otherwise the language
+/// server — never the shell or the CLI, which carry no gated call.
+fn vpn_help(app: &App, via_us: bool, detect_on: bool, ui: &mut egui::Ui) {
+    egui::CollapsingHeader::new(
+        egui::RichText::new("Что сделать, если ошибка 400 повторяется")
+            .size(12.5)
+            .color(theme::MUTED),
+    )
+    .id_salt("vpn-help")
+    .default_open(false)
+    .show(ui, |ui| {
+        // Which file to name is not a detail: with the local-proxy route on, the
+        // language server holds no connection to Google at all (measured — ten
+        // sockets to `127.0.0.1:53129` and none on 443), so excluding it from a
+        // VPN does exactly nothing. The process that opens the connection is the
+        // one to exclude.
+        //
+        // The caller's answer, not a second opinion derived from the switches:
+        // the headline above and the file below must be about the same process,
+        // and a measurement and a switch can disagree about which that is.
+        let via_us = via_us
+            && app
+                .status
+                .as_ref()
+                .is_some_and(|s| s.relay_exe.is_some());
+        widgets::hint(
+            ui,
+            if via_us {
+                "Первый путь — вывести из туннеля то, что открывает соединение. Сейчас \
+                 это служба обхода: в клиенте VPN найдите «раздельное туннелирование», \
+                 split tunneling или «исключить приложения» и добавьте туда этот файл."
+            } else {
+                "Первый путь — вывести Antigravity из туннеля. В клиенте VPN это \
+                 «раздельное туннелирование», split tunneling или «исключить приложения»: \
+                 добавьте туда файл языкового сервера — весь трафик, который упирается \
+                 в ошибку 400, идёт именно из него."
+            },
+        );
+        ui.add_space(4.0);
+
+        let exes = app
+            .status
+            .as_ref()
+            .map(|s| {
+                if via_us {
+                    s.relay_exe.iter().cloned().collect()
+                } else {
+                    s.client_exes.clone()
+                }
+            })
+            .unwrap_or_default();
+        if exes.is_empty() {
+            widgets::hint(
+                ui,
+                "Путь появится здесь, как только установка Antigravity будет найдена — \
+                 карточка выше.",
+            );
+        }
+        for exe in &exes {
+            let full = exe.display().to_string();
+            ui.horizontal(|ui| {
+                // Button first, path second: a truncating label given the row
+                // first takes what is left of it, and the button then lands past
+                // the edge of the card.
+                if ui
+                    .small_button("Копировать")
+                    .on_hover_text(full.clone())
+                    .clicked()
+                {
+                    ui.ctx().copy_text(full.clone());
+                }
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(mask_path(&full))
+                            .size(12.0)
+                            .color(theme::MUTED)
+                            .monospace(),
+                    )
+                    .truncate(),
+                )
+                .on_hover_text(full.clone());
+            });
+        }
+        // Only where it is true. With our service in the tunnel the rules are
+        // already installed (the client is not in there, so the layer never
+        // stood down), and with «Определять VPN» off they are installed over the
+        // tunnel by design — in both cases this line would send the user to
+        // re-do something that is already done.
+        if !via_us && detect_on {
+            ui.add_space(4.0);
+            widgets::hint(
+                ui,
+                "После этого включите «Обход через DNS» заново: правила ставятся только \
+                 тогда, когда Antigravity вне туннеля.",
+            );
+        }
+        // Only when the *client* is the one in the tunnel. With the proxy route
+        // on, the rules are installed already (the layer stands down for the
+        // client, and the client is not in there), so this switch would change
+        // nothing at all — offering it would send the user to flip something
+        // irrelevant and then wonder why the error stayed.
+        if !via_us {
+            ui.add_space(6.0);
+            widgets::hint(
+                ui,
+                "Второй путь — выключить «Определять VPN» ниже. Тогда обход применяется \
+                 поверх туннеля: это то, что нужно, если исключений в вашем VPN нет.",
+            );
+        }
+    });
 }
 
 /// How a provider's name is written in the list.
@@ -413,7 +970,122 @@ fn display_name(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::display_name;
+    use super::{ago_text, display_name, plural};
+    use std::time::Duration;
+
+    /// The line under the 400 callout is read by someone already annoyed. Three
+    /// forms, and the teens are the trap: «11 минут», not «11 минута».
+    #[test]
+    fn russian_counts_in_three_forms() {
+        let minutes = |n| plural(n, "минуту", "минуты", "минут");
+        assert_eq!(minutes(1), "минуту");
+        assert_eq!(minutes(2), "минуты");
+        assert_eq!(minutes(4), "минуты");
+        assert_eq!(minutes(5), "минут");
+        assert_eq!(minutes(11), "минут");
+        assert_eq!(minutes(12), "минут");
+        assert_eq!(minutes(14), "минут");
+        assert_eq!(minutes(21), "минуту");
+        assert_eq!(minutes(22), "минуты");
+        assert_eq!(minutes(25), "минут");
+        assert_eq!(minutes(0), "минут");
+    }
+
+    /// «Обход её перехватил» is the one line here that asserts something
+    /// happened. A relay that answered a refusal and was then killed must not
+    /// have that answer credited to the next one.
+    /// The cell that matters: telling somebody to edit their VPN is only right
+    /// when the process that opens the connection is actually inside the tunnel.
+    #[test]
+    fn the_window_asks_for_a_vpn_change_only_when_one_would_help() {
+        use super::vpn_quiet_line;
+        use crate::egress::ClientEgress;
+        use crate::ops::VpnSeen;
+        // Never `use VpnSeen::*` here: its `None` shadows `Option::None` and the
+        // second argument silently becomes the wrong kind of nothing.
+        let callout = |seen, relay| vpn_quiet_line(seen, relay).is_none();
+        const ALL: [Option<ClientEgress>; 5] = [
+            Some(ClientEgress::Tunnel),
+            Some(ClientEgress::Mixed),
+            Some(ClientEgress::Physical),
+            Some(ClientEgress::Unknown),
+            None,
+        ];
+        let quiet_relay = [
+            Some(ClientEgress::Physical),
+            Some(ClientEgress::Unknown),
+            None,
+        ];
+
+        // Our service in the tunnel decides on its own, whatever the client is
+        // doing — that is the state the gate refuses and the user must fix.
+        for seen in [
+            VpnSeen::ViaLocalProxy,
+            VpnSeen::NotCarryingClient,
+            VpnSeen::Unmeasured,
+            VpnSeen::CarryingClient,
+            VpnSeen::PartlyCarryingClient,
+        ] {
+            assert!(callout(seen, Some(ClientEgress::Tunnel)), "{seen:?}");
+            // Half its sockets in there is the same problem for the half in it.
+            assert!(callout(seen, Some(ClientEgress::Mixed)), "{seen:?}");
+        }
+        // The client's own sockets in the tunnel, whole or in part: also ours
+        // to point at, whatever the relay does.
+        for relay in ALL {
+            assert!(callout(VpnSeen::CarryingClient, relay));
+            assert!(callout(VpnSeen::PartlyCarryingClient, relay));
+        }
+        // Everything else is one grey line. `ViaLocalProxy` + relay outside is
+        // the working combination and must never ask for anything.
+        for relay in quiet_relay {
+            assert!(!callout(VpnSeen::ViaLocalProxy, relay));
+            assert!(!callout(VpnSeen::NotCarryingClient, relay));
+            assert!(!callout(VpnSeen::Unmeasured, relay));
+        }
+    }
+
+    #[test]
+    fn only_a_note_written_after_the_refusal_answers_it() {
+        use super::answers;
+        // Noticed on the warm pass after the line was logged: the normal case.
+        assert!(answers(1_000, 1_000));
+        assert!(answers(1_015, 1_000));
+        assert!(answers(2_000, 1_000));
+        // A second either way is the two stamps' whole-second quantisation.
+        assert!(answers(998, 1_000));
+        // Anything older is an answer to a different refusal.
+        assert!(!answers(940, 1_000));
+        assert!(!answers(0, 1_000));
+        // A corrupt record must not overflow its way into a true answer.
+        assert!(answers(u64::MAX, 1_000));
+        assert!(!answers(0, u64::MAX));
+    }
+
+    #[test]
+    fn one_refusal_is_an_event_and_several_are_a_pattern() {
+        use super::headline;
+        assert_eq!(headline(1, Duration::from_secs(5)), "Ошибка 400 — только что.");
+        assert_eq!(
+            headline(3, Duration::from_secs(120)),
+            "Ошибка 400 — 3 раза за 10 мин, последняя 2 минуты назад."
+        );
+        // Never drawn, but a count of zero must not produce «0 раз».
+        assert_eq!(
+            headline(0, Duration::from_secs(70)),
+            "Ошибка 400 — 1 минуту назад."
+        );
+    }
+
+    #[test]
+    fn an_age_reads_as_a_person_would_say_it() {
+        assert_eq!(ago_text(Duration::from_secs(3)), "только что");
+        assert_eq!(ago_text(Duration::from_secs(22)), "22 секунды назад");
+        assert_eq!(ago_text(Duration::from_secs(59)), "59 секунд назад");
+        assert_eq!(ago_text(Duration::from_secs(61)), "1 минуту назад");
+        assert_eq!(ago_text(Duration::from_secs(9 * 60)), "9 минут назад");
+    }
+
 
     #[test]
     fn an_acronym_stays_an_acronym_and_everything_else_gets_one_capital() {

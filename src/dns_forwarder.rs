@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use crate::dns;
 use crate::dns_client;
 use crate::egress;
+use crate::gate;
 use crate::ls_log;
 use crate::proxy;
 use crate::resolvers::{self, Verdict};
@@ -87,7 +88,12 @@ pub const LISTEN_PORT: u16 = 53;
 ///     tailed for the region 400 (`ls_log`) and answered by forcing substitution
 ///     back on and penalising the route it came through, and the direct route
 ///     fails inside a budget instead of hanging on the OS connect timeout.
-pub const RELAY_VERSION: u32 = 27;
+/// 28 = it writes down what it is doing (`gate.json`): the leader route, the
+///     forced-substitution deadline, the stand-down verdict, and what it did
+///     about the last region 400. Without this generation the window can see
+///     the refusal in the client's log but nothing about the answer, so the
+///     bump is what tells the user their service is too old to report (S48).
+pub const RELAY_VERSION: u32 = 28;
 
 /// Written where an unelevated relay can write and an unelevated unlocker can
 /// read. Absent means a relay from before versioning, i.e. older than anything.
@@ -206,33 +212,10 @@ fn parse_version(raw: Option<&str>) -> u32 {
 ///
 /// Local, not UTC: the only reader is a user comparing the log against the moment
 /// their editor showed an error, and asking them to do timezone arithmetic on a
-/// bug report is how a report becomes useless. `GetLocalTime` rather than a date
-/// crate because this is the only place the crate would be used.
-#[cfg(target_os = "windows")]
+/// bug report is how a report becomes useless. Empty where there is no local
+/// clock to read (`utils::local_clock`), which costs a stamp rather than a line.
 fn stamp() -> String {
-    #[repr(C)]
-    #[derive(Default)]
-    struct SystemTime {
-        year: u16,
-        month: u16,
-        day_of_week: u16,
-        day: u16,
-        hour: u16,
-        minute: u16,
-        second: u16,
-        milliseconds: u16,
-    }
-    extern "system" {
-        fn GetLocalTime(out: *mut SystemTime);
-    }
-    let mut t = SystemTime::default();
-    unsafe { GetLocalTime(&mut t) };
-    format!("{:02}:{:02}:{:02}", t.hour, t.minute, t.second)
-}
-
-#[cfg(not(target_os = "windows"))]
-fn stamp() -> String {
-    String::new()
+    crate::utils::local_clock().map_or_else(String::new, |c| c.hms())
 }
 
 /// Best-effort logging: a background process with no console is otherwise
@@ -354,6 +337,19 @@ fn warm_forever() {
     let mut since_direct = PROBE_HEALTHY_EVERY;
     let mut since_vpn = VPN_CHECK_EVERY;
     loop {
+        // One small record per pass, for a window that is another process and
+        // can otherwise only read the log meant for a person (P29). **First** in
+        // the pass, not last: a pass opens with a PowerShell VPN check and runs
+        // several probes with budgets of their own, so written at the end the
+        // file would not exist for the first tens of seconds of the relay's life
+        // - which is exactly when a user has just switched the bypass on and is
+        // watching the window. The leader is the one the last pass settled on,
+        // which is the one in force right now.
+        gate::publish(
+            routes::leader().map(|k| k.label()),
+            resolvers::substitution_forced_for(),
+            resolvers::tunnel_carries_client(),
+        );
         // First, because everything below depends on it: when a tunnel carries
         // the client the relay stops substituting and answers as the tunnel's
         // own resolver would. The rules cannot be removed from here - the task
@@ -383,6 +379,10 @@ fn warm_forever() {
                         }
                         (false, true, egress::ClientEgress::Physical) => {
                             "VPN поднят, но трафик Antigravity идёт мимо него — подмена включена"
+                                .to_string()
+                        }
+                        (false, true, egress::ClientEgress::ViaLocalProxy) => {
+                            "VPN поднят, Antigravity ходит через локальный прокси — подмена включена"
                                 .to_string()
                         }
                         (false, true, _) => {
@@ -490,15 +490,26 @@ fn answer_region_400(refusals: &[(std::path::PathBuf, usize)]) {
                 .map_or_else(String::new, |f| f.to_string_lossy().into_owned())
         ));
     }
+    // What was done about it, in the words the window shows (`gate`). Collected
+    // here rather than reconstructed there: the window can see that a refusal
+    // happened, but only this function knows which of the three answers it
+    // called for, and "перехвачено" is a claim that has to rest on the side that
+    // acted rather than on a switch being on.
+    let mut acted: Vec<String> = Vec::new();
     if resolvers::vpn_is_active() {
         resolvers::force_substitution(resolvers::FORCE_SUBSTITUTE_FOR);
         log(&format!(
             "VPN-выход не снимает гейт — подмена включена принудительно на {} мин",
             resolvers::FORCE_SUBSTITUTE_FOR.as_secs() / 60
         ));
+        acted.push(format!(
+            "ваш VPN не снимает блокировку — подмена адресов включена поверх туннеля на {} мин",
+            resolvers::FORCE_SUBSTITUTE_FOR.as_secs() / 60
+        ));
     } else {
         resolvers::forget_names(dns::core_namespaces());
         log("кэш выбора провайдера сброшен — гейт-имена опрашиваются заново");
+        acted.push("адреса серверов Google подбираются заново".to_string());
     }
     // One penalty per episode. The refusal is attributed to the route that most
     // recently opened a gate tunnel, and that is only right for the *first*
@@ -524,8 +535,14 @@ fn answer_region_400(refusals: &[(std::path::PathBuf, usize)]) {
                 total,
                 routes::REGION_PENALTY.as_secs() / 60
             ));
+            acted.push(format!(
+                "маршрут «{}» отложен на {} мин, следующее соединение пойдёт другим",
+                kind.label(),
+                routes::REGION_PENALTY.as_secs() / 60
+            ));
         }
     }
+    gate::record_episode(total as u32, acted.join("; "));
 }
 
 /// When a route was last penalised for a refusal. While the episode lasts,

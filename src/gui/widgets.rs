@@ -118,6 +118,31 @@ pub fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
         .inner
 }
 
+/// A callout inside a card: the one place the window raises its voice.
+///
+/// Deliberately not a fourth colour (theme.rs): it takes the colour it is given
+/// — `WARN` for something the user has to decide about, `OK` for something that
+/// has been dealt with — and only puts a border and a darker ground around it so
+/// the eye lands there first. Everything inside stays the ordinary type.
+pub fn notice<R>(
+    ui: &mut egui::Ui,
+    accent: egui::Color32,
+    add: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    egui::Frame::new()
+        .fill(theme::SUNKEN)
+        .corner_radius(CornerRadius::same(theme::RADIUS_SMALL))
+        .inner_margin(egui::Margin::same(10))
+        .stroke(Stroke::new(1.0, accent))
+        .show(ui, |ui| {
+            // Same reason as `card`: a callout sized to its contents sits
+            // visibly narrower than the rows above and below it.
+            ui.set_min_width(ui.available_width());
+            add(ui)
+        })
+        .inner
+}
+
 /// The one filled button per screen — the action the user came to press.
 pub fn primary(ui: &mut egui::Ui, text: &str, enabled: bool) -> egui::Response {
     let btn = egui::Button::new(

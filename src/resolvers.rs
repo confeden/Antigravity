@@ -68,9 +68,17 @@ pub fn provider_names() -> Vec<&'static str> {
 
 pub const PROVIDERS: &[Provider] = &[
     // First on purpose. Measured 2026-08-30 against 8.8.8.8: it substitutes
-    // `cloudcode-pa.googleapis.com` -> 186.246.45.126 (TTL 60), and that address
-    // accepts the SNI and answers as Google's own frontend (`Server: ESF`, valid
-    // certificate, TLS handshake 0.30 s). `cloudcode-pa` is the name a 22-resolver
+    // `cloudcode-pa.googleapis.com` for one of its own egress addresses (TTL 60),
+    // and that address accepts the SNI and answers as Google's own frontend
+    // (`Server: ESF`, valid certificate, TLS handshake 0.30 s).
+    //
+    // The address that measurement named was `186.246.45.126`, and it is written
+    // out here no longer ON PURPOSE: the service deleted that egress and returned
+    // the address to its hoster, and something else answers on it today (checked
+    // 2026-09-12, G43). The substitution still works — the service just answers
+    // with whichever egress it currently runs — so the FINDING holds and only the
+    // number expired. Do not re-derive it from a stranger's host.
+    // `cloudcode-pa` is the name a 22-resolver
     // sweep found **nobody** substituting (S9) - the whole reason the client used
     // to be pushed onto `daily-` instead (N15). It substitutes `daily-` and
     // `generativelanguage` from the same address, and correctly passes
@@ -116,10 +124,25 @@ pub const PROVIDERS: &[Provider] = &[
 /// reach it before anything else resolves. Safe because the certificate still has
 /// to prove the name (`*.dns-ai.ru`, verified live), so a stale or poisoned
 /// address fails the handshake instead of becoming a silent man-in-the-middle.
+///
+/// THESE GO STALE SILENTLY, AND ONE DID (G43). Until 2026-09-12 the first entry
+/// was `217.60.10.20` — an address the service had deleted and handed back to its
+/// hoster. It does not refuse the connection, it **blackholes** it, so every
+/// query spent the whole `PER_ADDR_BUDGET` (2.5 s) on it before falling through
+/// to the second address. Two consequences, both measured from a Russian line on
+/// 2026-09-12: every uncached lookup of a gate host cost an extra 2.5 s, and
+/// 100 % of our traffic landed on one of the service's two nodes — it ran at 48 %
+/// of a core while its sibling sat at 15 %, because the certificate check meant a
+/// dead address failed safely and therefore failed *quietly*.
+///
+/// Both entries below are live and were verified answering `200` on
+/// `/dns-query` before being written here. When re-checking (P14), check the
+/// ADDRESSES too, not only whether the provider still substitutes: a hardcoded
+/// address is a measurement with an expiry date.
 pub static DNS_AI: crate::doh::Endpoint = crate::doh::Endpoint {
     host: "dns.dns-ai.ru",
     path: "/dns-query",
-    addrs: &["217.60.10.20", "186.246.49.127"],
+    addrs: &["192.144.59.14", "186.246.49.127"],
 };
 
 /// Resolvers used only to recognise an unsubstituted answer. They must be
@@ -1049,11 +1072,17 @@ pub fn force_substitution(for_how_long: Duration) {
 }
 
 pub fn substitution_forced() -> bool {
+    substitution_forced_for().is_some()
+}
+
+/// How much of that window is left, for the record the window reads (`gate`).
+/// `None` when nothing is forced.
+pub fn substitution_forced_for() -> Option<Duration> {
     FORCE_SUBSTITUTE_UNTIL
         .lock()
         .ok()
         .and_then(|u| *u)
-        .is_some_and(|until| Instant::now() < until)
+        .and_then(|until| until.checked_duration_since(Instant::now()))
 }
 
 /// The verdict of the answer most recently handed out for each name, by the

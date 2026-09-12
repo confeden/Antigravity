@@ -154,6 +154,30 @@ pub enum VpnSeen {
     NotCarryingClient,
     /// Measured: Antigravity's sockets leave through the tunnel.
     CarryingClient,
+    /// Measured: some of them do and some do not — two language servers on
+    /// different sides of a split tunnel, or sockets that outlived a rule
+    /// change. The half inside faces the gate from wherever the tunnel exits.
+    PartlyCarryingClient,
+    /// A tunnel is up, and Antigravity's own traffic goes to **our** proxy — so
+    /// the socket that faces the gate is the relay's, not the client's.
+    ///
+    /// The ordinary state for a patched client with the local-proxy route on,
+    /// and the one the tool's own success created: excluding `language_server`
+    /// from a VPN stopped meaning anything the moment it stopped making gate
+    /// connections. Whether the *relay* is in the tunnel is a question this
+    /// measurement does not answer (P34).
+    ViaLocalProxy,
+    /// A tunnel is up and there was nothing to read: Antigravity is not running,
+    /// or has not dialled out yet.
+    ///
+    /// Its own variant because it used to be folded into `NotCarryingClient`,
+    /// and that is the same mistake the tool forbids itself elsewhere — treating
+    /// an absence of evidence as evidence (the resolver rule in CLAUDE.md). The
+    /// window opens before Antigravity is started far more often than not, so
+    /// the message every VPN user got was the confident and usually wrong «VPN
+    /// активен, но Antigravity идёт мимо него». What the layer *does* is
+    /// unchanged: no measurement still means the rules go in (S37).
+    Unmeasured,
 }
 
 #[derive(Debug, Clone)]
@@ -181,7 +205,29 @@ pub struct Status {
     pub vpn: Option<VpnSeen>,
     pub own_proxy_text: String,
     pub relay_outdated: bool,
+    /// Whether the relay task is registered *and* running. The raw fact, kept
+    /// beside the `dns` row that already folds it into a verdict: the gate strip
+    /// has to say "there is nobody to catch the next 400" without re-deriving it
+    /// from a string meant for a switch.
+    pub relay_running: bool,
     pub providers: Vec<ProviderRow>,
+    /// The language-server binaries, for the one thing the window needs their
+    /// full paths for: telling a VPN which executable to leave out of its
+    /// tunnel.
+    pub client_exes: Vec<PathBuf>,
+    /// The installed relay, when there is one. With the local-proxy route on it
+    /// is *this* process that opens the connection to Google, so it is the one a
+    /// split-tunnelling list has to name — excluding the language server there
+    /// changes nothing at all.
+    pub relay_exe: Option<PathBuf>,
+    /// Where **our own** service's connections leave. `None` when there was
+    /// nothing to read, or no tunnel to read it against.
+    ///
+    /// The half the client stopped being able to answer (G46), and the one that
+    /// decides whether a provider serving only Russian addresses will serve us
+    /// at all. Reported, never acted on: the stand-down decision is still the
+    /// client's (D13, P34).
+    pub relay_egress: Option<crate::egress::ClientEgress>,
 }
 
 impl Status {
@@ -222,6 +268,26 @@ pub enum Event {
 pub enum Cmd {
     /// Re-read the system. Cheap parts only.
     Refresh,
+    /// Ask the system again where the client's traffic leaves.
+    ///
+    /// Its own command because it is the one measurement that goes stale on its
+    /// own — a user connects a VPN, or starts Antigravity, and nothing in this
+    /// window was touched. Sent by the gate watcher, which knows when it is
+    /// worth paying for (`gate`), and answered here because `ops` owns the
+    /// measurement the DNS layer's decision is made from (I59).
+    RemeasureVpn,
+    /// The answer to the above, coming back from the thread it was taken on.
+    ///
+    /// It carries the relay's liveness too, because that is the other fact the
+    /// gate strip shows and the other one that goes stale on its own — a relay
+    /// can die while the window sits open, and until this arrived nothing
+    /// re-read it short of the user flipping a switch. Both probes are cheap
+    /// process spawns and neither belongs on the worker's queue.
+    Probed {
+        vpn: VpnSeen,
+        relay: bool,
+        relay_egress: Option<crate::egress::ClientEgress>,
+    },
     /// Re-read the system *including* whether each install is patched, which
     /// means reading every Language Server binary end to end.
     #[allow(dead_code)]
@@ -253,9 +319,15 @@ impl Worker {
 /// repaints — egui sleeps until something asks it not to.
 pub fn spawn(events: Sender<Event>, wake: Box<dyn Fn() + Send>) -> Worker {
     let (tx, rx) = mpsc::channel::<Cmd>();
+    // The worker keeps a sender of its own, for the one job it hands to a
+    // thread and gets an answer back from (`RemeasureVpn`). It means the
+    // channel never disconnects, so the loop does not end when the window drops
+    // its `Worker` — which costs nothing here, because the window closing is the
+    // process exiting.
+    let own = tx.clone();
     std::thread::Builder::new()
         .name("ops".to_string())
-        .spawn(move || run_worker(rx, events, wake))
+        .spawn(move || run_worker(rx, own, events, wake))
         .ok();
     Worker { tx }
 }
@@ -287,6 +359,8 @@ struct Ctx {
     /// a minute, so it is taken on the deep pass and after anything that could
     /// change it — never on a plain refresh.
     vpn: Option<VpnSeen>,
+    /// Taken with it: where our own service's sockets sit.
+    relay_egress: Option<crate::egress::ClientEgress>,
     /// The last snapshot that was actually asked of the system.
     ///
     /// What makes `Scan::Settings` possible: a switch that only writes a field of
@@ -326,7 +400,17 @@ impl Ctx {
     }
 }
 
-fn run_worker(rx: Receiver<Cmd>, events: Sender<Event>, wake: Box<dyn Fn() + Send>) {
+/// True while a VPN measurement is out at a thread. One at a time: the watcher
+/// can ask again before the last answer is back, and two PowerShell probes
+/// racing produce the same answer twice at twice the cost.
+static MEASURING_VPN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn run_worker(
+    rx: Receiver<Cmd>,
+    own: Sender<Cmd>,
+    events: Sender<Event>,
+    wake: Box<dyn Fn() + Send>,
+) {
     let mut ctx = Ctx {
         events,
         wake,
@@ -335,6 +419,7 @@ fn run_worker(rx: Receiver<Cmd>, events: Sender<Event>, wake: Box<dyn Fn() + Sen
         proxy_var_retryable: false,
         patched_seen: HashMap::new(),
         vpn: None,
+        relay_egress: None,
         last: None,
         dns_probe: (false, false),
     };
@@ -350,6 +435,54 @@ fn run_worker(rx: Receiver<Cmd>, events: Sender<Event>, wake: Box<dyn Fn() + Sen
         match cmd {
             Cmd::Stop => return,
             Cmd::Refresh => push_status(&mut ctx, Scan::System),
+            // Off the queue, not on it. The measurement drives PowerShell and
+            // takes seconds; on the queue, a user flipping a switch in the
+            // middle of one would watch it snap back until it finished — G42's
+            // lesson, applied to a job nobody asked for. No `busy` marker
+            // either, for the same reason: nothing the user is waiting on is
+            // running.
+            Cmd::RemeasureVpn => {
+                use std::sync::atomic::Ordering;
+                if !MEASURING_VPN.swap(true, Ordering::SeqCst) {
+                    let back = own.clone();
+                    let spawned = std::thread::Builder::new()
+                        .name("vpn-probe".to_string())
+                        .spawn(move || {
+                            let (vpn, relay_egress) = measure_vpn();
+                            let relay = background::is_enabled() && background::is_running();
+                            MEASURING_VPN.store(false, Ordering::SeqCst);
+                            let _ = back.send(Cmd::Probed {
+                                vpn,
+                                relay,
+                                relay_egress,
+                            });
+                        });
+                    if spawned.is_err() {
+                        // Or the flag would stay raised and this window would
+                        // never measure again.
+                        MEASURING_VPN.store(false, Ordering::SeqCst);
+                    }
+                }
+            }
+            Cmd::Probed {
+                vpn,
+                relay,
+                relay_egress,
+            } => {
+                let before = ctx.vpn;
+                ctx.vpn = Some(vpn);
+                ctx.relay_egress = relay_egress;
+                if before.is_some() && before != ctx.vpn {
+                    if let Some(line) = vpn_change_line(vpn) {
+                        ctx.log(Level::Info, line);
+                    }
+                }
+                // The raw half of `dns_probe`, refreshed without re-asking
+                // Windows about rules: the relay is the one of the two that
+                // stops on its own.
+                ctx.dns_probe.1 = relay;
+                push_status(&mut ctx, Scan::Settings);
+            }
             Cmd::DeepRefresh => {
                 ctx.busy(Some("Проверка установок"));
                 push_status(&mut ctx, Scan::Deep);
@@ -525,7 +658,9 @@ fn push_status(ctx: &mut Ctx, scan: Scan) {
     // taken, and a settings flip inherits it rather than paying a PowerShell
     // round trip to be told the same thing.
     if scan == Scan::Deep || ctx.vpn.is_none() {
-        ctx.vpn = Some(measure_vpn());
+        let (vpn, relay_egress) = measure_vpn();
+        ctx.vpn = Some(vpn);
+        ctx.relay_egress = relay_egress;
     }
 
     let status = match scan {
@@ -565,10 +700,15 @@ fn settings_only_status(ctx: &Ctx, prev: Status) -> Status {
     let (rules, relay) = ctx.dns_probe;
     Status {
         dns: dns_state(prev.admin, rules, relay, ctx.vpn, ctx.settings.vpn_detect),
+        // Not `..prev`: `Cmd::Probed` refreshes this behind the window's back,
+        // and a row carried forward from the last system scan would say a relay
+        // that died an hour ago is still running.
+        relay_running: relay,
         own_proxy_text: upstream::configured()
             .map(|u| u.display())
             .unwrap_or_else(|| ctx.settings.own_proxy.clone()),
         vpn: ctx.vpn,
+        relay_egress: ctx.relay_egress,
         ..prev
     }
     .with_settings_switches(&ctx.settings)
@@ -692,7 +832,14 @@ fn read_status(ctx: &mut Ctx, deep: bool) -> Status {
         vpn: ctx.vpn,
         dns_rotation: State::Off,
         relay_outdated,
+        relay_running: dns_probe.1,
+        relay_exe: {
+            let exe = background::installed_exe();
+            exe.exists().then_some(exe)
+        },
+        relay_egress: ctx.relay_egress,
         providers: Vec::new(),
+        client_exes: client_exes(&installs),
         installs,
     }
     .with_settings_switches(&ctx.settings)
@@ -704,15 +851,49 @@ fn read_status(ctx: &mut Ctx, deep: bool) -> Status {
 /// decision can never disagree: anything else would be a second opinion, and a
 /// second opinion is how a user ends up told one thing while the layer does
 /// another.
-fn measure_vpn() -> VpnSeen {
+fn measure_vpn() -> (VpnSeen, Option<crate::egress::ClientEgress>) {
+    use crate::egress::ClientEgress;
     let egress = crate::egress::detect();
     if !egress.as_ref().is_some_and(|e| e.vpn_active) {
-        return VpnSeen::None;
+        return (VpnSeen::None, None);
     }
-    if crate::egress::vpn_verdict(egress.as_ref()).0 {
-        VpnSeen::CarryingClient
-    } else {
-        VpnSeen::NotCarryingClient
+    // One reading, both halves — the same call `egress::vpn_verdict` makes for
+    // the DNS layer, so the row this colours and the decision that layer takes
+    // cannot be looking at different data. What is *reported* is the
+    // measurement itself, not the verdict derived from it: "stand the layer
+    // down" and "the client is outside the tunnel" are different questions, and
+    // reading the first as the second is what made the indicator claim a
+    // measurement nobody had taken.
+    let reading = crate::egress::read();
+    let client = match reading.client {
+        ClientEgress::Tunnel => VpnSeen::CarryingClient,
+        ClientEgress::Mixed => VpnSeen::PartlyCarryingClient,
+        ClientEgress::Physical => VpnSeen::NotCarryingClient,
+        ClientEgress::ViaLocalProxy => VpnSeen::ViaLocalProxy,
+        ClientEgress::Unknown => VpnSeen::Unmeasured,
+    };
+    (client, Some(reading.relay))
+}
+
+/// The one line the journal gets when the answer changes. An `Unmeasured` is
+/// not a change worth a line: it says only that Antigravity stopped running.
+fn vpn_change_line(now: VpnSeen) -> Option<&'static str> {
+    match now {
+        VpnSeen::None => Some("VPN отключён — обход снова работает сам."),
+        VpnSeen::CarryingClient => Some(
+            "Antigravity пошёл через VPN — снятие ошибки 400 теперь зависит от вашего сервера.",
+        ),
+        VpnSeen::NotCarryingClient => {
+            Some("Трафик Antigravity идёт мимо VPN — обход применяется.")
+        }
+        VpnSeen::ViaLocalProxy => Some(
+            "Antigravity ходит через локальный прокси — до серверов Google \
+             соединение открывает служба обхода, а не он сам.",
+        ),
+        VpnSeen::PartlyCarryingClient => {
+            Some("Часть трафика Antigravity пошла через VPN, часть идёт мимо.")
+        }
+        VpnSeen::Unmeasured => None,
     }
 }
 
@@ -746,8 +927,17 @@ fn dns_state(
 ) -> State {
     // Said before anything else, because it is the one reason the switch can be
     // off while everything about the setup is right.
-    if !rules && detect_on && vpn == Some(VpnSeen::CarryingClient) {
-        return State::Blocked("Antigravity идёт через VPN — обход не применяется".to_string());
+    if detect_on && vpn == Some(VpnSeen::CarryingClient) {
+        if !rules {
+            return State::Blocked("Antigravity идёт через VPN — обход не применяется".to_string());
+        }
+        // Rules *are* in — installed before the client went into the tunnel, and
+        // only an elevated run takes them off again (`refresh_pinned_hosts`).
+        // They resolve to our relay, and the relay stands down for a tunnel it
+        // measures the client inside of, so they are in place and doing nothing.
+        // Drawing that as a plain "on" is the window and the layer disagreeing
+        // about the same measurement.
+        return State::Partial("правила стоят, но Antigravity в туннеле".to_string());
     }
     match (rules, relay) {
         (true, true) => State::On,
@@ -788,6 +978,29 @@ fn read_own_proxy() -> State {
     } else {
         State::Off
     }
+}
+
+/// Every language server found, by full path.
+///
+/// `language_server*` only — never `agy.exe` and never the Electron shell. The
+/// same set `egress::CLIENT_PROCESS_GLOB` counts sockets for, and for the same
+/// reason: the shell carries no gated call, so excluding it from a tunnel would
+/// change nothing and excluding the CLI is a separate decision the user can make
+/// for themselves.
+fn client_exes(installs: &[InstallRow]) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for root in installs.iter().filter_map(|i| i.path.as_ref()) {
+        for bin in patch_binary::binary_targets(root) {
+            let is_ls = bin
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("language_server"));
+            if is_ls && !out.contains(&bin) {
+                out.push(bin);
+            }
+        }
+    }
+    out
 }
 
 /// The three kinds, in the order the window lists them.
@@ -1550,6 +1763,7 @@ mod tests {
             proxy_var_retryable: false,
             patched_seen: HashMap::new(),
             vpn: Some(VpnSeen::None),
+            relay_egress: None,
             last: None,
             dns_probe: (false, false),
         };
@@ -1589,7 +1803,43 @@ mod tests {
             vpn: None,
             own_proxy_text: String::new(),
             relay_outdated: false,
+            relay_running: false,
             providers: Vec::new(),
+            client_exes: Vec::new(),
+            relay_exe: None,
+            relay_egress: None,
         }
+    }
+
+    /// The regression the `Unmeasured` variant exists for: a tunnel is up and
+    /// the client has not dialled out, which is what a window opened before
+    /// Antigravity almost always sees. Reading that as "the client is outside
+    /// the tunnel" is the indicator claiming a measurement nobody took.
+    #[test]
+    fn a_tunnel_with_nothing_to_read_is_not_a_client_outside_it() {
+        use crate::egress::ClientEgress;
+        let seen = |client| match client {
+            ClientEgress::Tunnel => VpnSeen::CarryingClient,
+            ClientEgress::Mixed => VpnSeen::PartlyCarryingClient,
+            ClientEgress::Physical => VpnSeen::NotCarryingClient,
+            ClientEgress::ViaLocalProxy => VpnSeen::ViaLocalProxy,
+            ClientEgress::Unknown => VpnSeen::Unmeasured,
+        };
+        assert_eq!(seen(ClientEgress::Unknown), VpnSeen::Unmeasured);
+        assert_ne!(seen(ClientEgress::Unknown), VpnSeen::NotCarryingClient);
+        // The state the proxy route puts a patched client in: measured, and not
+        // the same answer as "nothing to read".
+        assert_eq!(seen(ClientEgress::ViaLocalProxy), VpnSeen::ViaLocalProxy);
+        assert_ne!(seen(ClientEgress::ViaLocalProxy), VpnSeen::Unmeasured);
+        // And an unmeasured tunnel must not block the DNS row: it takes evidence
+        // to stand down, not the absence of it (S37).
+        assert_eq!(
+            dns_state(true, true, true, Some(VpnSeen::Unmeasured), true),
+            State::On
+        );
+        assert!(matches!(
+            dns_state(true, false, true, Some(VpnSeen::CarryingClient), true),
+            State::Blocked(_)
+        ));
     }
 }

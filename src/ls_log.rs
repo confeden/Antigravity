@@ -15,12 +15,21 @@
 //! trigger anything now. A file seen for the first time is taken from its end
 //! for the same reason. A file that shrank was rotated or the app restarted, and
 //! is read from the start - it is new content either way.
+//!
+//! Two readers, asking different questions of the same file. `poll` is the
+//! relay's: "what came in since I last looked", which is what may be *acted*
+//! on. `newest_refusal` is the window's: "is the user hitting the gate right
+//! now", which has to be answerable about the minutes before this process
+//! started - so it reads the log's own stamps rather than a saved offset. The
+//! two share the pattern and the file list and nothing else; they run in
+//! different processes and neither moves the other's position.
 
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::Duration;
 
 /// The refusal, as the language server logs it. Matched ASCII-case-insensitively
 /// and never on the whole `FAILED_PRECONDITION` line: that status wraps other
@@ -119,7 +128,10 @@ fn count_refusals(buf: &[u8]) -> usize {
 /// fork, writes `<product>\logs\<session stamp>\ls-main.log`, one folder per
 /// launch - so for it only the newest session is watched. Product folders are
 /// matched by prefix rather than listed, so a rebranded build is picked up too.
-fn candidate_logs() -> Vec<PathBuf> {
+/// Public because the window holds the list rather than rebuilding it: this
+/// walks `%APPDATA%` and then the IDE's `logs` folder, which has one sub-folder
+/// per launch, and a window ticking every three seconds must not do that.
+pub fn candidate_logs() -> Vec<PathBuf> {
     let Some(root) = profile_root() else {
         return Vec::new();
     };
@@ -187,6 +199,207 @@ fn profile_root() -> Option<PathBuf> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Reading the same log the other way round: what is *there*, not what is new.
+// ---------------------------------------------------------------------------
+
+/// The newest refusal a client log carries, as the window needs it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Sighting {
+    /// How long ago the newest one was written, by the log's own stamp.
+    pub ago: Duration,
+    /// How many fall inside the window asked for.
+    pub count: usize,
+}
+
+/// How much of a log's tail is read looking for one. A session's worth of glog
+/// is a few hundred kilobytes an hour, and the window asked for is minutes.
+const HISTORY_TAIL: u64 = 256 * 1024;
+
+/// A stamp a second or two ahead of our own read of the clock is *now*, not a
+/// line from the future: the logger and this process read the same clock at
+/// slightly different moments, and `GetLocalTime` has whole-second resolution.
+const CLOCK_SLACK: u32 = 5;
+
+/// The newest refusal in any client log inside `within`, and how many there are.
+///
+/// `poll` above answers "what is new since I last looked", which is the right
+/// question for the relay and the wrong one for a window: a user who hits the
+/// gate and *then* opens this tool would be told nothing had happened. So this
+/// reads the log's own timestamps rather than a saved position, and it is the
+/// only place in the tool that parses them.
+///
+/// `None` without a local clock to compare against (non-Windows): an age nobody
+/// can compute is not one to guess at.
+pub fn newest_refusal(paths: &[PathBuf], within: Duration) -> Option<Sighting> {
+    let now = crate::utils::local_clock()?;
+    let mut newest: Option<Duration> = None;
+    let mut count = 0usize;
+    for path in paths {
+        let Some(text) = tail(path, HISTORY_TAIL) else {
+            continue;
+        };
+        for line in text.lines() {
+            // Occurrences, not lines: one line can carry more than one, and
+            // `Episode.count` on the relay's side counts them the same way.
+            let hits = count_refusals(line.as_bytes());
+            if hits == 0 {
+                continue;
+            }
+            // A line whose stamp will not parse is one the tail cut in half, or
+            // one some future build writes differently. Either way it cannot be
+            // placed in time, and an unplaceable refusal is not evidence of
+            // anything happening *now*.
+            let Some(ago) = parse_stamp(line).and_then(|at| age_secs(at, now)) else {
+                continue;
+            };
+            let ago = Duration::from_secs(ago as u64);
+            if ago > within {
+                continue;
+            }
+            count += hits;
+            if newest.is_none_or(|n| ago < n) {
+                newest = Some(ago);
+            }
+        }
+    }
+    newest.map(|ago| Sighting { ago, count })
+}
+
+/// Total size of the given logs. The cheap half of "is Antigravity doing
+/// anything" - one `metadata` per file and no read at all - which is what the
+/// window gates both its scans and its VPN measurement on. A log that has not
+/// grown cannot have gained a refusal, and a client that is not writing is not
+/// one whose route can have changed under us.
+pub fn bytes_of(paths: &[PathBuf]) -> u64 {
+    paths
+        .iter()
+        .filter_map(|p| fs::metadata(p).ok().map(|m| m.len()))
+        .sum()
+}
+
+/// The last `max` bytes of a file, as text. The first line usually comes back
+/// cut; that is the caller's problem and it handles it by refusing to place a
+/// line it cannot parse.
+fn tail(path: &Path, max: u64) -> Option<String> {
+    let len = fs::metadata(path).ok()?.len();
+    let start = len.saturating_sub(max);
+    let mut f = File::open(path).ok()?;
+    f.seek(SeekFrom::Start(start)).ok()?;
+    let mut buf = Vec::with_capacity((len - start) as usize);
+    f.take(len - start).read_to_end(&mut buf).ok()?;
+    Some(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// glog's header — a level letter, `MMDD`, a space, then local `HH:MM:SS.ffffff`
+/// — wherever in the line it sits.
+///
+/// Searched for rather than sliced off the front, and that is not defensive
+/// programming: measured on both real logs, it is never at the front. The
+/// Desktop server prefixes *every* line with `ERROR: logging before
+/// google.Init: `, and the IDE wraps that same text again in its own
+/// `2026-09-12 03:57:46.735 [error] [LS Main stderr] `. Anchoring at byte 0
+/// found a stamp in neither file, so the window would have shown "тихо" while
+/// the user was staring at the error.
+///
+/// Returns `(month, day, second of day)`; there is no year in it, which is why
+/// `age_secs` only ever places a line today or yesterday.
+fn parse_stamp(line: &str) -> Option<(u16, u16, u32)> {
+    let b = line.as_bytes();
+    let limit = b.len().min(HEADER_SEARCH).saturating_sub(STAMP_LEN);
+    (0..=limit).find_map(|i| stamp_at(line, i))
+}
+
+/// How far into a line the header is looked for. Both wrappers measured above
+/// fit in well under a hundred bytes; the bound is what keeps a stamp-shaped
+/// run of text deep inside a message from being read as one.
+const HEADER_SEARCH: usize = 200;
+/// `E0901 15:09:24` — the part that has to be there.
+const STAMP_LEN: usize = 14;
+
+/// The header if it starts exactly at `at`, and nothing otherwise. A slice that
+/// lands mid-character answers `None` rather than panicking (`str::get`), which
+/// is what makes scanning a line of arbitrary bytes safe.
+fn stamp_at(line: &str, at: usize) -> Option<(u16, u16, u32)> {
+    let b = line.as_bytes();
+    if b.len() < at + STAMP_LEN {
+        return None;
+    }
+    // glog's four levels. `is_ascii_alphabetic` would match the `E` of a word
+    // followed by four digits, which is exactly the kind of thing a log message
+    // contains.
+    if !matches!(b[at], b'I' | b'W' | b'E' | b'F') {
+        return None;
+    }
+    if b[at + 5] != b' ' || b[at + 8] != b':' || b[at + 11] != b':' {
+        return None;
+    }
+    let num = |r: std::ops::Range<usize>| line.get(r).and_then(|s| s.parse::<u32>().ok());
+    let (month, day) = (num(at + 1..at + 3)?, num(at + 3..at + 5)?);
+    let (h, m, s) = (
+        num(at + 6..at + 8)?,
+        num(at + 9..at + 11)?,
+        num(at + 12..at + 14)?,
+    );
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || h > 23 || m > 59 || s > 59 {
+        return None;
+    }
+    Some((month as u16, day as u16, h * 3600 + m * 60 + s))
+}
+
+/// How long ago a stamp was, against the local clock now.
+///
+/// Only today and yesterday can be placed: the header carries no year, and the
+/// window this is asked about is minutes. Anything else answers `None`, which
+/// reads as "not recent" - the safe direction, since the cost of missing an old
+/// refusal is nothing and the cost of inventing a fresh one is a false alarm.
+fn age_secs(at: (u16, u16, u32), now: crate::utils::LocalClock) -> Option<u32> {
+    let (month, day, sod) = at;
+    if month == now.month && day == now.day {
+        return if sod <= now.second_of_day {
+            Some(now.second_of_day - sod)
+        } else if sod - now.second_of_day <= CLOCK_SLACK {
+            Some(0)
+        } else {
+            None
+        };
+    }
+    if is_day_before((month, day), now) {
+        return Some(now.second_of_day + 86_400 - sod);
+    }
+    None
+}
+
+fn is_day_before(at: (u16, u16), now: crate::utils::LocalClock) -> bool {
+    if at.0 == now.month {
+        return at.1 + 1 == now.day;
+    }
+    // The first of a month: yesterday is the last day of the one before, whose
+    // number the header does not carry a year to settle. February is therefore
+    // allowed both its lengths, and the only stamp that can be misplaced is a
+    // 28 February read on 1 March of a leap year - in the first minutes after
+    // midnight, once every four years, and the cost is one line of the window
+    // saying "a few minutes ago" about a day-old refusal.
+    now.day == 1 && at.0 == month_before(now.month) && is_last_day(at.0, at.1)
+}
+
+fn is_last_day(month: u16, day: u16) -> bool {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => day == 31,
+        4 | 6 | 9 | 11 => day == 30,
+        2 => day == 28 || day == 29,
+        _ => false,
+    }
+}
+
+fn month_before(m: u16) -> u16 {
+    if m <= 1 {
+        12
+    } else {
+        m - 1
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -211,6 +424,12 @@ mod tests {
 
     const REFUSAL: &str = "E0901 15:09:24.614939 1 stream_handler.go:101] FAILED_PRECONDITION (code 400): User location is not supported for the API use.\n";
     const NOISE: &str = "I0901 15:09:24.639090 1 server.go:427] Setting GOMAXPROCS to 4\n";
+
+    /// The two shapes the real logs are actually written in, copied off this
+    /// machine. Neither starts with the glog header: the Desktop server prefixes
+    /// every line, and the IDE wraps the prefixed line again.
+    const DESKTOP_LINE: &str = "ERROR: logging before google.Init: E0901 15:09:24.614939       1 stream_handler.go:101] FAILED_PRECONDITION (code 400): User location is not supported for the API use.";
+    const IDE_LINE: &str = "2026-09-12 03:57:46.735 [error] [LS Main stderr] ERROR: logging before google.Init: E0901 15:09:24.614939       1 stream_handler.go:101] FAILED_PRECONDITION (code 400): User location is not supported for the API use.";
 
     #[test]
     fn counts_the_refusal_case_insensitively_and_nothing_else() {
@@ -281,6 +500,144 @@ mod tests {
         let path = temp_log("missing");
         assert_eq!(scan(&path, None), (0, 0));
         assert_eq!(scan(&path, Some(42)), (42, 0));
+    }
+
+    fn clock(month: u16, day: u16, h: u32, m: u32, s: u32) -> crate::utils::LocalClock {
+        crate::utils::LocalClock {
+            month,
+            day,
+            second_of_day: h * 3600 + m * 60 + s,
+        }
+    }
+
+    /// The window's reader, end to end: tail, stamp, age, count. Written with
+    /// the machine's own clock so the stamps are the shape the language server
+    /// would have written a moment ago.
+    #[test]
+    fn a_refusal_is_found_by_its_own_stamp_and_an_old_one_is_not() {
+        let Some(now) = crate::utils::local_clock() else {
+            return; // no local clock (non-Windows): the reader answers None by design
+        };
+        // Not within the first hour after midnight: the stamps below are built
+        // by subtracting from the clock, and "yesterday" is a different test.
+        if now.second_of_day < 3600 {
+            return;
+        }
+        // Written the way the real Desktop log writes it, prefix and all, so
+        // this exercises the search rather than a shape only a test produces.
+        let stamp = |back: u32| {
+            let sod = now.second_of_day - back;
+            format!(
+                "ERROR: logging before google.Init: E{:02}{:02} {:02}:{:02}:{:02}.123456       1 stream_handler.go:101] ",
+                now.month,
+                now.day,
+                sod / 3600,
+                (sod / 60) % 60,
+                sod % 60
+            )
+        };
+        let path = temp_log("recent");
+        append(&path, &format!("{}Setting GOMAXPROCS to 4\n", stamp(30)));
+        append(&path, &format!("{}FAILED_PRECONDITION (code 400): User location is not supported for the API use.\n", stamp(1500)));
+        append(&path, &format!("{}FAILED_PRECONDITION (code 400): User location is not supported for the API use.\n", stamp(300)));
+        append(&path, &format!("{}FAILED_PRECONDITION (code 400): User location is not supported for the API use.\n", stamp(120)));
+
+        let files = [path.clone()];
+        let seen = newest_refusal(&files, Duration::from_secs(600)).expect("two are in the window");
+        assert_eq!(seen.count, 2, "the 25-minute-old one is outside it");
+        assert!(
+            (115..=135).contains(&seen.ago.as_secs()),
+            "newest was two minutes ago, got {:?}",
+            seen.ago
+        );
+        // A window narrower than the newest refusal finds nothing at all.
+        assert_eq!(newest_refusal(&files, Duration::from_secs(60)), None);
+        // And a log with nothing in it says so rather than guessing.
+        let quiet = temp_log("quiet");
+        append(&quiet, &format!("{}Setting GOMAXPROCS to 4\n", stamp(10)));
+        assert_eq!(
+            newest_refusal(std::slice::from_ref(&quiet), Duration::from_secs(600)),
+            None
+        );
+        assert!(bytes_of(&files) > 0);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&quiet);
+    }
+
+    /// What the machine has right now. Reads, never asserts: the point is that
+    /// the paths and the parse work against a real client log.
+    ///
+    ///     cargo test reads_what_the_client_actually_logged -- --ignored --nocapture
+    #[test]
+    #[ignore = "reads the real Antigravity logs on this machine; run with --ignored"]
+    fn reads_what_the_client_actually_logged() {
+        let logs = candidate_logs();
+        println!("логов: {}, байт: {}", logs.len(), bytes_of(&logs));
+        for path in &logs {
+            println!("  {}", path.display());
+        }
+        println!(
+            "последняя region-400 за сутки: {:?}",
+            newest_refusal(&logs, Duration::from_secs(24 * 3600))
+        );
+    }
+
+    /// The regression this parser was rewritten for: measured on the machine's
+    /// own logs, the header is never at the start of the line. Anchored at byte
+    /// 0 it matched neither real file, and the window would have reported
+    /// silence while the user watched the error.
+    #[test]
+    fn the_header_is_found_under_both_wrappers_the_real_logs_use() {
+        let expected = Some((9, 1, 15 * 3600 + 9 * 60 + 24));
+        assert_eq!(parse_stamp(DESKTOP_LINE), expected);
+        assert_eq!(parse_stamp(IDE_LINE), expected);
+        // The IDE's own `2026-09-12 03:57:46.735` must not be mistaken for it:
+        // what is read is the language server's stamp, inside the wrapper.
+        assert_eq!(parse_stamp("2026-09-12 03:57:46.735 [info] [LS Main] Args"), None);
+        // And a stamp-shaped run deep inside a message is out of reach.
+        let deep = format!("{}E0102 03:04:05.000000 x", "y".repeat(HEADER_SEARCH));
+        assert_eq!(parse_stamp(&deep), None);
+    }
+
+    #[test]
+    fn a_glog_header_is_read_and_anything_else_refused() {
+        assert_eq!(parse_stamp(REFUSAL), Some((9, 1, 15 * 3600 + 9 * 60 + 24)));
+        assert_eq!(parse_stamp(NOISE), Some((9, 1, 15 * 3600 + 9 * 60 + 24)));
+        // The tail cuts the first line anywhere, and half a header is not one.
+        assert_eq!(parse_stamp("24.614939 1 stream_handler.go:101] blah"), None);
+        assert_eq!(parse_stamp(""), None);
+        assert_eq!(parse_stamp("E0901 15:09"), None);
+        // Not a date and not a time.
+        assert_eq!(parse_stamp("E1301 15:09:24.1 x"), None, "month 13");
+        assert_eq!(parse_stamp("E0932 15:09:24.1 x"), None, "day 32");
+        assert_eq!(parse_stamp("E0901 25:09:24.1 x"), None, "hour 25");
+        // A Cyrillic first byte must not panic the slicing.
+        assert_eq!(parse_stamp("Э0901 15:09:24.614939 x"), None);
+    }
+
+    /// The header carries no year, so only today and yesterday can be placed -
+    /// and "yesterday" is what makes a refusal at 23:58 still readable at 00:02.
+    #[test]
+    fn a_stamp_is_placed_against_the_local_clock() {
+        let now = clock(9, 1, 15, 10, 0);
+        assert_eq!(age_secs((9, 1, 15 * 3600 + 9 * 60), now), Some(60));
+        assert_eq!(age_secs((9, 1, 15 * 3600 + 10 * 60), now), Some(0));
+        // A stamp a second ahead of our own read of the clock is now.
+        assert_eq!(age_secs((9, 1, 15 * 3600 + 10 * 60 + 2), now), Some(0));
+        // Further ahead than that is not a line about now.
+        assert_eq!(age_secs((9, 1, 15 * 3600 + 20 * 60), now), None);
+        // Another day, and not the one before: unplaceable.
+        assert_eq!(age_secs((8, 20, 0), now), None);
+        // Just after midnight, looking back over it.
+        let midnight = clock(9, 2, 0, 2, 0);
+        assert_eq!(age_secs((9, 1, 23 * 3600 + 58 * 60), midnight), Some(240));
+        // And over the end of a month.
+        let first = clock(9, 1, 0, 1, 0);
+        assert_eq!(age_secs((8, 31, 23 * 3600 + 59 * 60), first), Some(120));
+        // Not the last day of August, so not the day before 1 September.
+        assert_eq!(age_secs((8, 30, 23 * 3600 + 59 * 60), first), None);
+        // February is allowed both its lengths.
+        assert!(is_last_day(2, 28) && is_last_day(2, 29) && !is_last_day(2, 27));
     }
 
     #[test]

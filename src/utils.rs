@@ -381,6 +381,66 @@ pub fn is_admin() -> bool {
     unsafe { geteuid() == 0 }
 }
 
+/// Local wall clock, in the fields a log line is stamped with.
+///
+/// Local rather than UTC because both readers compare it against something a
+/// *person* saw: the relay's own log, and the glog header Antigravity writes.
+/// `second_of_day` rather than three fields because every question asked of it
+/// is "how long ago", and that is one subtraction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocalClock {
+    pub month: u16,
+    pub day: u16,
+    pub second_of_day: u32,
+}
+
+impl LocalClock {
+    pub fn hms(&self) -> String {
+        format!(
+            "{:02}:{:02}:{:02}",
+            self.second_of_day / 3600,
+            (self.second_of_day / 60) % 60,
+            self.second_of_day % 60
+        )
+    }
+}
+
+/// `GetLocalTime`, because this is the only place in the tool that needs a
+/// calendar and a date crate for one struct is not worth the dependency.
+///
+/// `None` where there is no such call: a caller that cannot compare against a
+/// local clock says nothing rather than guessing at an offset.
+#[cfg(target_os = "windows")]
+pub fn local_clock() -> Option<LocalClock> {
+    #[repr(C)]
+    #[derive(Default)]
+    struct SystemTime {
+        year: u16,
+        month: u16,
+        day_of_week: u16,
+        day: u16,
+        hour: u16,
+        minute: u16,
+        second: u16,
+        milliseconds: u16,
+    }
+    extern "system" {
+        fn GetLocalTime(out: *mut SystemTime);
+    }
+    let mut t = SystemTime::default();
+    unsafe { GetLocalTime(&mut t) };
+    Some(LocalClock {
+        month: t.month,
+        day: t.day,
+        second_of_day: t.hour as u32 * 3600 + t.minute as u32 * 60 + t.second as u32,
+    })
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn local_clock() -> Option<LocalClock> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

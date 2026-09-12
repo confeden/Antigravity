@@ -657,6 +657,45 @@ pub fn inspect_install(install: &std::path::Path) -> InstallState {
 mod tests {
     use super::*;
 
+    /// What this machine's installs look like right now, read-only.
+    ///
+    /// The one question a new Antigravity release asks: are both renames still
+    /// there to make? `SignatureMissing` on a fresh install means the proto
+    /// field moved and the patcher needs a new signature before the version is
+    /// shipped (kb/patch.md); `Unpatched` means it is simply not applied yet.
+    /// Reads and prints, asserts nothing about the answer - all four states are
+    /// legitimate depending on what the user has done.
+    ///
+    ///     cargo test inspects_the_installs_on_this_machine -- --ignored --nocapture
+    #[test]
+    #[ignore = "reads the real installs on this machine; run with --ignored"]
+    fn inspects_the_installs_on_this_machine() {
+        let installs = crate::discover_installs_fast();
+        println!("установок найдено: {}", installs.len());
+        for install in &installs {
+            println!("\n{} — {}", crate::install_label(install), install.display());
+            for (path, state) in inspect_install(install).files {
+                // The second rename is not part of `FileState` (it is not what
+                // decides eligibility), and it is the half a new build is just
+                // as free to move. Read straight off the bytes.
+                let bytes = fs::read(&path).unwrap_or_default();
+                let proxy = if contains_subslice(&bytes, PROXY_VAR_NEW.as_bytes()) {
+                    "AG_LS_PROXY"
+                } else if contains_subslice(&bytes, &proxy_var_original()) {
+                    "не переименован"
+                } else {
+                    "ЛИТЕРАЛА НЕТ"
+                };
+                println!(
+                    "  {:?}  прокси-переменная: {}  — {}",
+                    state,
+                    proxy,
+                    path.file_name().unwrap_or_default().to_string_lossy()
+                );
+            }
+        }
+    }
+
     #[test]
     fn replaces_every_occurrence() {
         let mut data = b"xxineligibleyyineligible".to_vec();

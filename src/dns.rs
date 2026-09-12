@@ -33,8 +33,11 @@ const AG_NRPT_LEGACY_TAGS: &[&str] = &["AG_UNLOCKER_NRPT"];
 // history matters. It was dropped under N2 because a 22-resolver sweep found
 // **nobody** substituting it (S9) - a rule for a name every provider answers
 // genuinely is pure DNS leakage. That premise died the moment a provider that
-// does substitute it was measured: dns-ai.ru answers 186.246.45.126, and that
-// address accepts the SNI and replies as Google's own frontend. N2 still holds
+// does substitute it was measured: dns-ai.ru answers with one of its own egress
+// addresses, and that address accepts the SNI and replies as Google's own
+// frontend. (The 2026-08-30 measurement named `186.246.45.126`; that egress has
+// since been deleted and the address reassigned, so the number is not repeated
+// here — see the note in `resolvers.rs` and G43.) N2 still holds
 // as written - do not add a name *nobody* substitutes - but it was never a rule
 // about this hostname, it was a rule about the measurement, and the measurement
 // changed. `antigravity-unleash` stays out: still genuine everywhere.

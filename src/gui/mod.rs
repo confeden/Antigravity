@@ -13,7 +13,8 @@ mod widgets;
 use eframe::egui;
 use std::sync::mpsc::{channel, Receiver};
 
-use crate::ops::{self, Event, Level, Status, Worker};
+use crate::gate;
+use crate::ops::{self, Cmd, Event, Level, Status, Worker};
 use crate::settings::Settings;
 use crate::update::{self, ReleaseInfo};
 
@@ -56,6 +57,16 @@ pub struct App {
     worker: Worker,
     events: Receiver<Event>,
     status: Option<Status>,
+
+    /// What the gate watcher last found: the client's own region-400s, and the
+    /// relay's record of what it did about them.
+    gate: gate::View,
+    /// When that arrived. The watcher sends an age measured at its own tick and
+    /// then stays quiet while nothing changes (waking the UI three times a
+    /// minute to redraw the same line is not worth it), so the window ages its
+    /// copy itself from here.
+    gate_at: std::time::Instant,
+    gate_rx: Receiver<gate::Signal>,
     log: Vec<(Level, String)>,
     /// Ctrl+A over the journal. Our own, because egui's label selection is per
     /// galley and the journal is one label per line.
@@ -91,6 +102,14 @@ impl App {
         let ctx = cc.egui_ctx.clone();
         let worker = ops::spawn(ev_tx, Box::new(move || ctx.request_repaint()));
 
+        // Its own thread and its own channel rather than a command on the
+        // worker's queue: the worker can be minutes deep in a patch run, and
+        // "is Antigravity hitting the gate right now" is exactly the question
+        // that must still answer while it is.
+        let (gate_tx, gate_rx) = channel();
+        let gate_ctx = cc.egui_ctx.clone();
+        gate::spawn_watch(gate_tx, Box::new(move || gate_ctx.request_repaint()));
+
         // Read once, only to pre-fill the two fields. The worker owns the file
         // from here on — two writers each saving the whole thing meant whichever
         // saved last silently reverted the other.
@@ -108,6 +127,9 @@ impl App {
             worker,
             events,
             status: None,
+            gate: gate::View::default(),
+            gate_at: std::time::Instant::now(),
+            gate_rx,
             log: Vec::new(),
             log_all_selected: false,
             busy: None,
@@ -159,6 +181,18 @@ impl App {
     fn drain_events(&mut self) {
         while let Ok(rel) = self.update_rx.try_recv() {
             self.update = Some(rel);
+        }
+        while let Ok(signal) = self.gate_rx.try_recv() {
+            match signal {
+                gate::Signal::Gate(view) => {
+                    self.gate = view;
+                    self.gate_at = std::time::Instant::now();
+                }
+                // The watcher decides *when* it is worth re-measuring; the
+                // worker is the only thing that may take the measurement, so the
+                // request passes through here rather than going around it.
+                gate::Signal::MeasureVpn => self.worker.send(Cmd::RemeasureVpn),
+            }
         }
         while let Ok(ev) = self.events.try_recv() {
             match ev {

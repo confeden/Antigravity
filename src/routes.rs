@@ -204,6 +204,12 @@ fn snapshot() -> ([Option<Sample>; 4], [Option<Instant>; 4], Option<Kind>) {
     }
 }
 
+/// The route sitting first right now, or `None` before the first pass has
+/// picked one. Read by the record the window shows (`gate`).
+pub fn leader() -> Option<Kind> {
+    snapshot().2
+}
+
 /// Re-derives the leader from the latest measurements and says so in the log
 /// when it changed. Run once per warm pass, after the probes.
 pub fn refresh_leader(usable: impl Fn(Kind) -> bool) {

@@ -28,6 +28,7 @@ mod dns_forwarder;
 mod doh;
 mod egress;
 mod endpoint;
+mod gate;
 mod gui;
 mod health;
 mod hosts_pin;
