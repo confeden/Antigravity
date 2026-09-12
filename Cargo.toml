@@ -30,6 +30,15 @@ eframe = { version = "0.36", features = ["glow"] }
 # not ours; features unify, so the build is unchanged either way.
 arboard = { version = "3.6", default-features = false }
 
+[target.'cfg(windows)'.dependencies.windows-sys]
+version = "0.52.0"
+features = [
+    "Win32_Foundation",
+    "Win32_System_Registry",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+]
+
 [build-dependencies]
 winres = "0.1"
 # build.rs derives the per-release canary with the same formula as canary.rs.

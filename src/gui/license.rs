@@ -113,6 +113,7 @@ pub fn view(app: &mut App, ui: &mut egui::Ui) {
                 app.key_next_attempt = Some(std::time::Instant::now() + app.key_cooldown);
 
                 if valid {
+                    auth::save_license_key(app.key_input.trim());
                     app.screen = Screen::Main;
                     // The key field is about to stop existing. Leaving egui's focus
                     // pointed at it makes the next key press land on whatever claims

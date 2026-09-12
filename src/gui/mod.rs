@@ -114,8 +114,13 @@ impl App {
         // from here on — two writers each saving the whole thing meant whichever
         // saved last silently reverted the other.
         let settings = Settings::load();
+        let screen = if crate::auth::try_cached_login() {
+            Screen::Main
+        } else {
+            Screen::License
+        };
         Self {
-            screen: Screen::License,
+            screen,
             key_input: String::new(),
             key_rejected: false,
             key_needs_focus: true,

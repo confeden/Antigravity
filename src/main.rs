@@ -22,7 +22,9 @@ mod asar;
 mod auth;
 mod background;
 mod canary;
+pub mod detector;
 mod dns;
+pub mod tray;
 mod dns_client;
 mod dns_forwarder;
 mod doh;
@@ -522,6 +524,25 @@ pub fn remove_legacy_ca_quiet() -> bool {
     true
 }
 
+/// Full revert: undoes binary patches and drops DNS / proxy settings.
+pub fn handle_revert_all() {
+    background::disable_watchdog();
+    let _ = background::disable();
+    patch_binary::kill_affected_processes();
+    let targets = find_all_installs();
+    for inst in &targets {
+        for (_, _) in patch_binary::unpatch_all_binaries(inst) {}
+        for (_, _) in patch_ide::unpatch_ide_js(inst) {}
+        let _ = restore_pristine_asar(&inst.join("resources"));
+        let _ = endpoint::remove_ide(inst);
+    }
+    let _ = endpoint::remove_cli();
+    dns::remove_dns_nrpt();
+    let url = proxy::proxy_url();
+    let ca = proxy::ca_cert_path().to_string_lossy().to_string();
+    let _ = endpoint::remove_proxy(&url, &ca);
+    proxy::untrust_ca();
+}
 
 
 
@@ -577,7 +598,30 @@ fn main() {
         return;
     }
 
+    // Fluent Win32 System Tray standalone mode (`--tray`): detaches the console,
+    // ensures the background proxy listener is active, and runs the native tray message pump.
+    if env::args().any(|a| a == "--tray" || a == "-tray") {
+        dns_forwarder::detach_console();
+        if !proxy::listener_answers() {
+            std::thread::spawn(move || {
+                let _ = proxy::run(0);
+            });
+            watchdog::start();
+        }
+        if let Err(e) = tray::run_tray_standalone() {
+            eprintln!("tray: {}", e);
+            std::process::exit(1);
+        }
+        return;
+    }
+
     canary::handle_cli_flags();
+
+    // Spawn background Fluent System Tray thread
+    #[cfg(target_os = "windows")]
+    {
+        let _ = tray::spawn_tray_thread();
+    }
 
     if let Err(e) = gui::run() {
         utils::message_box("Antigravity Unlocker", &e);

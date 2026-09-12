@@ -188,6 +188,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "webpki-roots",
+ "windows-sys 0.52.0",
  "winres",
 ]
 
