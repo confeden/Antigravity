@@ -176,12 +176,12 @@ mod windows_impl {
              $d='Antigravity Unlocker: локальный DNS-релей'; \
              try {{ \
                $p=New-ScheduledTaskPrincipal -UserId \"$env:USERDOMAIN\\$env:USERNAME\" \
-                    -LogonType S4U -RunLevel Limited; \
+                    -LogonType S4U -RunLevel Highest; \
                Register-ScheduledTask -TaskName '{task}' -Action $a -Trigger $t -Settings $s \
                     -Principal $p -Description $d -Force -ErrorAction Stop | Out-Null }} \
-             catch {{ \
+             catch {{ $p=New-ScheduledTaskPrincipal -UserId \"$env:USERDOMAIN\\$env:USERNAME\" -RunLevel Highest; \
                Register-ScheduledTask -TaskName '{task}' -Action $a -Trigger $t -Settings $s \
-                    -Description $d -Force -ErrorAction Stop | Out-Null }}; \
+                    -Principal $p -Description $d -Force -ErrorAction Stop | Out-Null }}; \
              Start-ScheduledTask -TaskName '{task}'",
             exe = dst.display(),
             flag = FORWARDER_FLAG,
@@ -320,12 +320,12 @@ mod windows_impl {
              $d='Antigravity Unlocker: сторож патча'; \
              try {{ \
                $p=New-ScheduledTaskPrincipal -UserId \"$env:USERDOMAIN\\$env:USERNAME\" \
-                    -LogonType S4U -RunLevel Limited; \
+                    -LogonType S4U -RunLevel Highest; \
                Register-ScheduledTask -TaskName '{task}' -Action $a -Trigger $t -Settings $s \
                     -Principal $p -Description $d -Force -ErrorAction Stop | Out-Null }} \
-             catch {{ \
+             catch {{ $p=New-ScheduledTaskPrincipal -UserId \"$env:USERDOMAIN\\$env:USERNAME\" -RunLevel Highest; \
                Register-ScheduledTask -TaskName '{task}' -Action $a -Trigger $t -Settings $s \
-                    -Description $d -Force -ErrorAction Stop | Out-Null }}; \
+                    -Principal $p -Description $d -Force -ErrorAction Stop | Out-Null }}; \
              Start-ScheduledTask -TaskName '{task}' -ErrorAction SilentlyContinue",
             exe = exe.display(),
             flag = WATCHDOG_FLAG,
