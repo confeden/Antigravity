@@ -102,8 +102,37 @@ fn connect_pinned(addr: SocketAddr, timeout: Duration, if_index: u32) -> io::Res
 }
 
 #[cfg(not(target_os = "windows"))]
-fn connect_pinned(addr: SocketAddr, timeout: Duration, _if_index: u32) -> io::Result<TcpStream> {
-    TcpStream::connect_timeout(&addr, timeout)
+fn connect_pinned(addr: SocketAddr, timeout: Duration, if_index: u32) -> io::Result<TcpStream> {
+    use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+    use std::os::unix::io::AsRawFd;
+
+    let sock = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
+    const SOL_SOCKET: i32 = 1;
+    const SO_BINDTOIFINDEX: i32 = 62;
+    extern "C" {
+        fn setsockopt(
+            socket: i32,
+            level: i32,
+            option_name: i32,
+            option_value: *const std::ffi::c_void,
+            option_len: u32,
+        ) -> i32;
+    }
+    let idx = if_index as i32;
+    let rc = unsafe {
+        setsockopt(
+            sock.as_raw_fd(),
+            SOL_SOCKET,
+            SO_BINDTOIFINDEX,
+            &idx as *const i32 as *const std::ffi::c_void,
+            std::mem::size_of::<i32>() as u32,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    sock.connect_timeout(&SockAddr::from(addr), timeout)?;
+    Ok(sock.into())
 }
 
 /// The interface the routing table would send a packet to `dest` through.
@@ -122,7 +151,7 @@ pub fn best_interface(dest: Ipv4Addr) -> Option<u32> {
 
 #[cfg(not(target_os = "windows"))]
 pub fn best_interface(_dest: Ipv4Addr) -> Option<u32> {
-    None
+    crate::egress::detect().map(|e| e.if_index)
 }
 
 #[cfg(target_os = "windows")]

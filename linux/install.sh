@@ -37,7 +37,20 @@ chmod +x "$DESKTOP_FILE"
 gio set "$DESKTOP_FILE" metadata::trusted true 2>/dev/null || true
 update-desktop-database "$DESKTOP_DIR" 2>/dev/null || true
 
-echo
+# Check if appindicator library is present for tray icon
+if ! ldconfig -p 2>/dev/null | grep -q 'libayatana-appindicator3\|libappindicator3'; then
+    echo "Примечание: для отображения значка в системном трее рекомендуется установить:"
+    if command -v apt-get >/dev/null 2>&1; then
+        echo "  sudo apt install libayatana-appindicator3-1"
+    elif command -v pacman >/dev/null 2>&1; then
+        echo "  sudo pacman -S libayatana-appindicator"
+    elif command -v dnf >/dev/null 2>&1; then
+        echo "  sudo dnf install libayatana-appindicator-gtk3"
+    fi
+    echo "(Программа работает и без него, значок в трее будет просто скрыт)"
+    echo
+fi
+
 echo "Готово. «Antigravity Unlocker» добавлен в меню приложений."
 echo "Запускайте его двойным кликом из списка программ (Activities / app grid)."
 echo

@@ -1,9 +1,10 @@
 [package]
 name = "ag_unlocker"
-version = "2.15.1"
+version = "2.16.1"
 edition = "2021"
 description = "Antigravity Configuration Tool"
-authors = ["Brent t.me/nova_txt"]
+authors = ["SatoKazuma1 <timofeyp.exe@gmail.com>", "Brent t.me/nova_txt"]
+repository = "https://github.com/SatoKazuma1/Antigravity"
 
 [dependencies]
 obfstr = "0.4"
@@ -32,6 +33,8 @@ socket2 = "0.6"
 # e.g. a server over SSH; on Windows also the fallback when no renderer opens a
 # window). Only the crossterm backend - no widgets beyond the core set.
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
+tray-icon = { version = "0.25.1", default-features = false, features = ["libappindicator", "muda-gtk3"] }
+self-replace = "1.5.0"
 
 # The GUI. Immediate mode, pure Rust, one static exe with no runtime to install
 # (no WebView2, no GTK) - that is what makes it drop onto an arbitrary Windows
@@ -51,6 +54,8 @@ wgpu = { version = "30", default-features = false, features = ["std", "parking_l
 [target.'cfg(not(windows))'.dependencies]
 # Linux has no DirectX: wgpu's default Vulkan + GL, then glow.
 eframe = { version = "0.36", features = ["glow"] }
+gtk = { version = "0.18", default-features = false }
+libc = "0.2"
 
 [build-dependencies]
 winres = "0.1"

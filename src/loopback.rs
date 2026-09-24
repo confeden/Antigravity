@@ -33,12 +33,17 @@ use std::time::Duration;
 
 /// One loopback address per gate host. `127.65.71.x` - "A", "G" - to stay clear
 /// of `127.0.0.1` and of the relay's own `127.0.0.53`.
-pub const HOSTS: [(&str, Ipv4Addr); 2] = [
+pub const HOSTS: [(&str, Ipv4Addr); 4] = [
     ("cloudcode-pa.googleapis.com", Ipv4Addr::new(127, 65, 71, 1)),
     (
         "daily-cloudcode-pa.googleapis.com",
         Ipv4Addr::new(127, 65, 71, 2),
     ),
+    (
+        "generativelanguage.googleapis.com",
+        Ipv4Addr::new(127, 65, 71, 3),
+    ),
+    ("aistudio.google.com", Ipv4Addr::new(127, 65, 71, 4)),
 ];
 
 const PORT: u16 = 443;
@@ -230,7 +235,8 @@ mod tests {
             assert_ne!(ip, Ipv4Addr::LOCALHOST);
             assert_ne!(ip, Ipv4Addr::new(127, 0, 0, 53), "the relay's own");
         }
-        assert_ne!(HOSTS[0].1, HOSTS[1].1);
+        let ips: std::collections::HashSet<_> = HOSTS.iter().map(|(_, ip)| *ip).collect();
+        assert_eq!(ips.len(), HOSTS.len(), "all loopback IPs must be unique");
     }
 
     #[test]

@@ -7,7 +7,7 @@
 use std::fs;
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -15,9 +15,9 @@ use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection};
 use serde::{Deserialize, Serialize};
 
-pub const RELEASES_LATEST_URL: &str = "https://github.com/confeden/Antigravity/releases/latest";
+pub const RELEASES_LATEST_URL: &str = "https://github.com/SatoKazuma1/Antigravity/releases/latest";
 const API_HOST: &str = "api.github.com";
-const API_PATH: &str = "/repos/confeden/Antigravity/releases/latest";
+const API_PATH: &str = "/repos/SatoKazuma1/Antigravity/releases/latest";
 const CHECK_INTERVAL: Duration = Duration::from_secs(8 * 60 * 60);
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -75,6 +75,27 @@ impl ReleaseInfo {
         self.tag_name
             .trim()
             .trim_start_matches(|c| c == 'v' || c == 'V')
+    }
+
+    /// Finds the appropriate binary asset for the current OS.
+    pub fn find_binary_asset(&self) -> Option<&ReleaseAsset> {
+        #[cfg(windows)]
+        {
+            if let Some(a) = self
+                .assets
+                .iter()
+                .find(|a| a.name.eq_ignore_ascii_case("ag_unlocker.exe"))
+            {
+                return Some(a);
+            }
+            self.assets
+                .iter()
+                .find(|a| a.name.to_ascii_lowercase().ends_with(".exe"))
+        }
+        #[cfg(not(windows))]
+        {
+            self.assets.iter().find(|a| a.name == "ag_unlocker")
+        }
     }
 }
 
@@ -323,14 +344,344 @@ pub fn check_update_cached(force: bool) -> Result<Option<ReleaseInfo>, String> {
     }
 }
 
-/// Watches for a newer release for as long as the receiver lives.
-///
-/// Checked once immediately — the banner has to be up before the licence screen
-/// is even answered — and then every `CHECK_INTERVAL` for a window that stays
-/// open. Only the first pass may answer from the on-disk cache: after that the
-/// thread has already waited the full interval, so re-reading a cache it wrote
-/// itself would just double the wait.
-pub fn spawn_watch(tx: std::sync::mpsc::Sender<ReleaseInfo>, wake: Box<dyn Fn() + Send>) {
+/// Helper to parse https:// URLs into (host, port, path_and_query).
+pub fn parse_url(url: &str) -> Result<(String, u16, String), String> {
+    let rest = url
+        .strip_prefix("https://")
+        .ok_or_else(|| format!("Поддерживаются только https:// ссылки: {}", url))?;
+    let (host_port, path) = match rest.find('/') {
+        Some(idx) => (&rest[..idx], &rest[idx..]),
+        None => (rest, "/"),
+    };
+    let (host, port) = match host_port.find(':') {
+        Some(idx) => {
+            let host = &host_port[..idx];
+            let port = host_port[idx + 1..]
+                .parse::<u16>()
+                .map_err(|e| format!("Некорректный порт: {}", e))?;
+            (host.to_string(), port)
+        }
+        None => (host_port.to_string(), 443),
+    };
+    Ok((host, port, path.to_string()))
+}
+
+/// Resolves redirect location header (relative or absolute) against base host and port.
+pub fn resolve_redirect(base_host: &str, base_port: u16, loc: &str) -> String {
+    let loc = loc.trim();
+    if loc.starts_with("http://") || loc.starts_with("https://") {
+        loc.to_string()
+    } else if loc.starts_with('/') {
+        if base_port == 443 {
+            format!("https://{}{}", base_host, loc)
+        } else {
+            format!("https://{}:{}{}", base_host, base_port, loc)
+        }
+    } else {
+        if base_port == 443 {
+            format!("https://{}/{}", base_host, loc)
+        } else {
+            format!("https://{}:{}/{}", base_host, base_port, loc)
+        }
+    }
+}
+
+/// Downloads a file over HTTPS directly to disk, following redirects.
+pub fn download_file(
+    initial_url: &str,
+    dest_path: &Path,
+    progress_cb: impl Fn(u64, Option<u64>),
+) -> Result<(), String> {
+    let mut current_url = initial_url.to_string();
+    let mut redirects = 0;
+    const MAX_REDIRECTS: usize = 10;
+
+    loop {
+        if redirects >= MAX_REDIRECTS {
+            return Err("Слишком много перенаправлений (redirects) при скачивании".to_string());
+        }
+
+        let (host, port, path) = parse_url(&current_url)?;
+        let mut sock = connect_tcp(&host, port)?;
+
+        let server_name = ServerName::try_from(host.as_str())
+            .map_err(|e| format!("Некорректное имя TLS сервера {}: {}", host, e))?
+            .to_owned();
+        let mut conn = ClientConnection::new(tls_config(), server_name)
+            .map_err(|e| format!("Ошибка TLS соединения: {}", e))?;
+        let mut stream = rustls::Stream::new(&mut conn, &mut sock);
+
+        let req = format!(
+            "GET {} HTTP/1.1\r\n\
+             Host: {}\r\n\
+             User-Agent: ag_unlocker/{}\r\n\
+             Accept: application/octet-stream, */*\r\n\
+             Connection: close\r\n\r\n",
+            path,
+            host,
+            current_version()
+        );
+
+        stream
+            .write_all(req.as_bytes())
+            .map_err(|e| format!("Ошибка отправки HTTP-запроса: {}", e))?;
+        stream
+            .flush()
+            .map_err(|e| format!("Ошибка сброса HTTP-буфера: {}", e))?;
+
+        let mut header_buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let mut body_start_idx = None;
+
+        while header_buf.len() < 32 * 1024 {
+            match stream.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let prev_len = header_buf.len();
+                    header_buf.extend_from_slice(&chunk[..n]);
+                    let search_from = prev_len.saturating_sub(3);
+                    if let Some(pos) = header_buf[search_from..]
+                        .windows(4)
+                        .position(|w| w == b"\r\n\r\n")
+                    {
+                        body_start_idx = Some(search_from + pos + 4);
+                        break;
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(format!("Ошибка чтения ответа сервера: {}", e)),
+            }
+        }
+
+        let body_start = body_start_idx
+            .ok_or_else(|| "Не удалось получить HTTP-заголовки ответа".to_string())?;
+
+        let header_str = String::from_utf8_lossy(&header_buf[..body_start]);
+        let mut lines = header_str.lines();
+        let status_line = lines.next().unwrap_or("");
+
+        let status_code: u16 = status_line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+
+        if status_code == 301
+            || status_code == 302
+            || status_code == 303
+            || status_code == 307
+            || status_code == 308
+        {
+            let mut loc = None;
+            for line in lines {
+                if let Some(pos) = line.find(':') {
+                    let name = line[..pos].trim();
+                    if name.eq_ignore_ascii_case("location") {
+                        loc = Some(line[pos + 1..].trim().to_string());
+                        break;
+                    }
+                }
+            }
+            let loc = loc.ok_or_else(|| {
+                format!("Редирект {} без заголовка Location", status_code)
+            })?;
+            current_url = resolve_redirect(&host, port, &loc);
+            redirects += 1;
+            continue;
+        }
+
+        if status_code != 200 {
+            return Err(format!(
+                "Сервер вернул ошибку при скачивании: {}",
+                status_line
+            ));
+        }
+
+        let mut content_length = None;
+        for line in lines {
+            if let Some(pos) = line.find(':') {
+                let name = line[..pos].trim();
+                if name.eq_ignore_ascii_case("content-length") {
+                    content_length = line[pos + 1..].trim().parse::<u64>().ok();
+                    break;
+                }
+            }
+        }
+
+        let mut file = fs::File::create(dest_path)
+            .map_err(|e| format!("Не удалось создать файл для записи: {}", e))?;
+
+        let mut downloaded_bytes: u64 = 0;
+        let mut last_reported = 0u64;
+
+        progress_cb(0, content_length);
+
+        if body_start < header_buf.len() {
+            let initial_body = &header_buf[body_start..];
+            file.write_all(initial_body)
+                .map_err(|e| format!("Ошибка записи в файл: {}", e))?;
+            downloaded_bytes += initial_body.len() as u64;
+            last_reported = downloaded_bytes;
+            progress_cb(downloaded_bytes, content_length);
+        }
+
+        let mut read_buf = [0u8; 64 * 1024];
+        loop {
+            match stream.read(&mut read_buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    file.write_all(&read_buf[..n])
+                        .map_err(|e| format!("Ошибка записи в файл: {}", e))?;
+                    downloaded_bytes += n as u64;
+
+                    if downloaded_bytes.saturating_sub(last_reported) >= 64 * 1024 {
+                        last_reported = downloaded_bytes;
+                        progress_cb(downloaded_bytes, content_length);
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(format!("Ошибка при скачивании данных: {}", e)),
+            }
+        }
+
+        file.flush()
+            .map_err(|e| format!("Ошибка сброса буфера файла: {}", e))?;
+        progress_cb(downloaded_bytes, content_length);
+
+        if let Some(expected) = content_length {
+            if downloaded_bytes < expected {
+                return Err(format!(
+                    "Файл загружен не полностью (получено {} из {} байт)",
+                    downloaded_bytes, expected
+                ));
+            }
+        }
+
+        return Ok(());
+    }
+}
+
+/// Downloads binary from release and replaces the currently running executable.
+pub fn perform_update(
+    release: &ReleaseInfo,
+    progress_cb: impl Fn(u64, Option<u64>),
+) -> Result<(), String> {
+    let asset = release.find_binary_asset().ok_or_else(|| {
+        #[cfg(windows)]
+        let expected = "ag_unlocker.exe";
+        #[cfg(not(windows))]
+        let expected = "ag_unlocker";
+        format!(
+            "В релизе {} не найден файл для обновления ('{}')",
+            release.tag_name, expected
+        )
+    })?;
+
+    let temp_dir = std::env::temp_dir();
+    let temp_path = temp_dir.join(format!("ag_unlocker_update_{}.tmp", std::process::id()));
+
+    let dl_res = download_file(&asset.browser_download_url, &temp_path, &progress_cb);
+    if let Err(e) = dl_res {
+        let _ = fs::remove_file(&temp_path);
+        return Err(e);
+    }
+
+    let meta = fs::metadata(&temp_path).map_err(|e| {
+        let _ = fs::remove_file(&temp_path);
+        format!("Ошибка чтения файла обновления: {}", e)
+    })?;
+
+    if meta.len() < 500 * 1024 {
+        let _ = fs::remove_file(&temp_path);
+        return Err(format!(
+            "Скачанный файл повреждён или слишком мал ({} байт)",
+            meta.len()
+        ));
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = meta.permissions();
+        perms.set_mode(0o755);
+        if let Err(e) = fs::set_permissions(&temp_path, perms) {
+            let _ = fs::remove_file(&temp_path);
+            return Err(format!("Не удалось установить права запуска (+x): {}", e));
+        }
+    }
+
+    let replace_res = self_replace::self_replace(&temp_path);
+    let _ = fs::remove_file(&temp_path);
+
+    replace_res.map_err(|e| {
+        format!(
+            "Не удалось заменить файл программы: {} (возможно, требуются права администратора)",
+            e
+        )
+    })?;
+
+    Ok(())
+}
+
+/// Restarts the application by spawning the updated executable and terminating current process.
+pub fn restart_process() -> Result<(), String> {
+    let current_exe = std::env::current_exe()
+        .map_err(|e| format!("Не удалось определить путь к текущей программе: {}", e))?;
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+
+    let mut cmd = std::process::Command::new(&current_exe);
+    cmd.args(&args);
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
+    }
+
+    cmd.spawn()
+        .map_err(|e| format!("Не удалось перезапустить программу: {}", e))?;
+
+    std::process::exit(0);
+}
+
+/// Messages emitted by the update background worker.
+#[derive(Debug, Clone)]
+pub enum UpdateMsg {
+    Available(ReleaseInfo),
+    Progress {
+        version: String,
+        downloaded: u64,
+        total: Option<u64>,
+        percent: f32,
+    },
+    Done {
+        version: String,
+    },
+    Error {
+        version: String,
+        error: String,
+    },
+}
+
+/// Commands sent to the update background worker.
+#[derive(Debug, Clone)]
+pub enum UpdateCmd {
+    Download(ReleaseInfo),
+}
+
+/// Watches for updates and manages downloading in the background.
+pub fn spawn_watch(
+    tx: std::sync::mpsc::Sender<UpdateMsg>,
+    wake: Arc<dyn Fn() + Send + Sync>,
+    auto_download: bool,
+) -> std::sync::mpsc::Sender<UpdateCmd> {
+    let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<UpdateCmd>();
+    let cmd_tx_clone = cmd_tx.clone();
+    let tx_checker = tx.clone();
+    let wake_checker = Arc::clone(&wake);
+
     std::thread::Builder::new()
         .name("update-watch".to_string())
         .spawn(move || {
@@ -338,20 +689,15 @@ pub fn spawn_watch(tx: std::sync::mpsc::Sender<ReleaseInfo>, wake: Box<dyn Fn() 
             loop {
                 match check_update_cached(!first) {
                     Ok(Some(rel)) => {
-                        // A closed receiver means the window is gone; so is the
-                        // reason to keep checking.
-                        if tx.send(rel).is_err() {
-                            return;
+                        let _ = tx_checker.send(UpdateMsg::Available(rel.clone()));
+                        wake_checker();
+
+                        if auto_download {
+                            let _ = cmd_tx_clone.send(UpdateCmd::Download(rel));
                         }
-                        // egui sleeps until something asks it to repaint, so a
-                        // banner that only lands in a channel stays invisible
-                        // until the user happens to move the mouse.
-                        wake();
                     }
                     Ok(None) => {}
                     Err(_e) => {
-                        // Background check: a failure is not the user's problem,
-                        // and there is no UI surface that could act on it.
                         #[cfg(debug_assertions)]
                         eprintln!("update check failed: {}", _e);
                     }
@@ -361,6 +707,56 @@ pub fn spawn_watch(tx: std::sync::mpsc::Sender<ReleaseInfo>, wake: Box<dyn Fn() 
             }
         })
         .ok();
+
+    // Worker thread for downloading and updating
+    let tx_worker = tx;
+    std::thread::Builder::new()
+        .name("update-worker".to_string())
+        .spawn(move || {
+            while let Ok(cmd) = cmd_rx.recv() {
+                match cmd {
+                    UpdateCmd::Download(rel) => {
+                        let version = rel.display_version().to_string();
+                        let ver_cb = version.clone();
+                        let tx_cb = tx_worker.clone();
+                        let wake_cb = Arc::clone(&wake);
+
+                        let res = perform_update(&rel, move |downloaded, total| {
+                            let percent = match total {
+                                Some(tot) if tot > 0 => {
+                                    ((downloaded as f64 / tot as f64) * 100.0) as f32
+                                }
+                                _ => 0.0,
+                            };
+                            let _ = tx_cb.send(UpdateMsg::Progress {
+                                version: ver_cb.clone(),
+                                downloaded,
+                                total,
+                                percent,
+                            });
+                            wake_cb();
+                        });
+
+                        match res {
+                            Ok(()) => {
+                                let _ = tx_worker.send(UpdateMsg::Done { version });
+                                wake();
+                            }
+                            Err(e) => {
+                                let _ = tx_worker.send(UpdateMsg::Error {
+                                    version,
+                                    error: e,
+                                });
+                                wake();
+                            }
+                        }
+                    }
+                }
+            }
+        })
+        .ok();
+
+    cmd_tx
 }
 
 #[cfg(test)]
@@ -424,10 +820,79 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_url() {
+        let (host, port, path) = parse_url("https://github.com/test/repo").unwrap();
+        assert_eq!(host, "github.com");
+        assert_eq!(port, 443);
+        assert_eq!(path, "/test/repo");
+
+        let (host, port, path) = parse_url("https://example.com:8443/custom/path?query=1").unwrap();
+        assert_eq!(host, "example.com");
+        assert_eq!(port, 8443);
+        assert_eq!(path, "/custom/path?query=1");
+
+        assert!(parse_url("http://insecure.com").is_err());
+    }
+
+    #[test]
+    fn test_resolve_redirect() {
+        assert_eq!(
+            resolve_redirect("github.com", 443, "https://objects.githubusercontent.com/file"),
+            "https://objects.githubusercontent.com/file"
+        );
+        assert_eq!(
+            resolve_redirect("github.com", 443, "/relative/redirect"),
+            "https://github.com/relative/redirect"
+        );
+    }
+
+    #[test]
+    fn test_find_binary_asset() {
+        let sample = r#"{
+            "tag_name": "v2.16.0",
+            "html_url": "https://github.com/SatoKazuma1/Antigravity/releases/tag/v2.16.0",
+            "assets": [
+                {
+                    "name": "ag_unlocker",
+                    "browser_download_url": "https://github.com/downloads/ag_unlocker",
+                    "size": 15000000
+                },
+                {
+                    "name": "ag_unlocker.exe",
+                    "browser_download_url": "https://github.com/downloads/ag_unlocker.exe",
+                    "size": 10000000
+                }
+            ]
+        }"#;
+
+        let rel: ReleaseInfo = serde_json::from_str(sample).unwrap();
+        let asset = rel.find_binary_asset();
+        assert!(asset.is_some());
+        #[cfg(windows)]
+        assert_eq!(asset.unwrap().name, "ag_unlocker.exe");
+        #[cfg(not(windows))]
+        assert_eq!(asset.unwrap().name, "ag_unlocker");
+    }
+
+    #[test]
     #[ignore = "performs real HTTPS request to api.github.com; requires internet access"]
     fn test_live_fetch_latest_release() {
         let rel = fetch_latest_release().expect("live fetch succeeded");
         assert!(!rel.tag_name.is_empty());
         assert!(rel.html_url.contains("github.com"));
+    }
+
+    #[test]
+    #[ignore = "performs real asset download; requires internet access"]
+    fn test_live_download_asset() {
+        let temp_dir = std::env::temp_dir();
+        let temp_file = temp_dir.join("test_dl_ag_unlocker.bin");
+        let url = "https://github.com/SatoKazuma1/Antigravity/releases/download/v2.16.0/ag_unlocker";
+        let res = download_file(url, &temp_file, |_bytes, _tot| {});
+        assert!(res.is_ok(), "download failed: {:?}", res.err());
+        assert!(temp_file.exists());
+        let meta = std::fs::metadata(&temp_file).unwrap();
+        assert!(meta.len() > 10_000_000, "file too small: {}", meta.len());
+        std::fs::remove_file(temp_file).ok();
     }
 }

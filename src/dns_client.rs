@@ -63,8 +63,37 @@ mod sys {
 
 #[cfg(not(target_os = "windows"))]
 mod sys {
-    pub fn bind_socket_to_interface(_: &std::net::UdpSocket, _: u32) -> Result<(), String> {
-        Err("поддерживается только на Windows".to_string())
+    pub fn bind_socket_to_interface(
+        sock: &std::net::UdpSocket,
+        if_index: u32,
+    ) -> Result<(), String> {
+        use std::os::unix::io::AsRawFd;
+        const SOL_SOCKET: i32 = 1;
+        const SO_BINDTOIFINDEX: i32 = 62;
+        extern "C" {
+            fn setsockopt(
+                socket: i32,
+                level: i32,
+                option_name: i32,
+                option_value: *const std::ffi::c_void,
+                option_len: u32,
+            ) -> i32;
+        }
+        let idx = if_index as i32;
+        let rc = unsafe {
+            setsockopt(
+                sock.as_raw_fd(),
+                SOL_SOCKET,
+                SO_BINDTOIFINDEX,
+                &idx as *const i32 as *const std::ffi::c_void,
+                std::mem::size_of::<i32>() as u32,
+            )
+        };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err("не удалось привязать сокет к интерфейсу".to_string())
+        }
     }
 }
 

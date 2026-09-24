@@ -403,7 +403,10 @@ fn is_local_host(host: &str) -> bool {
 /// copy of a list like this drifts.
 pub fn is_gate_host(host: &str) -> bool {
     let h = host.trim_end_matches('.').to_ascii_lowercase();
-    h == "cloudcode-pa.googleapis.com" || h == "daily-cloudcode-pa.googleapis.com"
+    h == "cloudcode-pa.googleapis.com"
+        || h == "daily-cloudcode-pa.googleapis.com"
+        || h == "generativelanguage.googleapis.com"
+        || h == "aistudio.google.com"
 }
 
 /// Sends a gate host through the user's own proxy, when they gave us one and it
@@ -498,7 +501,7 @@ fn gate_direct_addrs(host: &str, port: u16) -> Result<(Vec<std::net::SocketAddr>
     // With no relay to stand down for a tunnel (D13) and no VPN route of ours,
     // Google's own address is the gate and nothing else: the next route in the
     // table takes the connection instead.
-    if !cfg!(target_os = "windows") && verdict != crate::resolvers::Verdict::Substituted {
+    if !crate::resolvers::vpn_is_active() && verdict != crate::resolvers::Verdict::Substituted {
         return Err(
             "сервисы разблокировки не подменили адрес — напрямую будет ошибка 400".to_string(),
         );

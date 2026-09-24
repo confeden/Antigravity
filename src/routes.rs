@@ -320,6 +320,29 @@ pub fn is_penalised(kind: Kind) -> bool {
         .is_some_and(|t| penalised(&t.penalised, kind))
 }
 
+/// Caps the remaining penalty of `kind` to at most `max_duration`.
+///
+/// Used when a route has no alternative paths (e.g. `Kind::Direct` in a standard build):
+/// instead of benching it for 10 or 60 minutes and leaving the client with no usable route,
+/// the bench is reduced to a brief pause (e.g. 10 s) to allow DNS cache flush and re-warming.
+pub fn cap_penalty(kind: Kind, max_duration: Duration) {
+    if let Ok(mut t) = TABLE.lock() {
+        let i = kind.index();
+        let limit = Instant::now() + max_duration;
+        if let Some(until) = t.penalised[i] {
+            if until > limit {
+                t.penalised[i] = Some(limit);
+            }
+        }
+    }
+}
+
+/// Whether any other route than `kind` is currently usable.
+pub fn has_other_usable(kind: Kind) -> bool {
+    let order = order(|k| crate::proxy::route_usable(k, "daily-cloudcode-pa.googleapis.com"));
+    order.into_iter().any(|k| k != kind)
+}
+
 fn penalised(list: &[Option<Instant>; N], kind: Kind) -> bool {
     list[kind.index()].is_some_and(|until| Instant::now() < until)
 }
@@ -497,10 +520,14 @@ pub fn set_context(fingerprint: u64) -> bool {
 /// The table is copied out from under its lock before `usable` is consulted:
 /// `usable` asks this module questions of its own (`is_penalised`), and a
 /// non-reentrant lock held across that call deadlocked the very first live
+pub fn has_dns_layer() -> bool {
+    true
+}
+
 /// connection (G30, I50).
 pub fn order(usable: impl Fn(Kind) -> bool) -> Vec<Kind> {
     let s = snapshot();
-    order_with(&s, cfg!(target_os = "windows"), usable)
+    order_with(&s, has_dns_layer(), usable)
 }
 
 #[derive(Clone, Copy)]
@@ -554,7 +581,7 @@ pub fn leader() -> Option<Kind> {
 /// in the log when it changed. Run once per warm pass, after the probes.
 pub fn refresh_leader(usable: impl Fn(Kind) -> bool) {
     let s = snapshot();
-    let order = order_with(&s, cfg!(target_os = "windows"), usable);
+    let order = order_with(&s, has_dns_layer(), usable);
     let Some(&best) = order.first() else {
         return;
     };
@@ -1076,7 +1103,7 @@ pub struct Row {
 pub fn rows(usable: impl Fn(Kind) -> bool) -> Vec<Row> {
     let s = snapshot();
     let open = open_counts();
-    let order = order_with(&s, cfg!(target_os = "windows"), &usable);
+    let order = order_with(&s, has_dns_layer(), &usable);
     let mut kinds: Vec<Kind> = order.clone();
     kinds.extend(ALL.iter().copied().filter(|k| !order.contains(k)));
     kinds
@@ -1131,7 +1158,11 @@ mod tests {
     static STATEFUL: Mutex<()> = Mutex::new(());
 
     fn turn() -> std::sync::MutexGuard<'static, ()> {
-        STATEFUL.lock().unwrap_or_else(|e| e.into_inner())
+        let guard = STATEFUL.lock().unwrap_or_else(|e| e.into_inner());
+        if let Ok(mut list) = TUNNELS.lock() {
+            list.clear();
+        }
+        guard
     }
 
     fn blank() -> Snapshot {

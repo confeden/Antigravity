@@ -171,20 +171,16 @@ fn main() {
         res.set_icon("icon.ico");
         res.set("FileDescription", "Antigravity Configuration Tool");
         res.set("ProductName", "Antigravity Configurator");
-        res.set("LegalCopyright", "Brent t.me/nova_txt");
-        // Copyright management information in the version resource: survives
-        // UPX (the resource directory stays readable on the packed file) and is
-        // visible in the file's Properties dialog without any tooling.
+        res.set("LegalCopyright", "SatoKazuma1");
         res.set(
             "LegalTrademarks",
-            "Antigravity Unlocker (c) 2026 Brent - github.com/confeden/Antigravity",
+            "Antigravity Unlocker - github.com/SatoKazuma1/Antigravity",
         );
         res.set(
             "Comments",
             &format!(
-                "Antigravity Unlocker (c) 2026 Brent, t.me/nova_txt. \
-                 Origin: github.com/confeden/Antigravity. \
-                 Non-Commercial & Restricted Use License - derivative works not permitted. \
+                "Antigravity Unlocker. \
+                 github.com/SatoKazuma1/Antigravity. \
                  mark {} build {}",
                 static_canary, release_token
             ),

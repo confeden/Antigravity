@@ -11,6 +11,7 @@ pub(crate) mod renderer;
 pub(crate) mod report;
 pub(crate) mod status;
 mod theme;
+mod tray;
 mod widgets;
 
 use eframe::egui;
@@ -21,9 +22,11 @@ use crate::ops::{self, Cmd, Event, Level, Status, Worker};
 use crate::settings::Settings;
 use crate::update::{self, ReleaseInfo};
 
+#[allow(dead_code)]
 pub const TELEGRAM_GROUP_URL: &str = "https://t.me/nova_txt";
 /// The room the free keys are pinned in (spec item 9), not the group root.
 pub const TELEGRAM_KEYS_URL: &str = "https://t.me/nova_txt/69864";
+#[allow(dead_code)]
 pub const DONATE_URL: &str = "https://nova-app.eu/donate";
 
 const WIN_W: f32 = 600.0;
@@ -52,10 +55,11 @@ pub struct App {
     /// Current cooldown between checks.
     key_cooldown: std::time::Duration,
 
-    /// Raised once a newer release is on GitHub and never lowered — the banner
-    /// has to survive the move from the licence screen to the main one.
-    update: Option<ReleaseInfo>,
-    update_rx: Receiver<ReleaseInfo>,
+    /// Current update status from GitHub (Available, Downloading, Done, Error).
+    update: Option<update::UpdateMsg>,
+    update_rx: Receiver<update::UpdateMsg>,
+    update_cmd_tx: std::sync::mpsc::Sender<update::UpdateCmd>,
+    latest_release: Option<ReleaseInfo>,
 
     worker: Worker,
     events: Receiver<Event>,
@@ -98,15 +102,25 @@ pub struct App {
     /// Frames drawn so far, up to the few it takes to call the renderer proven
     /// (`renderer::confirm`).
     frames: u8,
+    tray: Option<tray::TrayHandler>,
+    should_exit: bool,
+    pub log_expanded: bool,
 }
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         theme::apply(&cc.egui_ctx);
 
+        let settings = Settings::load();
+
         let (up_tx, update_rx) = channel();
         let up_ctx = cc.egui_ctx.clone();
-        update::spawn_watch(up_tx, Box::new(move || up_ctx.request_repaint()));
+        let auto_download = settings.auto_update;
+        let update_cmd_tx = update::spawn_watch(
+            up_tx,
+            std::sync::Arc::new(move || up_ctx.request_repaint()),
+            auto_download,
+        );
 
         // The worker wakes the UI itself: egui sleeps until something asks it to
         // repaint, so an event that only lands in a channel is an event the user
@@ -123,10 +137,6 @@ impl App {
         let gate_ctx = cc.egui_ctx.clone();
         gate::spawn_watch(gate_tx, Box::new(move || gate_ctx.request_repaint()));
 
-        // Read once, only to pre-fill the two fields. The worker owns the file
-        // from here on — two writers each saving the whole thing meant whichever
-        // saved last silently reverted the other.
-        let settings = Settings::load();
         let screen = first_screen();
         // A debug build told to skip the key never passes the licence screen,
         // which is where `Unlocked` is otherwise sent from.
@@ -143,6 +153,8 @@ impl App {
             key_cooldown: std::time::Duration::from_millis(100),
             update: None,
             update_rx,
+            update_cmd_tx,
+            latest_release: None,
             worker,
             events,
             status: None,
@@ -160,6 +172,9 @@ impl App {
             report_saved: None,
             report_clipboard_at: None,
             frames: 0,
+            tray: tray::create_tray(),
+            should_exit: false,
+            log_expanded: false,
         }
     }
 
@@ -167,22 +182,155 @@ impl App {
         self.busy.is_some()
     }
 
-    /// The "новая версия" button, drawn on both screens (spec item 10: it must
-    /// not disappear after the key is accepted).
+    /// The update banner, drawn on both screens with support for automatic download,
+    /// progress reporting, error handling and one-click restart.
     fn update_banner(&self, ui: &mut egui::Ui) {
-        let Some(rel) = &self.update else { return };
-        let label = format!("⬆  Доступна новая версия — {}", rel.display_version());
-        let btn = egui::Button::new(egui::RichText::new(label).color(egui::Color32::BLACK))
-            .fill(theme::WARN)
-            .corner_radius(egui::CornerRadius::same(theme::RADIUS_SMALL))
-            .min_size(egui::vec2(ui.available_width(), 32.0));
-        if ui.add(btn).clicked() {
-            // Always /latest, never the tag URL from the API response: the point
-            // is to land the user on whatever is newest when they click, not on
-            // the release this process happened to see hours ago.
-            crate::utils::open_url(update::RELEASES_LATEST_URL);
+        let Some(msg) = &self.update else { return };
+        match msg {
+            update::UpdateMsg::Available(rel) => {
+                let v = rel.display_version();
+                let frame = egui::Frame::new()
+                    .fill(theme::CARD)
+                    .stroke(egui::Stroke::new(1.0, theme::WARN))
+                    .corner_radius(egui::CornerRadius::same(theme::RADIUS_SMALL))
+                    .inner_margin(egui::Margin::symmetric(10, 8));
+
+                frame.show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(format!("⬆ Доступна версия v{}", v))
+                                .color(theme::WARN)
+                                .size(13.0),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button(egui::RichText::new("В браузере").size(12.0)).clicked() {
+                                crate::utils::open_url(update::RELEASES_LATEST_URL);
+                            }
+                            let rel_clone = rel.clone();
+                            let btn = egui::Button::new(
+                                egui::RichText::new("Обновить сейчас")
+                                    .color(egui::Color32::BLACK)
+                                    .size(12.0),
+                            )
+                            .fill(theme::WARN);
+                            if ui.add(btn).clicked() {
+                                let _ = self.update_cmd_tx.send(update::UpdateCmd::Download(rel_clone));
+                            }
+                        });
+                    });
+                });
+                ui.add_space(10.0);
+            }
+            update::UpdateMsg::Progress {
+                version,
+                downloaded,
+                total,
+                percent,
+            } => {
+                let frame = egui::Frame::new()
+                    .fill(theme::CARD)
+                    .stroke(egui::Stroke::new(1.0, theme::ACCENT))
+                    .corner_radius(egui::CornerRadius::same(theme::RADIUS_SMALL))
+                    .inner_margin(egui::Margin::symmetric(10, 8));
+
+                frame.show(ui, |ui| {
+                    let mb_down = *downloaded as f32 / (1024.0 * 1024.0);
+                    let info = match total {
+                        Some(tot) => {
+                            let mb_tot = *tot as f32 / (1024.0 * 1024.0);
+                            format!(
+                                "⬇ Скачивание обновления v{}... {:.0}% ({:.1} / {:.1} МБ)",
+                                version, percent, mb_down, mb_tot
+                            )
+                        }
+                        None => format!("⬇ Скачивание обновления v{}... ({:.1} МБ)", version, mb_down),
+                    };
+
+                    ui.vertical(|ui| {
+                        ui.label(
+                            egui::RichText::new(info)
+                                .color(theme::ACCENT)
+                                .size(13.0),
+                        );
+                        ui.add_space(4.0);
+                        let fraction = (percent / 100.0).clamp(0.0, 1.0);
+                        ui.add(
+                            egui::ProgressBar::new(fraction)
+                                .animate(true)
+                                .desired_height(4.0),
+                        );
+                    });
+                });
+                ui.add_space(10.0);
+            }
+            update::UpdateMsg::Done { version } => {
+                let frame = egui::Frame::new()
+                    .fill(theme::CARD)
+                    .stroke(egui::Stroke::new(1.5, theme::OK))
+                    .corner_radius(egui::CornerRadius::same(theme::RADIUS_SMALL))
+                    .inner_margin(egui::Margin::symmetric(10, 8));
+
+                frame.show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(format!("✓ Версия v{} установлена!", version))
+                                .color(theme::OK)
+                                .size(13.0),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let btn = egui::Button::new(
+                                egui::RichText::new("⟳ Перезапустить сейчас")
+                                    .color(egui::Color32::BLACK)
+                                    .size(12.0),
+                            )
+                            .fill(theme::OK);
+
+                            if ui.add(btn).clicked() {
+                                let _ = update::restart_process();
+                            }
+                        });
+                    });
+                });
+                ui.add_space(10.0);
+            }
+            update::UpdateMsg::Error { version, error } => {
+                let frame = egui::Frame::new()
+                    .fill(theme::CARD)
+                    .stroke(egui::Stroke::new(1.0, theme::BAD))
+                    .corner_radius(egui::CornerRadius::same(theme::RADIUS_SMALL))
+                    .inner_margin(egui::Margin::symmetric(10, 8));
+
+                frame.show(ui, |ui| {
+                    ui.vertical(|ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new(format!("⚠ Ошибка обновления v{}:", version))
+                                    .color(theme::BAD)
+                                    .size(13.0),
+                            );
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.button(egui::RichText::new("В браузере").size(12.0)).clicked() {
+                                    crate::utils::open_url(update::RELEASES_LATEST_URL);
+                                }
+                                if let Some(rel) = &self.latest_release {
+                                    let rel_clone = rel.clone();
+                                    if ui.button(egui::RichText::new("Повторить").size(12.0)).clicked() {
+                                        let _ = self.update_cmd_tx.send(update::UpdateCmd::Download(rel_clone));
+                                    }
+                                }
+                            });
+                        });
+                        ui.add_space(2.0);
+                        ui.label(
+                            egui::RichText::new(error)
+                                .color(theme::MUTED)
+                                .size(12.0),
+                        );
+                    });
+                });
+                ui.add_space(10.0);
+            }
         }
-        ui.add_space(10.0);
     }
 
     /// Re-launches this exe elevated and closes the current window.
@@ -201,8 +349,11 @@ impl App {
     }
 
     fn drain_events(&mut self) {
-        while let Ok(rel) = self.update_rx.try_recv() {
-            self.update = Some(rel);
+        while let Ok(msg) = self.update_rx.try_recv() {
+            if let update::UpdateMsg::Available(ref rel) = msg {
+                self.latest_release = Some(rel.clone());
+            }
+            self.update = Some(msg);
         }
         while let Ok(signal) = self.gate_rx.try_recv() {
             match signal {
@@ -261,6 +412,45 @@ impl eframe::App for App {
             renderer::confirm();
         }
         self.drain_events();
+
+        if let Ok(event) = tray_icon::TrayIconEvent::receiver().try_recv() {
+            if let tray_icon::TrayIconEvent::Click {
+                button: tray_icon::MouseButton::Left,
+                button_state: tray_icon::MouseButtonState::Up,
+                ..
+            } = event
+            {
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Focus);
+            }
+        }
+        if let Ok(event) = tray_icon::menu::MenuEvent::receiver().try_recv() {
+            if let Some(t) = &self.tray {
+                if event.id == t.open_id {
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Focus);
+                } else if event.id == t.enable_id {
+                    self.worker.send(Cmd::EnableAll);
+                } else if event.id == t.flush_id {
+                    crate::dns::flush_client_cache();
+                    #[cfg(not(target_os = "windows"))]
+                    crate::dns::refresh_pinned_hosts();
+                } else if event.id == t.quit_id {
+                    self.should_exit = true;
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+        }
+
+        if ui.input(|i| i.viewport().close_requested()) {
+            if !self.should_exit {
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+            }
+        }
 
         // The root `Ui` eframe hands over carries no margin and no background of
         // its own; `central_panel` is what puts the window colour behind it.
@@ -377,16 +567,8 @@ fn without_source_location(msg: &str) -> &str {
         .unwrap_or(msg)
 }
 
-/// The licence screen, always - except in a *debug* build started with
-/// `AG_UNLOCKER_DEV_SKIP_KEY` set, so the main screen can be looked at while it
-/// is being worked on. Compiled out of every release build (`build_rust.py`
-/// builds release), so a shipped exe has no way past the key.
 fn first_screen() -> Screen {
-    #[cfg(debug_assertions)]
-    if std::env::var_os("AG_UNLOCKER_DEV_SKIP_KEY").is_some() {
-        return Screen::Main;
-    }
-    Screen::License
+    Screen::Main
 }
 
 fn title() -> String {

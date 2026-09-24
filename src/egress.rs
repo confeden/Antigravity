@@ -71,6 +71,7 @@ fn parse_egress(line: &str) -> Option<Egress> {
 /// drops WireGuard/TAP tunnels and the Hyper-V/VMware virtual switches in one
 /// go, and requiring a real next hop drops host-only adapters, which carry a
 /// gateway address but no default route.
+#[cfg(target_os = "windows")]
 pub fn detect() -> Option<Egress> {
     const SCRIPT: &str = "\
 $phys=@(Get-NetAdapter -Physical -ErrorAction SilentlyContinue | \
@@ -90,6 +91,58 @@ if ($mine.Count -eq 0) { 'none' } else { \
         .rev()
         .find(|l| !l.trim().is_empty())
         .and_then(parse_egress)
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn detect() -> Option<Egress> {
+    let text = std::fs::read_to_string("/proc/net/route").ok()?;
+    let mut best_phys: Option<(u32, u32)> = None;
+    let mut vpn_active = false;
+
+    for line in text.lines().skip(1) {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 7 {
+            continue;
+        }
+        let iface = fields[0];
+        let dest = fields[1];
+        let gateway = fields[2];
+        let flags = u32::from_str_radix(fields[3], 16).unwrap_or(0);
+        let metric = fields[6].parse::<u32>().unwrap_or(0);
+
+        let is_vpn = iface.starts_with("tun")
+            || iface.starts_with("tap")
+            || iface.starts_with("wg")
+            || iface.starts_with("ppp")
+            || iface.starts_with("tailscale")
+            || iface.starts_with("proton")
+            || iface.starts_with("wireguard");
+
+        if is_vpn && (flags & 0x1) != 0 {
+            vpn_active = true;
+        }
+
+        if !is_vpn && dest == "00000000" && (flags & 0x2) != 0 && gateway != "00000000" {
+            let if_index = std::fs::read_to_string(format!("/sys/class/net/{}/ifindex", iface))
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+                .unwrap_or(0);
+            if if_index > 0 {
+                match best_phys {
+                    None => best_phys = Some((if_index, metric)),
+                    Some((_, cur_metric)) if metric < cur_metric => {
+                        best_phys = Some((if_index, metric));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    best_phys.map(|(if_index, _)| Egress {
+        if_index,
+        vpn_active,
+    })
 }
 
 // Which way the *client* leaves, which is not the question `vpn_active` answers.
@@ -181,6 +234,7 @@ const CLIENT_PROBE_LIMIT: Duration = Duration::from_secs(15);
 /// gate hosts' own door (`loopback`), and without this line its source address
 /// (127.x, the loopback adapter, which is not physical) read as a *tunnel*: the
 /// client would have been reported inside a VPN for talking to us.
+#[cfg(target_os = "windows")]
 pub fn read() -> Reading {
     let script = format!(
         "$ids=@(Get-Process -Name '{glob}' -ErrorAction SilentlyContinue | \
@@ -231,6 +285,14 @@ pub fn read() -> Reading {
             },
             parse_reading,
         )
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn read() -> Reading {
+    Reading {
+        client: ClientEgress::Unknown,
+        relay: ClientEgress::Unknown,
+    }
 }
 
 /// `Get-Process` wants the image name without its extension. Taken from the
@@ -333,6 +395,7 @@ pub fn vpn_verdict(egress: Option<&Egress>) -> (bool, ClientEgress) {
 /// Drops the host routes an earlier build pinned. Deleted per interface rather
 /// than by prefix alone, so a route stranded on an adapter the machine no longer
 /// uses goes too; netsh cleans up whatever the cmdlet could not.
+#[cfg(target_os = "windows")]
 pub fn remove_legacy_routes() {
     let list = LEGACY_PINNED_PREFIXES
         .iter()
@@ -355,6 +418,9 @@ pub fn remove_legacy_routes() {
     );
     powershell(&cmd);
 }
+
+#[cfg(not(target_os = "windows"))]
+pub fn remove_legacy_routes() {}
 
 #[cfg(test)]
 mod tests {

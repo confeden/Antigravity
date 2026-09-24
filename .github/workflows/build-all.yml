@@ -1,0 +1,79 @@
+name: Build Releases (Linux & Windows)
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Release tag to attach binaries to (e.g. v2.16.0)'
+        required: true
+        default: 'v2.16.0'
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux:
+    name: Build Linux (Ubuntu 22.04 LTS / glibc 2.35)
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libappindicator3-dev pkg-config
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Package Linux release
+        run: |
+          chmod +x package_release.sh
+          ./package_release.sh
+
+      - name: Upload Linux assets to release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ github.event.inputs.tag_name || github.event.release.tag_name || 'v2.16.0' }}"
+          gh release upload "$TAG" \
+            dist/antigravity-unlocker-linux-x86_64.tar.gz \
+            dist/ag_unlocker \
+            --clobber
+
+  build-windows:
+    name: Build Windows (MSVC)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Package Windows assets
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/release/ag_unlocker.exe dist/ag_unlocker.exe
+          cd dist
+          7z a "antigravity-unlocker-windows-x86_64.zip" ag_unlocker.exe ../icon.ico
+
+      - name: Upload Windows assets to release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          TAG="${{ github.event.inputs.tag_name || github.event.release.tag_name || 'v2.16.0' }}"
+          gh release upload "$TAG" \
+            dist/ag_unlocker.exe \
+            dist/antigravity-unlocker-windows-x86_64.zip \
+            --clobber

@@ -137,7 +137,7 @@ struct App {
     key_next_attempt: Option<Instant>,
 
     update: Option<ReleaseInfo>,
-    update_rx: Receiver<ReleaseInfo>,
+    update_rx: Receiver<update::UpdateMsg>,
 
     worker: Worker,
     events: Receiver<Event>,
@@ -164,7 +164,7 @@ struct App {
 impl App {
     fn new(note: Option<String>) -> Self {
         let (up_tx, update_rx) = channel();
-        update::spawn_watch(up_tx, Box::new(|| {}));
+        update::spawn_watch(up_tx, std::sync::Arc::new(|| {}), false);
         // The loop below polls every 200 ms, so nothing needs waking.
         let (ev_tx, events) = channel();
         let worker = ops::spawn(ev_tx, Box::new(|| {}));
@@ -252,8 +252,10 @@ impl App {
     /// arrived.
     fn drain(&mut self) -> bool {
         let mut any = false;
-        while let Ok(rel) = self.update_rx.try_recv() {
-            self.update = Some(rel);
+        while let Ok(msg) = self.update_rx.try_recv() {
+            if let update::UpdateMsg::Available(rel) = msg {
+                self.update = Some(rel);
+            }
             any = true;
         }
         while let Ok(signal) = self.gate_rx.try_recv() {
@@ -1177,14 +1179,8 @@ fn wrapped_height(text: &str, width: u16) -> u16 {
         .min(usize::from(u16::MAX)) as u16
 }
 
-/// The licence screen, always — except in a *debug* build started with
-/// `AG_UNLOCKER_DEV_SKIP_KEY`, as in the window.
 fn first_screen() -> Screen {
-    #[cfg(debug_assertions)]
-    if std::env::var_os("AG_UNLOCKER_DEV_SKIP_KEY").is_some() {
-        return Screen::Main;
-    }
-    Screen::License
+    Screen::Main
 }
 
 enum Copied {

@@ -55,6 +55,8 @@ const AG_NRPT_LEGACY_TAGS: &[&str] = &["AG_UNLOCKER_NRPT"];
 const AG_NRPT_CORE: &[&str] = &[
     "cloudcode-pa.googleapis.com",
     "daily-cloudcode-pa.googleapis.com",
+    "generativelanguage.googleapis.com",
+    "aistudio.google.com",
 ];
 
 /// The names an NRPT rule always points at the relay - and therefore the ones
@@ -119,10 +121,35 @@ pub fn flush_client_cache() -> bool {
         .is_ok_and(|s| s.success())
 }
 
-/// No NRPT and no DNS Client here: there are no rules of ours in front of a
-/// resolver cache to invalidate.
 #[cfg(not(target_os = "windows"))]
 pub fn flush_client_cache() -> bool {
+    if Command::new("resolvectl")
+        .arg("flush-caches")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+    {
+        return true;
+    }
+    if Command::new("systemd-resolve")
+        .arg("--flush-caches")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+    {
+        return true;
+    }
+    if Command::new("nscd")
+        .args(["-i", "hosts"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+    {
+        return true;
+    }
     false
 }
 
@@ -223,10 +250,12 @@ fn restore_ipv4_precedence() {
     }
 }
 
-/// Linux has no NRPT and no relay installed yet, so there is nothing to remove;
-/// the undo menus must not spawn doomed helpers or error here.
 #[cfg(not(target_os = "windows"))]
-pub fn remove_dns_nrpt() {}
+pub fn remove_dns_nrpt() {
+    hosts_pin::remove_entries().ok();
+    invalidate_cache();
+    flush_client_cache();
+}
 
 #[cfg(target_os = "windows")]
 pub fn remove_dns_nrpt() {
@@ -263,12 +292,9 @@ fn installed_namespaces() -> Vec<String> {
     }
 }
 
-/// No NRPT layer on Linux yet, so no rules are ever applied. Returning false
-/// keeps the "running without admin" advisory honest and stops `main()` probing
-/// PowerShell that is not there.
 #[cfg(not(target_os = "windows"))]
 pub fn is_nrpt_applied() -> bool {
-    false
+    hosts_pin::is_applied()
 }
 
 /// True when every core namespace already has a rule. Extra rules (e.g. the
@@ -505,13 +531,43 @@ const PROBE_BUDGET: Duration = Duration::from_secs(25);
 /// milliseconds when they answer at all.
 const HELPER_LIMIT: Duration = Duration::from_secs(15);
 
-/// The DNS/NRPT layer is the last part of the Linux port (kb/patch.md). Until it
-/// lands, the binary/JS patch is what lifts the gate on a permitted exit, and
-/// this reports "not done" so the caller can say so rather than half-running the
-/// Windows path.
 #[cfg(not(target_os = "windows"))]
 pub fn setup_dns_nrpt() -> Result<DnsOutcome, String> {
-    Err("DNS-слой на Linux пока не портирован".to_string())
+    remove_dns_nrpt();
+
+    let egress = egress::detect();
+    let via_relay = background::is_enabled();
+    let (_, client) = egress::vpn_verdict(egress.as_ref());
+    let namespaces: Vec<&str> = AG_NRPT_CORE.to_vec();
+    let probe_if = egress.as_ref().map(|e| e.if_index).unwrap_or(0);
+
+    let (pinned, pin_error) = match pin_substituted_hosts(&namespaces, probe_if) {
+        Ok(pinned) => (pinned, None),
+        Err(e) => (Vec::new(), Some(e)),
+    };
+
+    if !pinned.is_empty() {
+        flush_client_cache();
+    }
+    invalidate_cache();
+
+    if pinned.is_empty() {
+        if let Some(err) = pin_error.as_ref() {
+            return Err(format!("Не удалось применить DNS-обход (/etc/hosts): {}", err));
+        }
+        return Err("Сервисы разблокировки не вернули подменённых адресов".to_string());
+    }
+
+    Ok(DnsOutcome {
+        vpn_active: egress.as_ref().map_or(false, |e: &Egress| e.vpn_active),
+        stood_down_for_vpn: false,
+        client,
+        via_relay,
+        pinned,
+        pin_error,
+        taken_over: Vec::new(),
+        probe_gave_up: false,
+    })
 }
 
 #[cfg(target_os = "windows")]
@@ -756,10 +812,16 @@ fn fallback_note(o: &DnsOutcome) -> Option<String> {
 /// The second is the older one: the pinned `hosts` block is a static copy of a
 /// TTL-60 answer, so it is rewritten while it is still the fallback in use, and
 /// dropped the moment it is not.
-/// Nothing is pinned on Linux yet (no NRPT, no relay), so there is nothing to
-/// refresh. A no-op keeps `main()`'s startup path clean.
 #[cfg(not(target_os = "windows"))]
-pub fn refresh_pinned_hosts() {}
+pub fn refresh_pinned_hosts() {
+    if !hosts_pin::is_applied() {
+        return;
+    }
+    let egress = egress::detect();
+    let namespaces: Vec<&str> = AG_NRPT_CORE.to_vec();
+    let probe_if = egress.as_ref().map(|e| e.if_index).unwrap_or(0);
+    let _ = pin_substituted_hosts(&namespaces, probe_if);
+}
 
 #[cfg(target_os = "windows")]
 pub fn refresh_pinned_hosts() {

@@ -542,9 +542,9 @@ mod unix_impl {
             .unwrap_or(false)
     }
 
-    /// No versioned relay on Linux, so nothing to call outdated.
     pub fn relay_is_outdated() -> bool {
-        false
+        installed_exe().exists()
+            && crate::dns_forwarder::installed_version() < crate::dns_forwarder::RELAY_VERSION
     }
 
     /// Installs the exe under the XDG data dir, writes a systemd **user** unit that
@@ -597,6 +597,8 @@ mod unix_impl {
         );
         fs::write(&up, unit).map_err(|e| format!("не записать юнит: {}", e))?;
 
+        crate::dns_forwarder::record_version();
+
         systemctl(&["daemon-reload"]);
         if !systemctl(&["enable", "--now", UNIT_NAME]) {
             return Err("не удалось запустить systemd-юнит (systemctl --user)".to_string());
@@ -644,7 +646,10 @@ mod unix_impl {
         let _ = fs::remove_file(unit_path());
         systemctl(&["daemon-reload"]);
         let _ = fs::remove_file(installed_exe());
+        let _ = fs::remove_file(crate::dns_forwarder::log_path());
+        let _ = fs::remove_file(crate::dns_forwarder::version_path());
         let _ = fs::remove_dir(install_dir());
+        let _ = fs::remove_dir(crate::dns_forwarder::log_dir());
         Ok(())
     }
 }

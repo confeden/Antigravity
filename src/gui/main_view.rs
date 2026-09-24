@@ -20,7 +20,7 @@ use eframe::egui;
 use std::time::Duration;
 
 use super::status::{self, Action, Tone};
-use super::{theme, widgets, App, DONATE_URL, TELEGRAM_GROUP_URL};
+use super::{theme, widgets, App};
 use crate::ops::{Cap, Cmd, Level, State};
 use crate::utils::mask_path;
 
@@ -52,9 +52,13 @@ pub fn view(app: &mut App, ui: &mut egui::Ui) {
                     // bar still lands against the window edge.
                     ui.set_max_width(ui.available_width() - 10.0);
                     status_card(app, ui);
-                    ui.add_space(12.0);
+                    ui.add_space(10.0);
+                    hud_card(app, ui);
+                    ui.add_space(10.0);
+                    targets_card(app, ui);
+                    ui.add_space(10.0);
                     antigravity_card(app, ui);
-                    ui.add_space(12.0);
+                    ui.add_space(10.0);
                     advanced_card(app, ui);
                     ui.add_space(6.0);
                     log_card(app, ui);
@@ -165,6 +169,14 @@ fn status_card(app: &mut App, ui: &mut egui::Ui) {
                 {
                     copy = true;
                 }
+                if ui
+                    .add(egui::Button::new(egui::RichText::new("Свернуть в трей").size(12.5)))
+                    .on_hover_text("Скрыть окно в системный трей (обход продолжит работать в фоне)")
+                    .clicked()
+                {
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                }
                 if let Some((_, path)) = &saved {
                     if ui
                         .add(egui::Button::new(egui::RichText::new("Показать файл").size(12.5)))
@@ -239,6 +251,101 @@ fn status_card(app: &mut App, ui: &mut egui::Ui) {
 /// was right for «скопировано»; this one is an instruction to go and find a
 /// file and attach it, and the user is in another window by then.
 const REPORT_SHOWN_FOR: Duration = Duration::from_secs(30);
+
+fn hud_card(app: &mut App, ui: &mut egui::Ui) {
+    let f = facts(app);
+    widgets::card(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("Телеметрия сети")
+                    .size(14.5)
+                    .strong()
+                    .color(theme::TEXT),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .button(egui::RichText::new("🔄 Сбросить DNS-кэш").size(12.0))
+                    .on_hover_text("Очистить кэш DNS и обновить записи в /etc/hosts")
+                    .clicked()
+                {
+                    crate::dns::flush_client_cache();
+                    #[cfg(not(target_os = "windows"))]
+                    crate::dns::refresh_pinned_hosts();
+                }
+            });
+        });
+        ui.add_space(8.0);
+
+        ui.columns(3, |cols| {
+            cols[0].vertical(|ui| {
+                ui.label(egui::RichText::new("Маршрут").size(11.5).color(theme::MUTED));
+                let route_label = f
+                    .as_ref()
+                    .and_then(|f| f.route.as_deref())
+                    .unwrap_or("Прямой (Direct)");
+                ui.label(egui::RichText::new(route_label).size(12.5).strong().color(theme::TEXT));
+            });
+
+            cols[1].vertical(|ui| {
+                ui.label(egui::RichText::new("DNS-слой").size(11.5).color(theme::MUTED));
+                let (dns_text, dns_col) = if f.as_ref().is_some_and(|f| f.rules) {
+                    #[cfg(not(target_os = "windows"))]
+                    let txt = "Активен (/etc/hosts)";
+                    #[cfg(target_os = "windows")]
+                    let txt = "Активен (NRPT)";
+                    (txt, theme::OK)
+                } else {
+                    ("Не применен", theme::WARN)
+                };
+                ui.label(egui::RichText::new(dns_text).size(12.5).strong().color(dns_col));
+            });
+
+            cols[2].vertical(|ui| {
+                ui.label(egui::RichText::new("Служба / Прокси").size(11.5).color(theme::MUTED));
+                let (svc_text, svc_col) = if f.as_ref().is_some_and(|f| f.relay_running) {
+                    ("Активна (:53129)", theme::OK)
+                } else {
+                    ("Остановлена", theme::MUTED)
+                };
+                ui.label(egui::RichText::new(svc_text).size(12.5).strong().color(svc_col));
+            });
+        });
+    });
+}
+
+fn targets_card(app: &mut App, ui: &mut egui::Ui) {
+    let f = facts(app);
+    let active = f.as_ref().is_some_and(|f| f.rules || f.bypass_on);
+    widgets::card(ui, |ui| {
+        ui.label(
+            egui::RichText::new("Перехват целевых доменов Google AI")
+                .size(14.0)
+                .strong()
+                .color(theme::TEXT),
+        );
+        ui.add_space(6.0);
+
+        let targets = [
+            ("cloudcode-pa.googleapis.com", "Antigravity IDE / Language Server"),
+            ("daily-cloudcode-pa.googleapis.com", "Daily Staging Gate"),
+            ("generativelanguage.googleapis.com", "Gemini API"),
+            ("aistudio.google.com", "Google AI Studio"),
+        ];
+
+        for (host, desc) in targets {
+            ui.horizontal(|ui| {
+                let dot_color = if active { theme::OK } else { theme::MUTED };
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+                ui.painter().circle_filled(rect.center(), 3.5, dot_color);
+                ui.label(egui::RichText::new(host).size(12.0).monospace().color(theme::TEXT));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(egui::RichText::new(desc).size(11.0).color(theme::MUTED));
+                });
+            });
+            ui.add_space(2.0);
+        }
+    });
+}
 
 // ---------------------------------------------------------------------------
 // Antigravity: the three switches anyone needs, and the installs
@@ -649,35 +756,56 @@ fn log_line(level: Level, line: &str) -> String {
 }
 
 fn log_card(app: &mut App, ui: &mut egui::Ui) {
-    egui::CollapsingHeader::new(egui::RichText::new("Журнал").size(13.0).color(theme::MUTED))
-        .id_salt("log")
-        .default_open(dev_open())
-        .show(ui, |ui| {
-            // **Before** the lines are drawn, and that ordering is the whole
-            // trick. egui's `LabelSelectionState` accumulates its copy per label,
-            // as each one is drawn, and flushes it to the clipboard in
-            // `end_pass` — i.e. after everything here. Consuming the Copy event
-            // afterwards was too late: the labels had already accumulated (just
-            // the one holding the cursor, hence "copies a single line"), and
-            // their flush overwrote ours. Taking the event first means no label
-            // ever sees it and our copy is the only one.
-            log_keys(app, ui);
+    widgets::card(ui, |ui| {
+        log_keys(app, ui);
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("Журнал событий (Live Telemetry)")
+                    .size(14.0)
+                    .strong()
+                    .color(theme::TEXT),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .button(egui::RichText::new("Скопировать").size(11.5))
+                    .on_hover_text("Скопировать лог в буфер обмена")
+                    .clicked()
+                {
+                    let text = app
+                        .log
+                        .iter()
+                        .map(|(l, s)| log_line(*l, s))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    ui.ctx().copy_text(text);
+                }
+            });
+        });
+        ui.add_space(6.0);
 
-            // Selecting with the mouse and copying it is egui's own label
-            // selection; the only thing missing was a way to take the lot, which
-            // is what Ctrl+A does.
-            let all_selected = app.log_all_selected;
-            let fill = ui.visuals().selection.bg_fill;
+        egui::Frame::new()
+            .fill(theme::BG)
+            .corner_radius(egui::CornerRadius::same(theme::RADIUS_SMALL))
+            .inner_margin(egui::Margin::same(8))
+            .stroke(egui::Stroke::new(1.0, theme::LINE))
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                let lines_to_show = if app.log_expanded {
+                    app.log.as_slice()
+                } else {
+                    let start = app.log.len().saturating_sub(4);
+                    &app.log[start..]
+                };
 
-            egui::ScrollArea::vertical()
-                .max_height(160.0)
-                .stick_to_bottom(true)
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    if app.log.is_empty() {
-                        widgets::hint(ui, "Пока ничего не делалось.");
-                    }
-                    for (level, line) in &app.log {
+                if lines_to_show.is_empty() {
+                    ui.label(
+                        egui::RichText::new("Служба ожидает подключений...")
+                            .size(11.5)
+                            .monospace()
+                            .color(theme::MUTED),
+                    );
+                } else {
+                    for (level, line) in lines_to_show {
                         let color = match level {
                             Level::Ok => theme::OK,
                             Level::Warn => theme::WARN,
@@ -685,19 +813,31 @@ fn log_card(app: &mut App, ui: &mut egui::Ui) {
                             Level::Step => theme::TEXT,
                             Level::Info => theme::MUTED,
                         };
-                        let mut text = egui::RichText::new(log_line(*level, line))
-                            .color(color)
-                            .size(12.5);
-                        if *level == Level::Step {
-                            text = text.strong();
-                        }
-                        if all_selected {
-                            text = text.background_color(fill);
-                        }
-                        ui.label(text);
+                        ui.label(
+                            egui::RichText::new(log_line(*level, line))
+                                .size(11.5)
+                                .monospace()
+                                .color(color),
+                        );
                     }
-                });
-        });
+                }
+            });
+
+        if app.log.len() > 4 {
+            ui.add_space(4.0);
+            let toggle_label = if app.log_expanded {
+                "▲ Свернуть журнал"
+            } else {
+                "▼ Развернуть полный журнал"
+            };
+            if ui
+                .link(egui::RichText::new(toggle_label).size(11.5).color(theme::ACCENT))
+                .clicked()
+            {
+                app.log_expanded = !app.log_expanded;
+            }
+        }
+    });
 }
 
 /// Ctrl+A over the journal, then Ctrl+C.
@@ -769,29 +909,20 @@ fn footer(ui: &mut egui::Ui) {
         // or its last link is cut off by the window edge.
         ui.add_space(12.0);
         if ui
-            .link(egui::RichText::new("t.me/nova_txt").size(FOOTER_TEXT))
+            .link(egui::RichText::new("GitHub").size(FOOTER_TEXT))
             .clicked()
         {
-            crate::utils::open_url(TELEGRAM_GROUP_URL);
+            crate::utils::open_url("https://github.com/SatoKazuma1/Antigravity");
         }
-        ui.label(
-            egui::RichText::new("Группа в Telegram:")
-                .size(FOOTER_TEXT)
-                .color(theme::MUTED),
-        );
+        ui.add_space(4.0);
         ui.label(
             egui::RichText::new("|")
                 .size(FOOTER_TEXT)
                 .color(theme::LINE),
         );
-        if ui
-            .link(egui::RichText::new("nova-app.eu/donate").size(FOOTER_TEXT))
-            .clicked()
-        {
-            crate::utils::open_url(DONATE_URL);
-        }
+        ui.add_space(4.0);
         ui.label(
-            egui::RichText::new("Отблагодарить копеечкой:")
+            egui::RichText::new("Antigravity Unlocker")
                 .size(FOOTER_TEXT)
                 .color(theme::MUTED),
         );

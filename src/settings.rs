@@ -111,6 +111,9 @@ pub struct Settings {
     /// Installs the user pointed at by hand, on top of the ones found by the
     /// scan (the pencil next to each path).
     pub manual_paths: Vec<PathBuf>,
+
+    /// Whether to automatically download and apply updates from GitHub.
+    pub auto_update: bool,
 }
 
 impl Default for Settings {
@@ -134,6 +137,7 @@ impl Default for Settings {
             own_proxy: String::new(),
             own_proxy_enabled: false,
             manual_paths: Vec::new(),
+            auto_update: true,
         }
     }
 }

@@ -546,10 +546,68 @@ fn main() {
     if env::args().skip(1).any(|a| {
         matches!(
             a.trim_start_matches('-').to_ascii_lowercase().as_str(),
-            "about" | "license" | "licence" | "version" | "v" | "cli"
+            "about" | "license" | "licence" | "version" | "v" | "cli" | "update" | "u"
         )
     }) {
         utils::attach_parent_console();
+    }
+
+    if env::args().any(|a| {
+        matches!(
+            a.trim_start_matches('-').to_ascii_lowercase().as_str(),
+            "update" | "u"
+        )
+    }) {
+        println!("Проверка обновлений Antigravity Unlocker...");
+        match update::check_update_cached(true) {
+            Ok(Some(rel)) => {
+                println!(
+                    "Найдена новая версия: {} (текущая: {})",
+                    rel.tag_name,
+                    update::current_version()
+                );
+                println!("Скачивание и установка...");
+                use std::io::Write;
+                let res = update::perform_update(&rel, |downloaded, total| {
+                    if let Some(tot) = total {
+                        let pct = ((downloaded as f64 / tot as f64) * 100.0) as u32;
+                        print!(
+                            "\rЗагрузка: {:>3}% ({:.1} / {:.1} МБ)",
+                            pct,
+                            downloaded as f64 / 1048576.0,
+                            tot as f64 / 1048576.0
+                        );
+                    } else {
+                        print!("\rЗагрузка: {:.1} МБ", downloaded as f64 / 1048576.0);
+                    }
+                    std::io::stdout().flush().ok();
+                });
+                println!();
+                match res {
+                    Ok(()) => {
+                        println!("✓ Обновление успешно установлено!");
+                        println!("Перезапуск...");
+                        let _ = update::restart_process();
+                    }
+                    Err(e) => {
+                        eprintln!("Ошибка обновления: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            }
+            Ok(None) => {
+                println!(
+                    "У вас уже установлена актуальная версия ({})!",
+                    update::current_version()
+                );
+                return;
+            }
+            Err(e) => {
+                eprintln!("Ошибка при проверке обновлений: {}", e);
+                std::process::exit(1);
+            }
+        }
+        return;
     }
 
     if env::args().any(|a| a == background::FORWARDER_FLAG) {
@@ -570,8 +628,9 @@ fn main() {
 
     if env::args().any(|a| a == background::PROXY_FLAG) {
         dns_forwarder::detach_console();
-        if let Err(e) = proxy::run(0) {
-            eprintln!("proxy: {}", e);
+        watchdog::start();
+        if let Err(e) = dns_forwarder::run_proxy_only() {
+            dns_forwarder::log_fatal(&e);
             std::process::exit(1);
         }
         return;

@@ -828,16 +828,29 @@ fn on_refusals(count: usize, at: Instant, host: Option<&str>) {
             log_proxy(&connection_note(kind, tunnel, shape));
             match routes::blame(kind) {
                 routes::Blamed::Benched(penalty) => {
+                    let effective_penalty = if kind == routes::Kind::Direct && !routes::has_other_usable(kind) {
+                        routes::cap_penalty(kind, Duration::from_secs(10));
+                        Duration::from_secs(10)
+                    } else {
+                        penalty
+                    };
                     log_proxy(&format!(
                         "маршрут «{}» нёс region-400 — отложен на {}, его соединения закрыты",
                         kind.label(),
-                        human_minutes(penalty)
+                        human_minutes(effective_penalty)
                     ));
                     acted.push(format!(
                         "маршрут «{}» отложен на {}, следующее соединение пойдёт другим",
                         kind.label(),
-                        human_minutes(penalty)
+                        human_minutes(effective_penalty)
                     ));
+                    if kind == routes::Kind::Direct {
+                        resolvers::forget_names(dns::core_namespaces());
+                        resolvers::warm(dns::core_namespaces(), isp_interface());
+                        dns::flush_client_cache();
+                        #[cfg(not(target_os = "windows"))]
+                        dns::refresh_pinned_hosts();
+                    }
                 }
                 // The route answered a moment ago, so the refusal is about the
                 // request or about a connection the client made without us -
@@ -857,10 +870,20 @@ fn on_refusals(count: usize, at: Instant, host: Option<&str>) {
                     ));
                 }
                 routes::Blamed::AlreadyBenched => {
+                    if kind == routes::Kind::Direct && !routes::has_other_usable(kind) {
+                        routes::cap_penalty(kind, Duration::from_secs(10));
+                    }
                     acted.push(format!(
                         "соединения через «{}» закрыты — повтор пойдёт другим путём",
                         kind.label()
                     ));
+                    if kind == routes::Kind::Direct {
+                        resolvers::forget_names(dns::core_namespaces());
+                        resolvers::warm(dns::core_namespaces(), isp_interface());
+                        dns::flush_client_cache();
+                        #[cfg(not(target_os = "windows"))]
+                        dns::refresh_pinned_hosts();
+                    }
                 }
                 // A tunnel that carried an answer is still open on this route,
                 // so the answer is still coming through it. The route is not
@@ -996,13 +1019,18 @@ fn on_answers(count: usize, at: Instant, host: Option<&str>) {
 /// substitution forced on (D15, the fallback D25 leaves for a closed door).
 const FORCE_SUBSTITUTE_FOR: Duration = Duration::from_secs(30 * 60);
 
-/// «10 мин», «1 ч», «6 ч».
+/// «10 с», «10 мин», «1 ч», «6 ч».
 fn human_minutes(d: Duration) -> String {
-    let mins = d.as_secs() / 60;
-    if mins >= 60 && mins % 60 == 0 {
-        format!("{} ч", mins / 60)
+    let secs = d.as_secs();
+    if secs < 60 {
+        format!("{} с", secs)
     } else {
-        format!("{} мин", mins)
+        let mins = secs / 60;
+        if mins >= 60 && mins % 60 == 0 {
+            format!("{} ч", mins / 60)
+        } else {
+            format!("{} мин", mins)
+        }
     }
 }
 
@@ -1021,67 +1049,24 @@ const PROXY_START_BUDGET: Duration = Duration::from_secs(30);
 /// the built-in exits, the route table, the region-400 watch and the auto-patch
 /// watchdog. Not one of those needs port 53. That user had a working bypass
 /// available the whole time and got nothing.
-pub fn run() -> Result<(), String> {
-    // Detect once up front. Otherwise the first query pays for a cold probe,
-    // which is long enough that Windows gives up on us and falls back to the
-    // direct resolvers - and then caches that unsubstituted answer for its full
-    // TTL, so one slow startup is felt for minutes.
-    log(&format!("egress: if{}", isp_interface()));
+fn init_runtime() -> u32 {
+    let egress = isp_interface();
+    log(&format!("egress: if{}", egress));
     record_version();
     // Before any listener is tried: from here on the window can tell this
     // process from its own watchdog by the age of what it writes (P54).
     gate::note_started();
     thread::spawn(warm_forever);
-    // The proxy variable is user-wide and must never outlive the listener it
-    // names, so the watchdog takes it off when the listener is dead for a while
-    // (G20). This is the other half: the listener is up, so the route is back.
-    // Off the startup path - it is a PowerShell call - and never in front of a
-    // proxy the user set themselves.
-    //
-    // "Is up", not "is coming up": this used to run the moment the relay started,
-    // which is a promise about a socket that had not been bound yet. When the bind
-    // then failed - the port is inside Windows' dynamic range, so it can be taken
-    // (G31) - the variable was restored anyway and the watchdog took it back off
-    // ninety seconds later, every logon, and everything proxy-aware on the machine
-    // spent that window with no network.
-    #[cfg(target_os = "windows")]
     thread::spawn(|| {
         let var = crate::endpoint::PROXY_ENV_VAR;
-        // Before the wait, and unconditionally: retiring the user-wide pair an
-        // older build wrote has nothing to do with whether *our* listener came
-        // up. Behind the wait it would be skipped on exactly the machines that
-        // need it most - the ones where 53129 is taken or reserved, where the old
-        // value names a port that no longer answers and takes the whole machine's
-        // proxy-aware traffic with it (G20, G31).
         match crate::endpoint::remove_legacy_proxy_env(&proxy::proxy_url()) {
             Ok(true) => log_proxy("снята прежняя общесистемная HTTPS_PROXY"),
             Ok(false) => {}
             Err(e) => log_proxy(&format!("прежняя HTTPS_PROXY не снята: {}", e)),
         }
-        // The port that answered is the one named: the proxy may have moved
-        // while this waited (P26), and only our own listener counts - not a
-        // program of someone else's answering on the default port.
-        // The window's switch, honoured here as well as there - and honoured
-        // for as long as this process lives, not once at start. Both halves are
-        // the same bug (G74): a single pass meant a user who turned the local
-        // proxy back on had no variable until the next start, and a `return` on
-        // the off branch meant a variable that was already set stayed set while
-        // this process had decided not to write it - which is exactly what let
-        // the window draw «вкл» over a service logging «выключена в
-        // настройках». Now the two converge, and steady state is silent:
-        // `AlreadySet` says nothing, and a variable already gone is nothing to
-        // remove. The legacy-pair removal above stays unconditional: that is
-        // cleanup, not a route.
         let mut waiting_said = false;
         loop {
-            // The port that answered is the one named: the proxy may have moved
-            // while this waited (P26), and only our own listener counts - not a
-            // program of someone else's answering on the default port.
             let Some(port) = proxy::wait_for_our_listener(PROXY_START_BUDGET) else {
-                // It keeps trying (`proxy::run`, P53): an antivirus exception
-                // or a closed program frees the port without a restart, and the
-                // variable follows the listener up - still only once it answers.
-                // Said once per outage, not once a minute: this log is 64 KB.
                 if !waiting_said {
                     log_proxy(&format!(
                         "{} не выставлена: локальный прокси не поднялся",
@@ -1094,8 +1079,6 @@ pub fn run() -> Result<(), String> {
             waiting_said = false;
             let url = proxy::url_at(port);
             if crate::settings::local_proxy_wanted() {
-                // `ensure_proxy_env` asks `foreign_proxy` first, so a proxy the
-                // user set themselves still outranks ours (D19, I52, G33).
                 match crate::endpoint::ensure_proxy_env(&url) {
                     Ok(crate::endpoint::Outcome::Applied) => {
                         log_proxy(&format!("{} снова указывает на локальный прокси", var))
@@ -1104,10 +1087,6 @@ pub fn run() -> Result<(), String> {
                     Err(e) => log_proxy(&format!("{} не восстановлена: {}", var, e)),
                 }
             } else if crate::endpoint::proxy_env_is_ours() {
-                // Off in the settings and still set. `remove_proxy` judges each
-                // variable on its own: `PROXY_ENV_VAR` is a name only this tool
-                // writes, and the legacy pair is removed by value, so a proxy of
-                // the user's own is never taken off here.
                 match crate::endpoint::remove_proxy(&url, "") {
                     Ok(()) => log_proxy(&format!(
                         "{} снята: локальный прокси выключен в настройках",
@@ -1120,17 +1099,6 @@ pub fn run() -> Result<(), String> {
         }
     });
 
-    // The fallback route lives in this process because it needs the same two
-    // things the relay already has: the ISP interface, and the resolver pool
-    // that knows which provider is substituting right now. It only ever carries
-    // traffic that is actually pointed at it, so starting it here costs a
-    // listening socket and nothing else.
-    let egress = isp_interface();
-    thread::spawn(move || {
-        if let Err(e) = proxy::run(egress) {
-            log_proxy(&format!("not started: {}", e));
-        }
-    });
     // The gate hosts' own door (`loopback`). If it cannot be bound the relay
     // keeps answering with substituted addresses, exactly as before.
     thread::spawn(|| {
@@ -1140,7 +1108,25 @@ pub fn run() -> Result<(), String> {
     });
     thread::spawn(watch_client_logs);
 
+    egress
+}
+
+pub fn run() -> Result<(), String> {
+    let egress = init_runtime();
+    thread::spawn(move || {
+        if let Err(e) = proxy::run(egress) {
+            log_proxy(&format!("not started: {}", e));
+        }
+    });
+
     serve_dns_forever()
+}
+
+/// Runs the proxy and all companion threads without binding port 53.
+/// Used on Linux to avoid systemd-resolved conflicts while running unprivileged.
+pub fn run_proxy_only() -> Result<(), String> {
+    let egress = init_runtime();
+    proxy::run(egress)
 }
 
 /// Where the NRPT rules send their queries, as an address to bind and to

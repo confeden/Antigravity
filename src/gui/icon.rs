@@ -32,6 +32,13 @@ pub fn window_icon() -> Option<egui::IconData> {
     })
 }
 
+pub fn tray_icon() -> Option<tray_icon::Icon> {
+    if ICON_RGBA.len() != (ICON_W * ICON_H * 4) as usize {
+        return None;
+    }
+    tray_icon::Icon::from_rgba(ICON_RGBA.to_vec(), ICON_W, ICON_H).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

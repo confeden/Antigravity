@@ -87,7 +87,7 @@ impl Cause {
     /// would leave the variable naming the old port; there the proxy keeps
     /// retrying its own port instead, which a borrowed ephemeral port frees.
     pub fn another_port_helps(&self) -> bool {
-        cfg!(windows) && !matches!(self, Cause::Denied)
+        !matches!(self, Cause::Denied)
     }
 }
 
@@ -113,6 +113,9 @@ pub fn diagnose_on(addr: SocketAddr, err: &std::io::Error, proto: Proto) -> Caus
     // 10013 on Windows, EACCES elsewhere.
     if err.kind() == std::io::ErrorKind::PermissionDenied {
         return Cause::Denied;
+    }
+    if err.kind() == std::io::ErrorKind::AddrInUse {
+        return Cause::Held(None);
     }
     Cause::Other
 }
@@ -362,12 +365,82 @@ fn parse_excluded_ranges(text: &str) -> Vec<(u16, u16)> {
 // ---------------------------------------------------------------------------
 
 #[cfg(not(windows))]
-fn listener_pid(_addr: SocketAddr, _proto: Proto) -> Option<u32> {
+fn listener_pid(addr: SocketAddr, proto: Proto) -> Option<u32> {
+    let port = addr.port();
+    let files = match proto {
+        Proto::Tcp => ["/proc/net/tcp", "/proc/net/tcp6"],
+        Proto::Udp => ["/proc/net/udp", "/proc/net/udp6"],
+    };
+    let mut target_inode = None;
+    for file in files {
+        if let Ok(content) = std::fs::read_to_string(file) {
+            if let Some(inode) = find_inode_for_port(&content, port) {
+                target_inode = Some(inode);
+                break;
+            }
+        }
+    }
+    let target_inode = target_inode?;
+
+    let entries = std::fs::read_dir("/proc").ok()?;
+    let socket_str = format!("socket:[{}]", target_inode);
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let pid_str = name.to_string_lossy();
+        if !pid_str.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        let pid: u32 = pid_str.parse().ok()?;
+        let fd_dir = entry.path().join("fd");
+        if let Ok(fds) = std::fs::read_dir(fd_dir) {
+            for fd in fds.flatten() {
+                if let Ok(link) = std::fs::read_link(fd.path()) {
+                    if link.to_string_lossy() == socket_str {
+                        return Some(pid);
+                    }
+                }
+            }
+        }
+    }
     None
 }
 
 #[cfg(not(windows))]
-fn process_name(_pid: u32) -> Option<String> {
+fn find_inode_for_port(content: &str, port: u16) -> Option<u64> {
+    for line in content.lines().skip(1) {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 10 {
+            continue;
+        }
+        let local_addr = parts[1];
+        let state = parts[3];
+        if state != "0A" && state != "07" {
+            continue;
+        }
+        if let Some((_, port_hex)) = local_addr.split_once(':') {
+            if let Ok(parsed_port) = u16::from_str_radix(port_hex, 16) {
+                if parsed_port == port {
+                    return parts[9].parse::<u64>().ok();
+                }
+            }
+        }
+    }
+    None
+}
+
+#[cfg(not(windows))]
+fn process_name(pid: u32) -> Option<String> {
+    if let Ok(comm) = std::fs::read_to_string(format!("/proc/{}/comm", pid)) {
+        let name = comm.trim().to_string();
+        if !name.is_empty() {
+            return Some(name);
+        }
+    }
+    if let Ok(exe) = std::fs::read_link(format!("/proc/{}/exe", pid)) {
+        if let Some(name) = exe.file_name() {
+            return Some(name.to_string_lossy().to_string());
+        }
+    }
     None
 }
 

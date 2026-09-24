@@ -172,11 +172,18 @@ pub fn remove_cli() -> Result<(), String> {
     if current_cli_endpoint().as_deref() != Some(DAILY_ENDPOINT) {
         return Ok(());
     }
-    let script = format!(
-        "[Environment]::SetEnvironmentVariable('{}',$null,'User')",
-        CLI_ENV_VAR
-    );
-    powershell(&script).ok_or_else(|| "не удалось удалить переменную среды".to_string())?;
+    #[cfg(target_os = "windows")]
+    {
+        let script = format!(
+            "[Environment]::SetEnvironmentVariable('{}',$null,'User')",
+            CLI_ENV_VAR
+        );
+        powershell(&script).ok_or_else(|| "не удалось удалить переменную среды".to_string())?;
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = set_env(CLI_ENV_VAR, None);
+    }
     Ok(())
 }
 
@@ -662,7 +669,6 @@ fn profile_root() -> Option<PathBuf> {
 /// proxy *after* being patched would silently keep going through ours. Menu 1
 /// catches that only if they run it again; this runs at every relay start, which
 /// is every boot, so at worst they are back on their own proxy after a restart.
-#[cfg(target_os = "windows")]
 pub fn ensure_proxy_env(ours: &str) -> Result<Outcome, String> {
     if foreign_proxy(ours).is_some() {
         // Theirs, not ours - and ours would win over it, so it has to go.
@@ -686,18 +692,12 @@ pub fn ensure_proxy_env(ours: &str) -> Result<Outcome, String> {
 /// The watchdog's primitive: it must never touch a value the user set. That is
 /// now true by the *name* - `PROXY_ENV_VAR` is written by nothing else - where it
 /// used to rest on matching the value under a shared name.
-#[cfg(target_os = "windows")]
 pub fn remove_proxy_if_ours(url: &str, ca_path: &str) -> Result<bool, String> {
     if current_env(PROXY_ENV_VAR).is_none() {
         // Nothing of ours under our own name; a legacy pair may still be there.
         return remove_legacy_proxy_env(url);
     }
     remove_proxy(url, ca_path).map(|()| true)
-}
-
-#[cfg(not(target_os = "windows"))]
-pub fn remove_proxy_if_ours(_url: &str, _ca_path: &str) -> Result<bool, String> {
-    Ok(false)
 }
 
 #[cfg(target_os = "windows")]
@@ -785,12 +785,22 @@ fn set_env(name: &str, value: Option<&str>) -> Result<(), String> {
 /// one is refused honestly rather than silently doing nothing.
 #[cfg(not(target_os = "windows"))]
 fn set_env(name: &str, value: Option<&str>) -> Result<(), String> {
+    use std::process::Command;
     match value {
-        None => Ok(()),
-        Some(_) => Err(format!(
-            "{} на Linux пока не задаётся (нужен свой прокси-слой порта)",
-            name
-        )),
+        Some(val) => {
+            Command::new("systemctl")
+                .args(["--user", "set-environment", &format!("{}={}", name, val)])
+                .status()
+                .ok();
+            Ok(())
+        }
+        None => {
+            Command::new("systemctl")
+                .args(["--user", "unset-environment", name])
+                .status()
+                .ok();
+            Ok(())
+        }
     }
 }
 
@@ -804,11 +814,37 @@ fn current_env(name: &str) -> Option<String> {
     (!value.is_empty()).then_some(value)
 }
 
-/// We manage no persistent user-env store on Linux yet, so there is nothing of
-/// ours to read back. `None` makes every "remove if it is still ours" guard a
-/// clean no-op.
 #[cfg(not(target_os = "windows"))]
-fn current_env(_name: &str) -> Option<String> {
+fn current_env(name: &str) -> Option<String> {
+    use std::process::Command;
+    if let Ok(path) = environment_d_path() {
+        if let Ok(text) = fs::read_to_string(&path) {
+            let prefix = format!("{}=", name);
+            if let Some(val) = text.lines().find_map(|l| l.strip_prefix(&prefix)).map(str::trim) {
+                if !val.is_empty() {
+                    return Some(val.to_string());
+                }
+            }
+        }
+    }
+    if let Ok(out) = Command::new("systemctl")
+        .args(["--user", "show-environment"])
+        .output()
+    {
+        let env = String::from_utf8_lossy(&out.stdout);
+        let prefix = format!("{}=", name);
+        if let Some(val) = env.lines().find_map(|l| l.strip_prefix(&prefix)).map(str::trim) {
+            if !val.is_empty() {
+                return Some(val.to_string());
+            }
+        }
+    }
+    if let Ok(val) = std::env::var(name) {
+        let val = val.trim();
+        if !val.is_empty() {
+            return Some(val.to_string());
+        }
+    }
     None
 }
 
@@ -824,7 +860,7 @@ fn current_cli_endpoint() -> Option<String> {
 
 #[cfg(not(target_os = "windows"))]
 fn current_cli_endpoint() -> Option<String> {
-    None
+    current_env(CLI_ENV_VAR)
 }
 
 /// The value of our proxy variable as the user environment has it right now.

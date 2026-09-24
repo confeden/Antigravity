@@ -19,12 +19,25 @@ const BEGIN: &str = "# AG_UNLOCKER_HOSTS_BEGIN";
 const END: &str = "# AG_UNLOCKER_HOSTS_END";
 
 pub fn hosts_path() -> PathBuf {
-    let root = env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
-    PathBuf::from(root)
-        .join("System32")
-        .join("drivers")
-        .join("etc")
-        .join("hosts")
+    #[cfg(target_os = "windows")]
+    {
+        let root = env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
+        PathBuf::from(root)
+            .join("System32")
+            .join("drivers")
+            .join("etc")
+            .join("hosts")
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        PathBuf::from("/etc/hosts")
+    }
+}
+
+pub fn is_applied() -> bool {
+    fs::read_to_string(hosts_path())
+        .map(|s| s.contains(BEGIN))
+        .unwrap_or(false)
 }
 
 fn render_block(entries: &[(String, Ipv4Addr)]) -> String {
@@ -82,13 +95,63 @@ fn rewrite(block: Option<&str>) -> Result<(), String> {
     if updated == existing {
         return Ok(());
     }
-    fs::write(&path, updated).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::PermissionDenied {
-            "hosts: требуются права администратора".to_string()
-        } else {
-            format!("hosts: {}", e)
+    match fs::write(&path, &updated) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            #[cfg(not(target_os = "windows"))]
+            {
+                if elevate_write_hosts(&updated).is_ok() {
+                    return Ok(());
+                }
+            }
+            Err("hosts: требуются права администратора (или: sudo setfacl -m u:$USER:rw /etc/hosts)".to_string())
         }
-    })
+        Err(e) => Err(format!("hosts: {}", e)),
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn elevate_write_hosts(content: &str) -> Result<(), String> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    // 1. Try pkexec (Polkit graphical/terminal agent)
+    if let Ok(mut child) = Command::new("pkexec")
+        .args(["tee", "/etc/hosts"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(content.as_bytes());
+        }
+        if let Ok(status) = child.wait() {
+            if status.success() {
+                return Ok(());
+            }
+        }
+    }
+
+    // 2. Try sudo (if cached or in terminal)
+    if let Ok(mut child) = Command::new("sudo")
+        .args(["tee", "/etc/hosts"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(content.as_bytes());
+        }
+        if let Ok(status) = child.wait() {
+            if status.success() {
+                return Ok(());
+            }
+        }
+    }
+
+    Err("hosts: требуются права администратора".to_string())
 }
 
 pub fn write_entries(entries: &[(String, Ipv4Addr)]) -> Result<(), String> {

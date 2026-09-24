@@ -28,7 +28,7 @@
 Без графического сеанса (сервер по SSH) анлокер сам откроется прямо в
 терминале. Или без архива, одной командой:
 
-    curl -fsSL https://raw.githubusercontent.com/confeden/Antigravity/main/tui.sh | sh
+    curl -fsSL https://raw.githubusercontent.com/SatoKazuma1/Antigravity/main/tui.sh | sh
 
 ## Как отключить
 
