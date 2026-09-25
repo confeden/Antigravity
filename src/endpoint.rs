@@ -466,7 +466,16 @@ pub fn remove_proxy(url: &str, ca_path: &str) -> Result<(), String> {
 pub fn remove_proxy(url: &str, _ca_path: &str) -> Result<(), String> {
     use std::process::Command;
     if let Ok(path) = environment_d_path() {
-        let _ = fs::remove_file(&path);
+        if fs::remove_file(&path).is_ok() {
+            // Measured (WSL, systemd user manager): a variable the environment.d
+            // generator loaded at the last reload survives `unset-environment`,
+            // so every program started afterwards still got the address of a
+            // proxy that is gone. A reload re-reads environment.d without our file.
+            Command::new("systemctl")
+                .args(["--user", "daemon-reload"])
+                .status()
+                .ok();
+        }
     }
     Command::new("systemctl")
         .args(["--user", "unset-environment", PROXY_ENV_VAR])
@@ -662,7 +671,6 @@ fn profile_root() -> Option<PathBuf> {
 /// proxy *after* being patched would silently keep going through ours. Menu 1
 /// catches that only if they run it again; this runs at every relay start, which
 /// is every boot, so at worst they are back on their own proxy after a restart.
-#[cfg(target_os = "windows")]
 pub fn ensure_proxy_env(ours: &str) -> Result<Outcome, String> {
     if foreign_proxy(ours).is_some() {
         // Theirs, not ours - and ours would win over it, so it has to go.
@@ -686,18 +694,12 @@ pub fn ensure_proxy_env(ours: &str) -> Result<Outcome, String> {
 /// The watchdog's primitive: it must never touch a value the user set. That is
 /// now true by the *name* - `PROXY_ENV_VAR` is written by nothing else - where it
 /// used to rest on matching the value under a shared name.
-#[cfg(target_os = "windows")]
 pub fn remove_proxy_if_ours(url: &str, ca_path: &str) -> Result<bool, String> {
     if current_env(PROXY_ENV_VAR).is_none() {
         // Nothing of ours under our own name; a legacy pair may still be there.
         return remove_legacy_proxy_env(url);
     }
     remove_proxy(url, ca_path).map(|()| true)
-}
-
-#[cfg(not(target_os = "windows"))]
-pub fn remove_proxy_if_ours(_url: &str, _ca_path: &str) -> Result<bool, String> {
-    Ok(false)
 }
 
 #[cfg(target_os = "windows")]
@@ -804,11 +806,46 @@ fn current_env(name: &str) -> Option<String> {
     (!value.is_empty()).then_some(value)
 }
 
-/// We manage no persistent user-env store on Linux yet, so there is nothing of
-/// ours to read back. `None` makes every "remove if it is still ours" guard a
-/// clean no-op.
+/// On Linux reads the process environment, the systemd user manager session,
+/// or the persistent environment.d drop-in.
 #[cfg(not(target_os = "windows"))]
-fn current_env(_name: &str) -> Option<String> {
+fn current_env(name: &str) -> Option<String> {
+    if let Ok(v) = std::env::var(name) {
+        let trimmed = v.trim().to_string();
+        if !trimmed.is_empty() {
+            return Some(trimmed);
+        }
+    }
+    if let Ok(out) = std::process::Command::new("systemctl")
+        .args(["--user", "show-environment"])
+        .output()
+    {
+        let env_str = String::from_utf8_lossy(&out.stdout);
+        let prefix = format!("{}=", name);
+        if let Some(val) = env_str.lines().find_map(|l| l.strip_prefix(&prefix)) {
+            let trimmed = val.trim().to_string();
+            if !trimmed.is_empty() {
+                return Some(trimmed);
+            }
+        }
+    }
+    if let Ok(path) = environment_d_path() {
+        if let Ok(content) = fs::read_to_string(&path) {
+            let prefix = format!("{}=", name);
+            for line in content.lines() {
+                let trimmed = line.trim();
+                if trimmed.starts_with('#') {
+                    continue;
+                }
+                if let Some(val) = trimmed.strip_prefix(&prefix) {
+                    let val_trimmed = val.trim().to_string();
+                    if !val_trimmed.is_empty() {
+                        return Some(val_trimmed);
+                    }
+                }
+            }
+        }
+    }
     None
 }
 

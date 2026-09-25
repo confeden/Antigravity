@@ -138,7 +138,12 @@ pub const LISTEN_PORT: u16 = 53;
 ///     says which host was refused and how many answers were held back. An
 ///     older relay swaps the gate route away from the one that is answering
 ///     every fifteen seconds and cannot say whether a route half-works.
-pub const RELAY_VERSION: u32 = 37;
+/// 39 = a live gate tunnel the client spoke into and got nothing back from
+///     benches its route (`routes::SILENT_STEPS`), and a passing probe no
+///     longer lets it back in front - only a model answer does. An older relay
+///     keeps sending every connection to a built-in exit that opens and then
+///     carries nothing, and never tries the DNS route behind it.
+pub const RELAY_VERSION: u32 = 39;
 
 /// Written where an unelevated relay can write and an unelevated unlocker can
 /// read. Absent means a relay from before versioning, i.e. older than anything.
@@ -1049,7 +1054,47 @@ pub fn run() -> Result<(), String> {
     // (G31) - the variable was restored anyway and the watchdog took it back off
     // ninety seconds later, every logon, and everything proxy-aware on the machine
     // spent that window with no network.
-    #[cfg(target_os = "windows")]
+    spawn_proxy_env_maintainer();
+
+    // The fallback route lives in this process because it needs the same two
+    // things the relay already has: the ISP interface, and the resolver pool
+    // that knows which provider is substituting right now. It only ever carries
+    // traffic that is actually pointed at it, so starting it here costs a
+    // listening socket and nothing else.
+    let egress = isp_interface();
+    thread::spawn(move || {
+        if let Err(e) = proxy::run(egress) {
+            log_proxy(&format!("not started: {}", e));
+        }
+    });
+    // The gate hosts' own door (`loopback`). If it cannot be bound the relay
+    // keeps answering with substituted addresses, exactly as before.
+    thread::spawn(|| {
+        if let Err(e) = loopback::run() {
+            log_proxy(&format!("локальные адреса гейт-хостов не заняты: {}", e));
+        }
+    });
+    thread::spawn(watch_client_logs);
+
+    serve_dns_forever()
+}
+
+/// The Linux service entry point: runs the local CONNECT proxy route as a
+/// background service without a port-53 DNS listener.
+///
+/// It maintains gate.json, the resolver pool, client log watching, and the
+/// proxy environment variable, then serves the local proxy on 127.0.0.1:53129.
+pub fn run_proxy_service() -> Result<(), String> {
+    log_proxy("служба обхода (локальный прокси) запущена");
+    record_version();
+    gate::note_started();
+    thread::spawn(warm_forever);
+    thread::spawn(watch_client_logs);
+    spawn_proxy_env_maintainer();
+    proxy::run(0)
+}
+
+fn spawn_proxy_env_maintainer() {
     thread::spawn(|| {
         let var = crate::endpoint::PROXY_ENV_VAR;
         // Before the wait, and unconditionally: retiring the user-wide pair an
@@ -1063,20 +1108,6 @@ pub fn run() -> Result<(), String> {
             Ok(false) => {}
             Err(e) => log_proxy(&format!("прежняя HTTPS_PROXY не снята: {}", e)),
         }
-        // The port that answered is the one named: the proxy may have moved
-        // while this waited (P26), and only our own listener counts - not a
-        // program of someone else's answering on the default port.
-        // The window's switch, honoured here as well as there - and honoured
-        // for as long as this process lives, not once at start. Both halves are
-        // the same bug (G74): a single pass meant a user who turned the local
-        // proxy back on had no variable until the next start, and a `return` on
-        // the off branch meant a variable that was already set stayed set while
-        // this process had decided not to write it - which is exactly what let
-        // the window draw «вкл» over a service logging «выключена в
-        // настройках». Now the two converge, and steady state is silent:
-        // `AlreadySet` says nothing, and a variable already gone is nothing to
-        // remove. The legacy-pair removal above stays unconditional: that is
-        // cleanup, not a route.
         let mut waiting_said = false;
         loop {
             // The port that answered is the one named: the proxy may have moved
@@ -1124,28 +1155,6 @@ pub fn run() -> Result<(), String> {
             thread::sleep(proxy::REBIND_EVERY);
         }
     });
-
-    // The fallback route lives in this process because it needs the same two
-    // things the relay already has: the ISP interface, and the resolver pool
-    // that knows which provider is substituting right now. It only ever carries
-    // traffic that is actually pointed at it, so starting it here costs a
-    // listening socket and nothing else.
-    let egress = isp_interface();
-    thread::spawn(move || {
-        if let Err(e) = proxy::run(egress) {
-            log_proxy(&format!("not started: {}", e));
-        }
-    });
-    // The gate hosts' own door (`loopback`). If it cannot be bound the relay
-    // keeps answering with substituted addresses, exactly as before.
-    thread::spawn(|| {
-        if let Err(e) = loopback::run() {
-            log_proxy(&format!("локальные адреса гейт-хостов не заняты: {}", e));
-        }
-    });
-    thread::spawn(watch_client_logs);
-
-    serve_dns_forever()
 }
 
 /// Where the NRPT rules send their queries, as an address to bind and to

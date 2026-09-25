@@ -64,6 +64,20 @@ pub fn build(status: Option<&Status>, view: &View) -> String {
             let _ = writeln!(out, "Ошибок 400 за 12 ч в логах нет.");
         }
     }
+    // When, and on which host - never the link: it carries a one-time token,
+    // and the report is made to be sent to someone else.
+    if let Some(v) = &view.verify {
+        let host = v
+            .url
+            .strip_prefix("https://")
+            .and_then(|r| r.split(['/', '?', '#']).next())
+            .unwrap_or("");
+        let _ = writeln!(
+            out,
+            "Google просил верификацию аккаунта: {} ({host})",
+            super::status::ago_text(v.ago)
+        );
+    }
 
     // Fresh from the file, not the window's copy: the route table's ages move
     // every pass and the watcher does not wake the window for them.

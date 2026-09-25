@@ -445,7 +445,7 @@ pub fn newest_answer(paths: &[PathBuf], within: Duration) -> Option<Sighting> {
 }
 
 /// Everything the window asks of the logs, in one read of each tail.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct History {
     /// Refusals inside `recent`: the newest, and how many.
     pub refused_recent: Option<Sighting>,
@@ -453,6 +453,8 @@ pub struct History {
     pub refused: Option<Sighting>,
     /// The newest model answer inside `horizon`, and how many.
     pub answered: Option<Sighting>,
+    /// The newest account-verification demand inside `horizon`.
+    pub verify: Option<Verification>,
 }
 
 /// `newest_refusal` and `newest_answer` over two windows, from a single pass:
@@ -499,6 +501,11 @@ pub fn history(paths: &[PathBuf], recent: Duration, horizon: Duration) -> Histor
                 bump(&mut out.answered, ago, 1);
             }
         }
+        if let Some(v) = newest_verification(&text, now, horizon) {
+            if out.verify.as_ref().is_none_or(|o| v.ago < o.ago) {
+                out.verify = Some(v);
+            }
+        }
     }
     out
 }
@@ -538,6 +545,225 @@ fn newest_matching(
         }
     }
     newest.map(|ago| Sighting { ago, count })
+}
+
+/// Google asking the signed-in account to prove itself before it may use the
+/// model: a `403` whose `google.rpc.ErrorInfo` says `VALIDATION_REQUIRED` and
+/// carries the page to do it on in `metadata.validation_url` (the same field
+/// arrives as `validationUrl` on an ineligible tier at sign-in). The client is
+/// meant to show «Complete verification» for it, and does not always - the
+/// link is then only in its log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Verification {
+    /// How long ago, by the log's own stamp.
+    pub ago: Duration,
+    /// The page, decoded from the JSON it came in and checked to be Google's.
+    pub url: String,
+}
+
+/// The reason code, as the client itself matches it (`reason ===
+/// "VALIDATION_REQUIRED"` in the workbench).
+const VERIFY_REASON: &[u8] = b"VALIDATION_REQUIRED";
+/// How far from the link its reason may be and still be the same error body.
+/// Google pretty-prints the body, and `details` holds a handful of short
+/// entries; a few kilobytes covers it without reaching a neighbouring error.
+const VERIFY_REACH: usize = 4096;
+/// How many lines back from the link its entry's stamp is looked for: the body
+/// spans lines of its own, and only the line that opens the entry is stamped.
+const VERIFY_STAMP_LINES: usize = 200;
+
+/// The newest verification demand in `text` inside `horizon`.
+///
+/// Searched by bytes, not parsed as JSON, and that is forced by the file: the
+/// IDE writes the server's stderr in chunks, with blank lines and its own
+/// `[LS Main stderr]` prefix wherever a chunk starts, so a body that spans lines
+/// does not survive as one JSON document. The one value needed is short and
+/// never broken across lines, so it is read as a JSON string where it stands.
+fn newest_verification(
+    text: &str,
+    now: crate::utils::LocalClock,
+    horizon: Duration,
+) -> Option<Verification> {
+    let bytes = text.as_bytes();
+    // ASCII lowercasing keeps every byte offset where it was.
+    let lower = text.to_ascii_lowercase();
+    let lb = lower.as_bytes();
+    let mut best: Option<Verification> = None;
+    let mut from = 0usize;
+    while let Some(off) = find(&lb[from..], b"validation") {
+        let key = from + off;
+        from = key + 1;
+        let Some(value_at) = url_value_start(lb, key) else {
+            continue;
+        };
+        let lo = key.saturating_sub(VERIFY_REACH);
+        let hi = (key + VERIFY_REACH).min(bytes.len());
+        if !has_reason(&bytes[lo..hi]) {
+            continue;
+        }
+        let Some(url) = read_value(bytes, value_at).filter(|u| is_google_page(u)) else {
+            continue;
+        };
+        let Some(ago) = stamp_before(text, key).and_then(|at| age_secs(at, now)) else {
+            continue;
+        };
+        let ago = Duration::from_secs(ago as u64);
+        if ago > horizon {
+            continue;
+        }
+        // `<=`: of two in the same second, the later one in the file.
+        if best.as_ref().is_none_or(|b| ago <= b.ago) {
+            best = Some(Verification { ago, url });
+        }
+    }
+    best
+}
+
+fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if hay.len() < needle.len() {
+        return None;
+    }
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Where the value of a link key starting at `key` begins, or `None` if the
+/// word there is not one. Takes `validation_url` and `validationUrl` (and Go's
+/// `ValidationURL`) - lowercased by the caller - but not
+/// `validation_url_link_text`, which is the button's caption.
+fn url_value_start(lower: &[u8], key: usize) -> Option<usize> {
+    let rest = &lower[key..];
+    let len = if rest.starts_with(b"validation_url") {
+        14
+    } else if rest.starts_with(b"validationurl") {
+        13
+    } else {
+        return None;
+    };
+    if key > 0 && is_word(lower[key - 1]) {
+        return None;
+    }
+    let mut i = key + len;
+    if lower.get(i).is_some_and(|&c| is_word(c)) {
+        return None;
+    }
+    // The key's own closing quote, escaped once when the body was logged as a
+    // quoted string.
+    if lower.get(i) == Some(&b'\\') {
+        i += 1;
+    }
+    if lower.get(i) == Some(&b'"') {
+        i += 1;
+    }
+    while lower.get(i).is_some_and(|c| c.is_ascii_whitespace()) {
+        i += 1;
+    }
+    if lower.get(i) != Some(&b':') {
+        return None;
+    }
+    i += 1;
+    while lower.get(i).is_some_and(|c| *c == b' ' || *c == b'\t') {
+        i += 1;
+    }
+    Some(i)
+}
+
+fn is_word(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || c == b'_'
+}
+
+/// `VALIDATION_REQUIRED` as a word of its own, so an enum listing it among
+/// others still counts but a longer name that merely contains it does not.
+fn has_reason(window: &[u8]) -> bool {
+    let mut from = 0usize;
+    while let Some(off) = find(&window[from..], VERIFY_REASON) {
+        let at = from + off;
+        let end = at + VERIFY_REASON.len();
+        let before = at == 0 || !is_word(window[at - 1]);
+        let after = window.get(end).is_none_or(|&c| !is_word(c));
+        if before && after {
+            return true;
+        }
+        from = at + 1;
+    }
+    false
+}
+
+/// The link at `at`, in whichever of the three shapes it was logged: a JSON
+/// string (`"https:…&…"`), that string escaped once more because the whole
+/// body was logged as a quoted string (`\"https:…\\u0026…\"`), or bare, as Go
+/// prints a struct (`ValidationURL:https://… `). JSON escapes are decoded - a
+/// link with `&` left in it opens a page with its parameters broken.
+fn read_value(bytes: &[u8], at: usize) -> Option<String> {
+    let rest = bytes.get(at..)?;
+    if rest.starts_with(b"\\\"") {
+        // Undo the outer quoting, then read what is left as the JSON string it was.
+        let end = find(&rest[2..], b"\\\"")? + 2;
+        let mut inner = Vec::with_capacity(end);
+        let mut i = 2;
+        while i < end {
+            if rest[i] == b'\\' && i + 1 < end {
+                inner.push(rest[i + 1]);
+                i += 2;
+            } else {
+                inner.push(rest[i]);
+                i += 1;
+            }
+        }
+        let lit = format!("\"{}\"", String::from_utf8(inner).ok()?);
+        return serde_json::from_str::<String>(&lit).ok();
+    }
+    if rest.first() == Some(&b'"') {
+        let mut i = 1;
+        while i < rest.len() {
+            match rest[i] {
+                b'\\' => i += 2,
+                b'"' => {
+                    let lit = std::str::from_utf8(&rest[..=i]).ok()?;
+                    return serde_json::from_str::<String>(lit).ok();
+                }
+                b'\n' | b'\r' => return None,
+                _ => i += 1,
+            }
+        }
+        return None;
+    }
+    if rest.starts_with(b"https://") {
+        let end = rest
+            .iter()
+            .position(|c| c.is_ascii_whitespace() || *c == b'}' || *c == b'"')
+            .unwrap_or(rest.len());
+        return String::from_utf8(rest[..end].to_vec()).ok();
+    }
+    None
+}
+
+/// Only a Google page over HTTPS is ever opened: the link comes out of a log
+/// file, and a button that opens whatever a log line says is a button anyone
+/// who can write a line there controls.
+fn is_google_page(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("https://") else {
+        return false;
+    };
+    if url.len() > 8192 || url.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return false;
+    }
+    let host_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let host = rest[..host_end].to_ascii_lowercase();
+    // No userinfo and no port: `https://google.com@evil/` names `evil`.
+    if host.contains(['@', ':', '\\']) {
+        return false;
+    }
+    host == "google.com" || host.ends_with(".google.com")
+}
+
+/// The stamp of the entry holding byte `pos`: the nearest stamped line at or
+/// above it.
+fn stamp_before(text: &str, pos: usize) -> Option<(u16, u16, u32)> {
+    let line_end = text[pos..].find('\n').map_or(text.len(), |i| pos + i);
+    text[..line_end]
+        .rsplit('\n')
+        .take(VERIFY_STAMP_LINES)
+        .find_map(parse_stamp)
 }
 
 /// Total size of the given logs. The cheap half of "is Antigravity doing
@@ -1018,5 +1244,90 @@ mod tests {
         fs::create_dir_all(&new).unwrap();
         assert_eq!(newest_session(&dir), Some(new));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    const NOW: (u16, u16, u32, u32, u32) = (9, 25, 12, 0, 0);
+
+    fn verify_in(text: &str) -> Option<Verification> {
+        let (mo, d, h, mi, s) = NOW;
+        newest_verification(text, clock(mo, d, h, mi, s), Duration::from_secs(3600))
+    }
+
+    /// Google's own shape: a pretty-printed body, `&` escaped as `\u0026`, in
+    /// the IDE's framing with a blank line in the middle of it.
+    #[test]
+    fn a_verification_link_is_read_from_a_pretty_printed_body() {
+        let log = concat!(
+            "2026-09-25 11:58:00.100 [error] [LS Main stderr] ERROR: logging before google.Init: E0925 11:58:00.100000 1 http_helpers.go:88] URL: https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent Status: 403 Body: {\n",
+            "  \"error\": {\n",
+            "    \"code\": 403,\n",
+            "    \"message\": \"Verify your account to continue.\",\n",
+            "    \"status\": \"PERMISSION_DENIED\",\n",
+            "\n",
+            "    \"details\": [\n",
+            "      {\n",
+            "        \"@type\": \"type.googleapis.com/google.rpc.ErrorInfo\",\n",
+            "        \"reason\": \"VALIDATION_REQUIRED\",\n",
+            "        \"metadata\": {\n",
+            "          \"validation_url_link_text\": \"Verify\",\n",
+            "          \"validation_url\": \"https://accounts.google.com/signin/continue?sarp=1\\u0026continue=https%3A%2F%2Fx\\u0026plt=AKgn\"\n",
+            "        }\n",
+            "      }\n",
+            "    ]\n",
+            "  }\n",
+            "}\n",
+            "I0925 11:58:01.000000 1 server.go:1] after\n",
+        );
+        let v = verify_in(log).expect("found");
+        assert_eq!(
+            v.url,
+            "https://accounts.google.com/signin/continue?sarp=1&continue=https%3A%2F%2Fx&plt=AKgn"
+        );
+        assert_eq!(v.ago, Duration::from_secs(120));
+    }
+
+    /// The body logged as one quoted string, and Go's struct printing.
+    #[test]
+    fn a_verification_link_is_read_escaped_once_more_and_bare() {
+        let quoted = "E0925 11:59:00.000000 1 x.go:1] details: \"{\\\"error\\\":{\\\"details\\\":[{\\\"reason\\\":\\\"VALIDATION_REQUIRED\\\",\\\"metadata\\\":{\\\"validation_url\\\":\\\"https://accounts.google.com/v?a=1\\\\u0026b=2\\\"}}]}}\"\n";
+        assert_eq!(
+            verify_in(quoted).map(|v| v.url).as_deref(),
+            Some("https://accounts.google.com/v?a=1&b=2")
+        );
+        let bare = "E0925 11:59:30.000000 1 x.go:1] {Reason:VALIDATION_REQUIRED Metadata:{ValidationURL:https://accounts.google.com/v?a=1&b=2 UIMessage:}}\n";
+        let v = verify_in(bare).expect("found");
+        assert_eq!(v.url, "https://accounts.google.com/v?a=1&b=2");
+        assert_eq!(v.ago, Duration::from_secs(30));
+    }
+
+    /// The camelCase field of an ineligible tier at sign-in, newest wins.
+    #[test]
+    fn the_newest_verification_link_wins() {
+        let log = concat!(
+            "E0925 11:10:00.000000 1 x.go:1] {\"reasonCode\": \"VALIDATION_REQUIRED\", \"validationUrl\": \"https://accounts.google.com/old\"}\n",
+            "E0925 11:50:00.000000 1 x.go:1] {\"reasonCode\": \"VALIDATION_REQUIRED\", \"validationUrl\": \"https://accounts.google.com/new\"}\n",
+        );
+        assert_eq!(
+            verify_in(log).map(|v| v.url).as_deref(),
+            Some("https://accounts.google.com/new")
+        );
+    }
+
+    /// Only a Google page, only next to its reason, only a page that can be
+    /// placed in time.
+    #[test]
+    fn a_link_that_is_not_a_verification_demand_is_ignored() {
+        let foreign = "E0925 11:58:00.000000 1 x.go:1] {\"reason\": \"VALIDATION_REQUIRED\", \"validation_url\": \"https://accounts.google.com.evil.example/x\"}\n";
+        assert_eq!(verify_in(foreign), None);
+        let userinfo = "E0925 11:58:00.000000 1 x.go:1] {\"reason\": \"VALIDATION_REQUIRED\", \"validation_url\": \"https://accounts.google.com@evil.example/x\"}\n";
+        assert_eq!(verify_in(userinfo), None);
+        let plain = "E0925 11:58:00.000000 1 x.go:1] {\"reason\": \"VALIDATION_REQUIRED\", \"validation_url\": \"http://accounts.google.com/x\"}\n";
+        assert_eq!(verify_in(plain), None);
+        let other_reason = "E0925 11:58:00.000000 1 x.go:1] {\"reason\": \"VALIDATION_REQUIRED_SOON\", \"validation_url\": \"https://accounts.google.com/x\"}\n";
+        assert_eq!(verify_in(other_reason), None);
+        let unstamped = "{\"reason\": \"VALIDATION_REQUIRED\", \"validation_url\": \"https://accounts.google.com/x\"}\n";
+        assert_eq!(verify_in(unstamped), None);
+        let old = "E0925 09:00:00.000000 1 x.go:1] {\"reason\": \"VALIDATION_REQUIRED\", \"validation_url\": \"https://accounts.google.com/x\"}\n";
+        assert_eq!(verify_in(old), None);
     }
 }

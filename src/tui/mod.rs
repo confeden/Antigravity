@@ -467,6 +467,7 @@ impl App {
             // when the card says there is nothing to do.
             KeyCode::Char('a') => self.act_if_offered(Action::EnableAll),
             KeyCode::Char('r') => self.act_if_offered(Action::Repair),
+            KeyCode::Char('v') => self.act_if_offered(Action::Verify),
             KeyCode::Char('o') => self.save_report(),
             KeyCode::Char('x') | KeyCode::Delete => {
                 if let Some(Row::Install(i)) = row {
@@ -569,6 +570,14 @@ impl App {
                     return;
                 }
                 self.toast("Права администратора не получены.");
+            }
+            // Opened, and also shown: a terminal with no desktop behind it has
+            // no browser to open, and the link is then copied from here.
+            Action::Verify => {
+                if let Some((_, url)) = self.facts().and_then(|f| f.verify) {
+                    crate::utils::open_url_as_user(&url);
+                    self.toast(format!("Если браузер не открылся, откройте ссылку вручную: {url}"));
+                }
             }
         }
     }
@@ -1053,6 +1062,7 @@ impl App {
         let offered = match self.facts().and_then(|f| status::headline(&f).action) {
             Some(Action::EnableAll) => " · a — включить всё",
             Some(Action::Repair) => " · r — починить",
+            Some(Action::Verify) => " · v — пройти верификацию",
             _ => "",
         };
         let keys = format!("↑↓ выбор · Пробел/Enter — вкл/выкл{offered} · o — отчёт · q — выход");

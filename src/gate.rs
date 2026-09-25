@@ -390,6 +390,8 @@ pub struct View {
     /// the last answer disappeared, and the answer before it turned the card
     /// green again - a claim about a route that was last seen failing.
     pub refused_long: Option<crate::ls_log::Sighting>,
+    /// Google asking the account to verify itself, with the page to do it on.
+    pub verify: Option<crate::ls_log::Verification>,
     /// The relay's record, or `None` when there is none or it has gone stale.
     pub relay: Option<Report>,
     /// Whether this window reaches the internet, asked only while the relay is
@@ -475,6 +477,7 @@ fn watch(tx: Sender<Signal>, wake: Box<dyn Fn() + Send>) {
     let mut found: Option<(crate::ls_log::Sighting, Instant)> = None;
     let mut answered: Option<(crate::ls_log::Sighting, Instant)> = None;
     let mut refused_long: Option<(crate::ls_log::Sighting, Instant)> = None;
+    let mut verify: Option<(crate::ls_log::Verification, Instant)> = None;
     // The first tick scans whatever is already there: a user who hits the gate
     // and *then* opens this window is the case this whole path exists for.
     let mut scan = true;
@@ -516,6 +519,7 @@ fn watch(tx: Sender<Signal>, wake: Box<dyn Fn() + Send>) {
             found = h.refused_recent.map(|s| (s, at)).or(found);
             answered = h.answered.map(|s| (s, at)).or(answered);
             refused_long = h.refused.map(|s| (s, at)).or(refused_long);
+            verify = h.verify.map(|v| (v, at)).or(verify);
         }
 
         let view = View {
@@ -534,6 +538,13 @@ fn watch(tx: Sender<Signal>, wake: Box<dyn Fn() + Send>) {
             refused_long: refused_long.and_then(|(s, at)| {
                 let ago = s.ago + at.elapsed();
                 (ago <= ANSWER_RECENT).then_some(crate::ls_log::Sighting { ago, ..s })
+            }),
+            verify: verify.as_ref().and_then(|(v, at)| {
+                let ago = v.ago + at.elapsed();
+                (ago <= ANSWER_RECENT).then(|| crate::ls_log::Verification {
+                    ago,
+                    url: v.url.clone(),
+                })
             }),
             relay: read().filter(|r| !r.is_stale()),
             net_ok: None,
@@ -601,9 +612,14 @@ fn worth_sending(fresh: &View, shown: &View) -> bool {
         (Some(a), Some(b)) => a.count != b.count || a.ago < b.ago,
         (a, b) => a.is_some() != b.is_some(),
     };
+    let verify_changed = match (&fresh.verify, &shown.verify) {
+        (Some(a), Some(b)) => a.url != b.url || a.ago < b.ago,
+        (a, b) => a.is_some() != b.is_some(),
+    };
     newer(fresh.seen, shown.seen)
         || newer(fresh.answered, shown.answered)
         || newer(fresh.refused_long, shown.refused_long)
+        || verify_changed
 }
 
 #[cfg(test)]
@@ -626,6 +642,7 @@ mod tests {
             seen: seen(120, 2),
             answered: None,
             refused_long: None,
+            verify: None,
             relay: None,
             net_ok: None,
         };
@@ -642,6 +659,27 @@ mod tests {
             ..shown.clone()
         };
         assert!(worth_sending(&newer, &shown));
+        let link = |ago: u64, url: &str| {
+            Some(crate::ls_log::Verification {
+                ago: Duration::from_secs(ago),
+                url: url.to_string(),
+            })
+        };
+        let asked = View {
+            verify: link(10, "https://accounts.google.com/a"),
+            ..shown.clone()
+        };
+        assert!(worth_sending(&asked, &shown), "a verification demand appeared");
+        let aged = View {
+            verify: link(13, "https://accounts.google.com/a"),
+            ..shown.clone()
+        };
+        assert!(!worth_sending(&aged, &asked), "the same demand, three seconds on");
+        let again = View {
+            verify: link(2, "https://accounts.google.com/b"),
+            ..shown.clone()
+        };
+        assert!(worth_sending(&again, &asked), "a fresh link");
         let expired = View {
             seen: None,
             ..shown.clone()
@@ -697,6 +735,7 @@ mod tests {
             seen: None,
             answered: None,
             refused_long: None,
+            verify: None,
             relay: Some(base),
             net_ok: None,
         };

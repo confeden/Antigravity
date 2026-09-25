@@ -293,6 +293,33 @@ mod windows_impl {
         enable()
     }
 
+    /// Puts this build in `%ProgramData%` for the watchdog task **without**
+    /// starting the relay.
+    ///
+    /// Auto-patch is not the 400 bypass. It used to reach for `ensure_running`,
+    /// which registered and started the relay, and a running relay is the bypass
+    /// (it answers the gate hosts and writes the proxy variable) - so a user who
+    /// switched on only «Автопатч» found «Снять ошибку 400» on as well. With the
+    /// relay already wanted it is kept current the usual way; otherwise only the
+    /// file is copied, and stamped so the copy does not read as an outdated relay.
+    pub fn ensure_installed() -> Result<(), String> {
+        if is_enabled() {
+            return ensure_running();
+        }
+        if installed_copy_is_current() {
+            return Ok(());
+        }
+        let src = env::current_exe().map_err(|e| format!("не найден путь к exe: {}", e))?;
+        let dir = install_dir();
+        fs::create_dir_all(&dir).map_err(|e| format!("не создать {}: {}", dir.display(), e))?;
+        // An older watchdog may be running the copy about to be replaced.
+        disable_watchdog();
+        stop_process();
+        copy_over(&src, &installed_exe())?;
+        dns_forwarder::record_version();
+        Ok(())
+    }
+
     /// Registers the standalone watchdog logon task, pointing at the same installed
     /// exe as the relay but with `--watchdog`. Additive: it runs a second copy of
     /// the re-patch loop that survives the relay being stopped or absent (G9). The
@@ -582,11 +609,24 @@ mod unix_impl {
         if let Some(p) = up.parent() {
             fs::create_dir_all(p).map_err(|e| format!("не создать {}: {}", p.display(), e))?;
         }
+        // The window finds the service's `gate.json` through `log_dir()`, which
+        // follows `XDG_DATA_HOME`. The systemd user manager does not always carry
+        // the desktop session's value, and a service writing into a different
+        // directory than the window reads leaves the card on «Служба запускается»
+        // for good - so the unit is given the directory the window uses.
+        let data_home = crate::dns_forwarder::log_dir()
+            .parent()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default()
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('%', "%%");
         let unit = format!(
             "[Unit]\n\
              Description=Antigravity Unlocker local proxy\n\
-             After=network-online.target\n\n\
+             After=default.target\n\n\
              [Service]\n\
+             Environment=\"XDG_DATA_HOME={data_home}\"\n\
              ExecStart={exe} {flag}\n\
              Restart=on-failure\n\
              RestartSec=5\n\n\
@@ -595,6 +635,9 @@ mod unix_impl {
             exe = exe.display(),
             flag = PROXY_FLAG,
         );
+        // A unit from an older build lacks the data-dir line; running on under
+        // it keeps the service writing where the window does not look.
+        let unit_changed = fs::read_to_string(&up).map_or(true, |old| old != unit);
         fs::write(&up, unit).map_err(|e| format!("не записать юнит: {}", e))?;
 
         systemctl(&["daemon-reload"]);
@@ -603,7 +646,7 @@ mod unix_impl {
         }
         // `enable --now` leaves a unit that is already running alone, so a copy
         // just replaced would sit unused until the next login.
-        if replaced && !systemctl(&["restart", UNIT_NAME]) {
+        if (replaced || unit_changed) && !systemctl(&["restart", UNIT_NAME]) {
             return Err(
                 "новая версия прокси записана, но служба не перезапустилась (systemctl --user)"
                     .to_string(),
@@ -626,12 +669,20 @@ mod unix_impl {
     }
 
     pub fn enable() -> Result<(), String> {
-        ensure_running()
+        ensure_running()?;
+        let _ = systemctl(&["restart", UNIT_NAME]);
+        Ok(())
     }
 
     /// No separate watchdog on Linux yet - the proxy unit's own `Restart=` covers
     /// the crash case, and there is no auto-updater story to fight here.
     pub fn enable_watchdog() -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Nothing to install for a watchdog Linux does not have - and starting the
+    /// proxy unit here would switch the 400 bypass on behind the user's back.
+    pub fn ensure_installed() -> Result<(), String> {
         Ok(())
     }
 

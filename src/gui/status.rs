@@ -46,6 +46,8 @@ pub enum Action {
     Elevate,
     /// Reinstall and restart the service.
     Repair,
+    /// Open Google's verification page (`Facts::verify`) in the browser.
+    Verify,
 }
 
 impl Action {
@@ -54,6 +56,7 @@ impl Action {
             Action::EnableAll => "Включить всё",
             Action::Elevate => "Перезапустить от имени администратора",
             Action::Repair => "Починить",
+            Action::Verify => "Пройти верификацию в браузере",
         }
     }
 }
@@ -121,7 +124,16 @@ pub struct Facts {
     pub net_ok: Option<bool>,
     /// The relay's own exe: the file an antivirus exception has to name.
     pub relay_exe: String,
+    /// The newest time Google asked for the account to be verified: how long
+    /// ago, and the page it gave. `headline` decides whether it still stands.
+    pub verify: Option<(Duration, String)>,
 }
+
+/// How long a verification demand stays on the card with no answer after it.
+/// The page carries a one-time token; past this the client has usually asked
+/// again and logged a fresh one, and an old link is more likely to fail than
+/// help.
+const VERIFY_FOR: Duration = Duration::from_secs(30 * 60);
 
 /// About three refused turns (each writes four lines) with no answer in
 /// between: past that, "send it again" has been tried and did not help.
@@ -207,6 +219,7 @@ impl Facts {
             cut_off: relay.is_some_and(crate::gate::Report::cut_off),
             net_ok: gate.net_ok,
             relay_exe: relay.map(|r| r.exe.clone()).unwrap_or_default(),
+            verify: gate.verify.as_ref().map(|v| (aged(v.ago), v.url.clone())),
         }
     }
 }
@@ -404,6 +417,30 @@ pub fn headline(f: &Facts) -> Headline {
             detail: "Установите Antigravity или укажите папку с ним ниже — карандаш рядом с нужной строкой."
                 .into(),
             action: None,
+        };
+    }
+
+    // Google itself stopped the account until it is verified. Above everything
+    // the bypass says: no route and no switch changes this, only the user in a
+    // browser - and the client does not always offer the button for it.
+    // Only while nothing has answered since: an answer after it means the
+    // account was verified, whatever the log still says.
+    let verify_due = f
+        .verify
+        .as_ref()
+        .filter(|(ago, _)| *ago <= VERIFY_FOR && f.answer.is_none_or(|a| a > *ago));
+    if let Some((ago, _)) = verify_due {
+        return Headline {
+            tone: Tone::Action,
+            title: "Нужна верификация аккаунта Google".into(),
+            detail: format!(
+                "Google попросил подтвердить аккаунт — {}. Antigravity не всегда показывает \
+                 для этого кнопку. Нажмите кнопку ниже: страница Google откроется в браузере \
+                 по умолчанию — в нём должен быть выполнен вход в этот же аккаунт. После \
+                 подтверждения отправьте сообщение в Antigravity ещё раз.",
+                ago_text(*ago)
+            ),
+            action: Some(Action::Verify),
         };
     }
 
@@ -976,5 +1013,35 @@ mod tests {
             ..working()
         };
         assert_eq!(headline(&unasked).title, "Всё включено");
+    }
+
+    /// Google stopped the account: the card says so above everything, red, with
+    /// the one button that helps - even with the bypass switched off, which has
+    /// nothing to do with it.
+    #[test]
+    fn a_verification_demand_tops_the_card_until_an_answer_follows() {
+        let url = "https://accounts.google.com/signin/continue?a=1&b=2".to_string();
+        let asked = Facts {
+            verify: Some((secs(120), url.clone())),
+            answer: Some(secs(900)),
+            bypass_on: false,
+            ..working()
+        };
+        let h = headline(&asked);
+        assert_eq!(h.tone, Tone::Action);
+        assert_eq!(h.action, Some(Action::Verify));
+
+        let answered_since = Facts {
+            verify: Some((secs(120), url.clone())),
+            answer: Some(secs(30)),
+            ..working()
+        };
+        assert_ne!(headline(&answered_since).action, Some(Action::Verify));
+
+        let stale = Facts {
+            verify: Some((VERIFY_FOR + secs(1), url)),
+            ..working()
+        };
+        assert_ne!(headline(&stale).action, Some(Action::Verify));
     }
 }

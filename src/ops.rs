@@ -1163,10 +1163,9 @@ fn apply(ctx: &mut Ctx, cap: Cap, on: bool) {
             // Switching the patch off took the watchdog task down with it. The
             // relay's own watchdog thread acts again the moment the decline is
             // gone, so without the task back the switch would read off while
-            // patching went on. Only with the relay wanted: `set_watchdog`
-            // installs the relay if it is missing.
+            // patching went on. `set_watchdog` no longer starts the relay, so
+            // this does not depend on the bypass being wanted.
             if is_admin()
-                && ctx.settings.dns
                 && ctx.settings.auto_patch_wanted()
                 && !background::is_watchdog_enabled()
             {
@@ -1415,6 +1414,18 @@ fn auto_patch_found(ctx: &mut Ctx) -> bool {
     ctx.busy(Some("Автопатч"));
     let mut wrote = false;
     for (label, inst) in found {
+        // Never a password prompt nobody asked for: the automatic pass leaves a
+        // root-owned install to the button, which asks.
+        if crate::elevate::needs_root(&inst) {
+            ctx.log(
+                Level::Warn,
+                format!(
+                    "Автопатч: {} — установка принадлежит root. Нажмите «Включить всё» и введите пароль.",
+                    label
+                ),
+            );
+            continue;
+        }
         let mut patched = 0usize;
         let mut unknown = 0usize;
         let mut failed: Option<String> = None;
@@ -1491,6 +1502,32 @@ fn enable_client_patch(ctx: &mut Ctx) -> bool {
 
     let mut ok = 0usize;
     for inst in &targets {
+        // A root-owned Linux install: only this write is done as root, behind
+        // the desktop's password prompt (`elevate`).
+        if crate::elevate::needs_root(inst) {
+            let where_ = crate::utils::mask_path(&inst.display().to_string());
+            ctx.log(
+                Level::Step,
+                format!("{where_} принадлежит root — запрашиваю пароль для записи патча"),
+            );
+            match crate::elevate::patch_as_root(inst) {
+                Ok(done) => {
+                    ok += 1;
+                    if done.proxy_var {
+                        ctx.proxy_var_carried = Some(true);
+                    }
+                    if done.proxy_var_retryable {
+                        ctx.proxy_var_retryable = true;
+                    }
+                    ctx.log(Level::Ok, format!("{} — {}", done.label, where_));
+                    for w in done.warnings {
+                        ctx.log(Level::Warn, w);
+                    }
+                }
+                Err(e) => ctx.log(Level::Err, format!("{where_} — {e}")),
+            }
+            continue;
+        }
         match crate::process_install(inst) {
             Ok(outcome) => {
                 ok += 1;
@@ -1630,10 +1667,11 @@ fn set_watchdog(ctx: &mut Ctx, on: bool) {
         ctx.log(Level::Ok, "Автовосстановление патча отключено.");
         return;
     }
-    // The task launches the copy in %ProgramData%; `ensure_running` is what puts
-    // it there, so without it `enable_watchdog` has nothing to point at.
-    if let Err(e) = background::ensure_running() {
-        ctx.log(Level::Warn, format!("Служба DNS не поднялась: {}", e));
+    // The task launches the copy in %ProgramData%, so it has to be there - but
+    // only the file: starting the relay here switched the 400 bypass on for a
+    // user who asked for auto-patch alone.
+    if let Err(e) = background::ensure_installed() {
+        ctx.log(Level::Warn, format!("Не удалось установить копию для автопатча: {}", e));
     }
     match background::enable_watchdog() {
         Ok(()) => ctx.log(Level::Ok, "Автовосстановление патча включено."),
@@ -1704,15 +1742,12 @@ fn disable_dns(ctx: &mut Ctx) {
     }
 
     // The standalone watchdog task launches the copy of this exe that
-    // `background::disable` is about to delete. Leaving the task registered
-    // would leave the switch reading On while auto-patch was in fact dead.
+    // `background::disable` is about to delete. It is taken down first and put
+    // back after, on a copy of its own: auto-patch is not part of the bypass,
+    // and switching the bypass off must not switch it off too.
     let restore_watchdog = ctx.settings.auto_patch && background::is_watchdog_enabled();
     if restore_watchdog {
         background::disable_watchdog();
-        ctx.log(
-            Level::Info,
-            "Автопатч приостановлен: он работает из той же службы. Вернётся вместе с «Обходом через DNS».",
-        );
     }
 
     // I45: both steps run regardless of what the first one did.
@@ -1725,6 +1760,9 @@ fn disable_dns(ctx: &mut Ctx) {
             Level::Warn,
             format!("Служба остановлена не полностью: {}", e),
         ),
+    }
+    if restore_watchdog {
+        set_watchdog(ctx, true);
     }
 }
 

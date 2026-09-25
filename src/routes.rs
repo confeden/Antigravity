@@ -189,6 +189,25 @@ const STUMBLE_FOR: Duration = Duration::from_secs(60);
 /// own.
 const PROBE_STUMBLE_FOR: Duration = Duration::from_secs(3 * 60);
 
+/// How long a route whose live tunnel went **silent** sits behind the others:
+/// it opened, the client spoke, and nothing came back before the tunnel closed.
+///
+/// The failure nothing else sees. The route said `200`, so it never stumbled;
+/// the gate never answered, so there is no 400 to blame it with; and its probe
+/// can still pass between two dead tunnels, so it kept being put first - a
+/// built-in exit that stopped carrying held the table on itself, and the user
+/// had to switch the exits off by hand for the DNS route to be tried at all.
+/// Not cleared by a probe (`record`), only by a model answer (`credit`) or by
+/// the bench running out: a live connection that got nothing outweighs a probe.
+/// Two steps, not the four a refusal climbs - a network that dropped out makes
+/// every route go silent at once, and that must not cost the best one an hour.
+const SILENT_STEPS: [Duration; 2] = [Duration::from_secs(2 * 60), Duration::from_secs(10 * 60)];
+
+/// Fewer bytes than this back to the client is no TLS server flight at all: a
+/// ServerHello alone is larger. What does arrive is an alert or a proxy's error
+/// text, which is the same answer - the route does not reach Google.
+const SILENT_MAX_BYTES: u64 = 64;
+
 #[derive(Clone, Copy)]
 struct Sample {
     latency: Duration,
@@ -228,6 +247,10 @@ struct Table {
     streak: [u8; N],
     /// Until when a route that failed to open for a live connection sits last.
     stumbled: [Option<Instant>; N],
+    /// Until when a route whose live tunnel went silent sits last
+    /// (`SILENT_STEPS`), and how many times in a row it did.
+    silent: [Option<Instant>; N],
+    silent_streak: [u8; N],
     /// The route the last `refresh_leader` put first, for the hysteresis.
     leader: Option<Kind>,
     /// The route that most recently opened a gate tunnel, and when.
@@ -246,6 +269,8 @@ static TABLE: Mutex<Table> = Mutex::new(Table {
     bad_count: [0; N],
     streak: [0; N],
     stumbled: [None; N],
+    silent: [None; N],
+    silent_streak: [0; N],
     leader: None,
     last_used: None,
     context: 0,
@@ -351,6 +376,8 @@ pub fn credit(kind: Kind) {
         // A route that carried an answer is not one to keep behind the others.
         t.penalised[i] = None;
         t.stumbled[i] = None;
+        t.silent[i] = None;
+        t.silent_streak[i] = 0;
     }
 }
 
@@ -486,6 +513,8 @@ pub fn set_context(fingerprint: u64) -> bool {
         t.streak = [0; N];
         t.penalised = [None; N];
         t.stumbled = [None; N];
+        t.silent = [None; N];
+        t.silent_streak = [0; N];
     }
     !first
 }
@@ -512,6 +541,7 @@ struct Snapshot {
     ok_count: [u32; N],
     bad_count: [u32; N],
     stumbled: [Option<Instant>; N],
+    silent: [Option<Instant>; N],
     leader: Option<Kind>,
 }
 
@@ -527,6 +557,7 @@ fn snapshot() -> Snapshot {
             ok_count: t.ok_count,
             bad_count: t.bad_count,
             stumbled: t.stumbled,
+            silent: t.silent,
             leader: t.leader,
         },
         Err(_) => Snapshot {
@@ -538,6 +569,7 @@ fn snapshot() -> Snapshot {
             ok_count: [0; N],
             bad_count: [0; N],
             stumbled: [None; N],
+            silent: [None; N],
             leader: None,
         },
     }
@@ -599,6 +631,7 @@ fn order_with(s: &Snapshot, has_dns_layer: bool, usable: impl Fn(Kind) -> bool) 
     let tier = |k: Kind| -> u8 {
         if penalised(&s.penalised, k)
             || penalised(&s.stumbled, k)
+            || penalised(&s.silent, k)
             || (k == Kind::Direct && !has_dns_layer)
         {
             3
@@ -632,7 +665,9 @@ fn order_with(s: &Snapshot, has_dns_layer: bool, usable: impl Fn(Kind) -> bool) 
     let ends = |k: &Kind| {
         let i = k.index();
         let live = |u: Option<Instant>| u.filter(|u| *u > Instant::now());
-        live(s.penalised[i]).max(live(s.stumbled[i]))
+        live(s.penalised[i])
+            .max(live(s.stumbled[i]))
+            .max(live(s.silent[i]))
     };
     benched.sort_by_key(ends);
     out.extend(benched);
@@ -820,14 +855,57 @@ pub fn attach_upstream(upstream: &TcpStream) {
 fn end_gate_connection() {
     let tunnel = SERVING.with(|s| s.borrow_mut().take().and_then(|s| s.tunnel));
     let Some(id) = tunnel else { return };
+    let mut went_silent = None;
     if let Ok(mut list) = TUNNELS.lock() {
         if let Some(t) = list.iter_mut().find(|t| t.id == id) {
             t.closed = Some(Instant::now());
             t.client = None;
             t.upstream = None;
+            let (to_client, to_upstream) = t.activity.bytes();
+            if is_silent(to_client, to_upstream) && t.answered_at.is_none() {
+                went_silent = Some(t.kind);
+            }
         }
         prune(&mut list);
     }
+    // After `TUNNELS` is released: the two locks are never held together (G30).
+    if let Some(kind) = went_silent {
+        if let Some(bench) = silence(kind, live_answer(kind).is_some()) {
+            note(&format!(
+                "{}: соединение открылось, но Google не ответил ни байта — маршрут отложен на {} мин, следующие соединения идут другим путём",
+                kind.label(),
+                bench.as_secs() / 60
+            ));
+        }
+    }
+}
+
+/// A tunnel the client spoke into and got nothing - or next to nothing - back
+/// from. One the client never used (nothing out) says nothing about the route.
+fn is_silent(to_client: u64, to_upstream: u64) -> bool {
+    to_upstream > 0 && to_client < SILENT_MAX_BYTES
+}
+
+/// Puts `kind` behind the others for going silent on a live tunnel. `None` when
+/// it is already there - a burst of the client's parallel connections dying on
+/// one dead route is one event, not a climb up the steps - when a refusal
+/// already benched it and cut the tunnel that is closing now, or when the route
+/// is demonstrably carrying: an answer streaming through another of its tunnels
+/// (`streaming`, D32) or one that arrived within `PROOF_PROTECTS_FOR` (D31).
+fn silence(kind: Kind, streaming: bool) -> Option<Duration> {
+    let mut t = TABLE.lock().ok()?;
+    let i = kind.index();
+    if penalised(&t.penalised, kind) || penalised(&t.silent, kind) {
+        return None;
+    }
+    if streaming || t.ok_at[i].is_some_and(|ok| ok.elapsed() < PROOF_PROTECTS_FOR) {
+        return None;
+    }
+    let step = (t.silent_streak[i] as usize).min(SILENT_STEPS.len() - 1);
+    let bench = SILENT_STEPS[step];
+    t.silent_streak[i] = t.silent_streak[i].saturating_add(1);
+    t.silent[i] = Some(Instant::now() + bench);
+    Some(bench)
 }
 
 /// Notes that a gate tunnel was just opened on `kind`. Called where the `200`
@@ -1004,6 +1082,7 @@ pub fn tunnel_shape(id: u64) -> Option<Shape> {
 /// refused over, and D26's reason for cutting applies to it and to nothing else
 /// on the route. Returns whether anything was closed, so the log can say which
 /// of the two cases this was.
+#[allow(dead_code)]
 pub fn cut_tunnel(id: u64) -> bool {
     let Ok(mut list) = TUNNELS.lock() else {
         return false;
@@ -1113,6 +1192,7 @@ pub fn rows(usable: impl Fn(Kind) -> bool) -> Vec<Row> {
                 refusals: s.bad_count[i],
                 bench_left: s.penalised[i]
                     .max(s.stumbled[i])
+                    .max(s.silent[i])
                     .and_then(|u| u.checked_duration_since(Instant::now()))
                     .map(|d| d.as_secs()),
                 open: open[i],
@@ -1162,6 +1242,7 @@ mod tests {
             ok_count: [0; N],
             bad_count: [0; N],
             stumbled: [None; N],
+            silent: [None; N],
             leader: None,
         }
     }
@@ -1254,6 +1335,61 @@ mod tests {
             order_with(&s, true, |k| k != Kind::Own && k != Kind::Vpn)[0],
             Kind::Direct
         );
+    }
+
+    /// The field case behind `SILENT_STEPS`: a built-in exit that answered once
+    /// and then went dead kept the table on itself, and the DNS route was never
+    /// tried until the user switched the exits off.
+    #[test]
+    fn a_proven_route_that_went_silent_gives_way_to_the_dns_route() {
+        let mut s = blank();
+        s.samples[Kind::Exits.index()] = sample(400);
+        s.samples[Kind::Direct.index()] = sample(600);
+        s.ok_at[Kind::Exits.index()] = Some(Instant::now() - ms(600_000));
+        s.leader = Some(Kind::Exits);
+        let usable = |k: Kind| k == Kind::Exits || k == Kind::Direct;
+        assert_eq!(order_with(&s, true, usable)[0], Kind::Exits);
+        s.silent[Kind::Exits.index()] = Some(Instant::now() + ms(120_000));
+        assert_eq!(
+            order_with(&s, true, usable),
+            vec![Kind::Direct, Kind::Exits]
+        );
+    }
+
+    #[test]
+    fn only_a_tunnel_the_client_spoke_into_and_heard_nothing_from_is_silent() {
+        assert!(is_silent(0, 517), "ClientHello out, nothing back");
+        assert!(is_silent(7, 517), "a TLS alert is not a server flight");
+        assert!(!is_silent(0, 0), "never used by the client");
+        assert!(!is_silent(4_800, 517), "a handshake came back");
+    }
+
+    #[test]
+    fn silence_benches_once_per_episode_and_only_an_answer_lifts_it() {
+        let _turn = turn();
+        set_context(0x6666);
+        assert_eq!(silence(Kind::Relay, false), Some(SILENT_STEPS[0]));
+        // The client's other connections dying on the same route: one event.
+        assert_eq!(silence(Kind::Relay, false), None);
+        // A probe that passes does not let it out early.
+        record(Kind::Relay, ms(300));
+        assert!(snapshot().silent[Kind::Relay.index()].is_some());
+        assert_eq!(
+            order(|k| k == Kind::Relay || k == Kind::Exits)[0],
+            Kind::Exits
+        );
+        // A model answer does, and protects it from the next silent tunnel.
+        credit(Kind::Relay);
+        assert!(snapshot().silent[Kind::Relay.index()].is_none());
+        assert_eq!(silence(Kind::Relay, false), None);
+        // An answer streaming through another of its tunnels protects it too.
+        set_context(0x6667);
+        assert_eq!(silence(Kind::Relay, true), None);
+        // Escalates to the second step and stays there.
+        if let Ok(mut t) = TABLE.lock() {
+            t.silent_streak[Kind::Relay.index()] = 5;
+        }
+        assert_eq!(silence(Kind::Relay, false), Some(SILENT_STEPS[1]));
     }
 
     #[test]

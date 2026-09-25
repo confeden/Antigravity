@@ -113,7 +113,7 @@ fn status_card(app: &mut App, ui: &mut egui::Ui) {
     };
     // Ages on the card count up on their own; without a repaint «минуту назад»
     // would stay «минуту назад» until the mouse moved.
-    if f.refusal.is_some() || f.answer.is_some() {
+    if f.refusal.is_some() || f.answer.is_some() || f.verify.is_some() {
         ui.ctx().request_repaint_after(Duration::from_secs(1));
     }
 
@@ -209,6 +209,11 @@ fn status_card(app: &mut App, ui: &mut egui::Ui) {
         Some(Action::EnableAll) => app.worker.send(Cmd::EnableAll),
         Some(Action::Repair) => app.worker.send(Cmd::Repair),
         Some(Action::Elevate) => app.request_elevation(),
+        Some(Action::Verify) => {
+            if let Some((_, url)) = &f.verify {
+                crate::utils::open_url_as_user(url);
+            }
+        }
         None => {}
     }
     if copy {

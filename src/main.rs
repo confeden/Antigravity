@@ -26,6 +26,7 @@ mod dns_client;
 mod dns_forwarder;
 mod doh;
 mod egress;
+mod elevate;
 mod endpoint;
 mod gate;
 mod gui;
@@ -570,11 +571,20 @@ fn main() {
 
     if env::args().any(|a| a == background::PROXY_FLAG) {
         dns_forwarder::detach_console();
-        if let Err(e) = proxy::run(0) {
-            eprintln!("proxy: {}", e);
+        if let Err(e) = dns_forwarder::run_proxy_service() {
+            dns_forwarder::log_fatal(&e);
             std::process::exit(1);
         }
         return;
+    }
+
+    // Root's half of patching a root-owned install (`elevate`): started by
+    // pkexec from the window, patches the one install named and exits.
+    {
+        let args: Vec<String> = env::args().collect();
+        if let Some(i) = args.iter().position(|a| a == elevate::PATCH_ROOT_FLAG) {
+            elevate::run_helper(args.get(i + 1).cloned());
+        }
     }
 
     canary::handle_cli_flags();
