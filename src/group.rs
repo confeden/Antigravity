@@ -36,6 +36,10 @@ struct Server {
     tunnel_ok: bool,
     /// CPU load in percent from its last status answer; None = never answered.
     cpu: Option<i64>,
+    /// Region-400 came back through it: its exit is not in a permitted country.
+    /// Kept apart from `tunnel_ok` too — the tunnel to it opens fine and a
+    /// passing probe (which never reaches a gate host) must not clear this.
+    benched_until: Option<Instant>,
 }
 
 impl Server {
@@ -47,7 +51,11 @@ impl Server {
             ok: true,
             tunnel_ok: true,
             cpu: None,
+            benched_until: None,
         }
+    }
+    fn benched(&self) -> bool {
+        self.benched_until.is_some_and(|t| Instant::now() < t)
     }
     fn name(&self) -> String {
         format!("{}:{}", self.host, self.port)
@@ -218,6 +226,24 @@ fn initial_servers(key: &GroupKey) -> Vec<Server> {
     out
 }
 
+/// Drops every server the live pool does not list, the key's own bootstrap
+/// excepted. Empty `listed` drops nothing: a status with no names says nothing.
+fn prune_unlisted(
+    servers: &mut Vec<Server>,
+    bootstrap: &(String, u16),
+    listed: &[(String, u16)],
+) -> bool {
+    if listed.is_empty() {
+        return false;
+    }
+    let before = servers.len();
+    servers.retain(|s| {
+        (&s.host, s.port) == (&bootstrap.0, bootstrap.1)
+            || listed.iter().any(|(h, p)| *h == s.host && *p == s.port)
+    });
+    servers.len() != before
+}
+
 fn save_servers(key: &GroupKey, names: Vec<String>) {
     if let Some(p) = pool_file() {
         let v = serde_json::json!({ "key": key_id(key), "servers": names });
@@ -255,7 +281,7 @@ fn pick_server(key: &GroupKey) -> (usize, String) {
         .servers
         .iter()
         .map(|s| Cand {
-            ok: s.ok && s.tunnel_ok,
+            ok: s.ok && s.tunnel_ok && !s.benched(),
             cpu: s.cpu,
         })
         .collect();
@@ -282,6 +308,37 @@ fn pick_server(key: &GroupKey) -> (usize, String) {
         ));
     }
     (pick, name)
+}
+
+/// How long a server whose exit drew region-400 sits out of the walk.
+const REGION_BENCH: Duration = Duration::from_secs(5 * 60);
+
+/// Region-400 came through the group with no answer on it: bench the server new
+/// tunnels were going to, so the next one lands on another. Returns whether
+/// another server is left to try (with one server there is nothing to switch to).
+pub fn bench_current_server() -> bool {
+    let mut state = group_state().lock().unwrap();
+    let Some(cur) = state.current.filter(|&c| c < state.servers.len()) else {
+        return false;
+    };
+    // One host on two ports is one exit: both entries sit out together.
+    let host = state.servers[cur].host.clone();
+    let until = Instant::now() + REGION_BENCH;
+    for srv in state.servers.iter_mut().filter(|s| s.host == host) {
+        srv.benched_until = Some(until);
+    }
+    state.current = None;
+    drop(state);
+    crate::dns_forwarder::log_proxy(&format!(
+        "Прокси из группы: сервер #{} отдал region-400 — отложен на 5 мин, следующее соединение пойдёт на другой",
+        cur + 1
+    ));
+    group_state()
+        .lock()
+        .unwrap()
+        .servers
+        .iter()
+        .any(|s| s.ok && s.tunnel_ok && !s.benched())
 }
 
 fn set_tunnel_ok(name: &str, ok: bool) {
@@ -995,6 +1052,19 @@ fn poll_pool(key: &GroupKey) {
                         }
                     }
                 }
+                // What the live servers list is the pool; a name an earlier run
+                // saved that they no longer list is a server taken down.
+                let listed: Vec<(String, u16)> = st
+                    .servers
+                    .iter()
+                    .chain(st.pool.iter().map(|(n, _)| n))
+                    .filter_map(|n| valid_server_name(n))
+                    .collect();
+                let bootstrap = (key.host.to_ascii_lowercase(), key.port);
+                if prune_unlisted(&mut state.servers, &bootstrap, &listed) {
+                    state.current = None;
+                    learned = true;
+                }
                 for name in st.servers.iter().chain(st.pool.iter().map(|(n, _)| n)) {
                     if let Some((h, p)) = valid_server_name(name) {
                         if state.servers.len() < MAX_SERVERS
@@ -1111,6 +1181,36 @@ fn probe_via(key: &GroupKey, server: &str, force_refresh: bool) -> Result<(), St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_server_the_pool_no_longer_lists_is_dropped() {
+        let mut v = vec![
+            Server::new("a.example".into(), 443),
+            Server::new("b.example".into(), 8443),
+            Server::new("c.example".into(), 443),
+        ];
+        let listed = vec![("a.example".to_string(), 443), ("c.example".to_string(), 443)];
+        assert!(prune_unlisted(&mut v, &("a.example".into(), 443), &listed));
+        assert_eq!(v.len(), 2);
+        assert!(!prune_unlisted(&mut v, &("a.example".into(), 443), &listed));
+        assert!(!prune_unlisted(&mut v, &("a.example".into(), 443), &[]));
+    }
+
+    #[test]
+    fn benched_server_is_skipped_until_the_bench_ends() {
+        let mut a = Server::new("a.example".into(), 443);
+        assert!(!a.benched());
+        a.benched_until = Some(Instant::now() + Duration::from_secs(60));
+        assert!(a.benched());
+        a.benched_until = Some(Instant::now() - Duration::from_secs(1));
+        assert!(!a.benched());
+        // A benched current server is not "ok", so a fresh pick leaves it.
+        let cands = [
+            Cand { ok: false, cpu: Some(0) },
+            Cand { ok: true, cpu: Some(90) },
+        ];
+        assert_eq!(choose(&cands, Some(0), 0, 0.3), Some(1));
+    }
 
     /// Live: this client against a running agate. The key is built from a test
     /// master (no baked secret); the address is seeded so the SNI/cert name and

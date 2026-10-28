@@ -155,7 +155,7 @@ pub const LISTEN_PORT: u16 = 53;
 ///     added, and an address that fails sits out of the DoH walk for a while
 ///     (`doh::plan`). An older relay still spends 2.5 s of every walk on two
 ///     dead addresses - the slow start of the 400 bypass.
-pub const RELAY_VERSION: u32 = 42;
+pub const RELAY_VERSION: u32 = 44;
 
 /// Written where an unelevated relay can write and an unelevated unlocker can
 /// read. Absent means a relay from before versioning, i.e. older than anything.
@@ -911,7 +911,18 @@ fn on_refusals(count: usize, at: Instant, host: Option<&str>) {
         Some((kind, tunnel)) => {
             let shape = routes::tunnel_shape(tunnel);
             log_proxy(&connection_note(kind, tunnel, shape));
-            match routes::blame(kind) {
+            let blamed = routes::blame(kind);
+            // A route-wide bench is not enough for the group: the same server
+            // would be picked again when it ends. Bench the server itself.
+            if matches!(kind, routes::Kind::Group)
+                && matches!(
+                    blamed,
+                    routes::Blamed::Benched(_) | routes::Blamed::AlreadyBenched
+                )
+            {
+                crate::group::bench_current_server();
+            }
+            match blamed {
                 routes::Blamed::Benched(penalty) => {
                     log_proxy(&format!(
                         "маршрут «{}» нёс region-400 — отложен на {}, его соединения закрыты",

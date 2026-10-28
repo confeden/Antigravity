@@ -493,7 +493,7 @@ fn try_direct(mut client: TcpStream, host: &str, port: u16) -> Result<(), TcpStr
 /// route to 400s that the log called «the DNS route».
 fn gate_direct_addrs(host: &str, port: u16) -> Result<(Vec<std::net::SocketAddr>, u32), String> {
     let if_index = crate::net::pin_interface();
-    let (addrs, _, verdict) = crate::resolvers::resolve_a_best(host, if_index)
+    let (addrs, _, verdict) = crate::resolvers::direct_addrs(host, if_index)
         .ok_or_else(|| "имя не разрешилось".to_string())?;
     // With no relay to stand down for a tunnel (D13) and no VPN route of ours,
     // Google's own address is the gate and nothing else: the next route in the

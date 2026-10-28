@@ -529,6 +529,18 @@ pub fn set_context(fingerprint: u64) -> bool {
     let first = t.context == 0;
     t.context = fingerprint;
     if !first {
+        // The group server's exit sits in the same country on every network, so
+        // a region-400 it drew is not news that a VPN going up or down can
+        // overturn. Wiping it put the pinned group back in front of the VPN
+        // each time the network changed, and the VPN was never asked.
+        let g = Kind::Group.index();
+        let kept = (
+            t.penalised[g],
+            t.streak[g],
+            t.bad_at[g],
+            t.refused_at[g],
+            t.bad_count[g],
+        );
         t.ok_at = [None; N];
         t.bad_at = [None; N];
         t.refused_at = [None; N];
@@ -539,6 +551,7 @@ pub fn set_context(fingerprint: u64) -> bool {
         t.stumbled = [None; N];
         t.silent = [None; N];
         t.silent_streak = [0; N];
+        (t.penalised[g], t.streak[g], t.bad_at[g], t.refused_at[g], t.bad_count[g]) = kept;
     }
     !first
 }
@@ -675,8 +688,17 @@ fn order_with(s: &Snapshot, has_dns_layer: bool, usable: impl Fn(Kind) -> bool) 
     let mut out: Vec<Kind> = Vec::with_capacity(N);
     // Pinned routes: taken first whenever usable and not benched, in this
     // order, regardless of speed. A benched one joins the rest like any route.
+    // Except one that was refused and has not answered since while another
+    // usable route has: the pin is an owner's preference for a road that works,
+    // not for one that keeps drawing region-400 while the VPN carries the model.
+    let other_proven = |k: Kind| {
+        ALL.iter().any(|&o| {
+            o != k && usable(o) && !benched(o) && proven(&s.ok_at, &s.bad_at, o)
+        })
+    };
     for k in s.pinned {
-        if usable(k) && !benched(k) {
+        let refused_unproven = s.refused_at[k.index()].is_some() && !proven(&s.ok_at, &s.bad_at, k);
+        if usable(k) && !benched(k) && !(refused_unproven && other_proven(k)) {
             out.push(k);
         }
     }
@@ -1318,6 +1340,18 @@ mod tests {
 
     fn turn() -> std::sync::MutexGuard<'static, ()> {
         STATEFUL.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[test]
+    fn a_refused_unproven_pin_yields_to_a_proven_route() {
+        let mut s = blank();
+        let (g, v) = (Kind::Group.index(), Kind::Vpn.index());
+        s.refused_at[g] = Some(Instant::now());
+        s.ok_at[v] = Some(Instant::now());
+        assert_eq!(order_with(&s, true, |k| k != Kind::Own)[0], Kind::Vpn);
+        // Nothing else has answered: the pin keeps its place.
+        s.ok_at[v] = None;
+        assert_eq!(order_with(&s, true, |k| k != Kind::Own)[0], Kind::Group);
     }
 
     fn blank() -> Snapshot {

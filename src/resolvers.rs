@@ -1756,6 +1756,37 @@ pub fn resolve_a_best(name: &str, if_index: u32) -> Option<(Vec<Ipv4Addr>, &'sta
     Some((addrs, provider, verdict))
 }
 
+/// What the `Direct` route walks: the race winner's answer, then every proxy
+/// address any provider is known to hand out, the ones that accept a connection
+/// first.
+///
+/// `resolve_a_best` alone is one provider's word. A single-address answer is
+/// never vetted (`drop_dead_addrs` keeps the last address so a slow answer does
+/// not become no answer), so a winner whose lone proxy had died put the direct
+/// route on a black hole every time while another provider's proxy served the
+/// same name (measured: dns-ai.ru's address timed out, geohide's completed TLS).
+pub fn direct_addrs(name: &str, if_index: u32) -> Option<(Vec<Ipv4Addr>, &'static str, Verdict)> {
+    let (mut addrs, provider, verdict) = resolve_a_best(name, if_index)?;
+    if verdict != Verdict::Substituted {
+        return Some((addrs, provider, verdict));
+    }
+    ensure_proxy_sets_learned(if_index);
+    for idx in 0..PROVIDERS.len() {
+        for a in known_proxy_addrs(idx) {
+            if let IpAddr::V4(v4) = a {
+                if !addrs.contains(&v4) {
+                    addrs.push(v4);
+                }
+            }
+        }
+    }
+    let all: Vec<IpAddr> = addrs.iter().map(|a| IpAddr::V4(*a)).collect();
+    let dead = dead_addrs(&all, false, Some(name));
+    // Stable: the winner keeps its place among the live ones.
+    addrs.sort_by_key(|a| dead.contains(&IpAddr::V4(*a)));
+    Some((addrs, provider, verdict))
+}
+
 /// Genuine Google for `name`, as the routing table's own path resolves it: the
 /// reference resolvers asked over the **default route**, i.e. through the
 /// user's VPN when one holds it, so the edge is the one that tunnel's exit is
