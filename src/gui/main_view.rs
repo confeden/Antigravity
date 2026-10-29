@@ -310,6 +310,7 @@ fn install_rows(app: &mut App, ui: &mut egui::Ui) {
 
     let mut forget: Option<std::path::PathBuf> = None;
     let mut edit: Option<String> = None;
+    let mut patch: Option<std::path::PathBuf> = None;
 
     for row in &rows {
         ui.horizontal(|ui| {
@@ -359,6 +360,15 @@ fn install_rows(app: &mut App, ui: &mut egui::Ui) {
                         }
                     }
                 }
+                if let (Some(path), Some(false)) = (&row.path, row.patched) {
+                    if ui
+                        .small_button("Пропатчить")
+                        .on_hover_text("Наложить патч на эту установку")
+                        .clicked()
+                    {
+                        patch = Some(path.clone());
+                    }
+                }
                 if ui
                     .small_button("✏")
                     .on_hover_text("Указать путь вручную")
@@ -377,6 +387,9 @@ fn install_rows(app: &mut App, ui: &mut egui::Ui) {
 
     if let Some(p) = forget {
         app.worker.send(Cmd::ForgetPath(p));
+    }
+    if let Some(p) = patch {
+        app.worker.send(Cmd::PatchInstall(p));
     }
     if let Some(text) = edit {
         app.path_dialog = Some(text);

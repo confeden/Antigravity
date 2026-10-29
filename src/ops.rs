@@ -328,6 +328,8 @@ pub enum Cmd {
     Set(Cap, bool),
     AddPath(PathBuf),
     ForgetPath(PathBuf),
+    /// The «Пропатчить» button of one install row.
+    PatchInstall(PathBuf),
     SetOwnProxy(String),
     SetCustomDns(String),
     SetGroupKey(String),
@@ -574,6 +576,15 @@ fn run_worker(
                 if auto_patch_found(&mut ctx) {
                     push_status(&mut ctx, Scan::Deep);
                 }
+                ctx.busy(None);
+            }
+            Cmd::PatchInstall(p) => {
+                ctx.busy(Some("Патч"));
+                let label = crate::install_label(&p);
+                if !patch_found(&mut ctx, vec![(label, p)]) {
+                    ctx.log(Level::Warn, format!("{}: патч не записан, см. выше", label));
+                }
+                push_status(&mut ctx, Scan::Deep);
                 ctx.busy(None);
             }
             Cmd::ForgetPath(p) => {
@@ -1497,6 +1508,13 @@ fn auto_patch_found(ctx: &mut Ctx) -> bool {
                 .collect()
         })
         .unwrap_or_default();
+    patch_found(ctx, found)
+}
+
+/// Patches the given installs without closing anything. The shared body of
+/// auto-patch and of the row's «Пропатчить» button, which is what a user is left
+/// with when the automatic pass could not write.
+fn patch_found(ctx: &mut Ctx, found: Vec<(&'static str, PathBuf)>) -> bool {
     if found.is_empty() {
         return false;
     }

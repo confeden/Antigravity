@@ -411,6 +411,29 @@ pub fn binary_targets(inst: &Path) -> Vec<PathBuf> {
         }
     }
 
+    // IDE 2.6.0 carries no language server of its own: its `agy` extension
+    // downloads the backend into the user's `~/.gemini/bin`. That file is the
+    // IDE's, so the IDE's row reads and patches it (G85).
+    if inst
+        .join("resources")
+        .join("app")
+        .join("extensions")
+        .join("agy")
+        .is_dir()
+    {
+        let home = std::env::var_os("USERPROFILE")
+            .or_else(|| std::env::var_os("HOME"))
+            .map(PathBuf::from);
+        if let Some(bin) = home.map(|h| h.join(".gemini").join("bin")) {
+            for name in ["agy.exe", "agy"] {
+                let p = bin.join(name);
+                if !targets.contains(&p) {
+                    targets.push(p);
+                }
+            }
+        }
+    }
+
     targets.retain(|p| p.exists());
 
     // On Unix a CLI like `agy` is frequently a symlink in a PATH dir pointing at
