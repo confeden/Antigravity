@@ -174,7 +174,7 @@ dependencies = [
 
 [[package]]
 name = "ag_unlocker"
-version = "2.28.0"
+version = "2.28.2"
 dependencies = [
  "aes-gcm",
  "arboard",

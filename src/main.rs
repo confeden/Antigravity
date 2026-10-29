@@ -190,6 +190,11 @@ fn standard_install_candidates() -> Vec<PathBuf> {
         PathBuf::from(&local_appdata).join("Antigravity IDE"),
         PathBuf::from(&local_appdata).join("agy").join("bin"),
         PathBuf::from(&local_appdata).join("agy"),
+        // IDE 2.6.0 no longer bundles its language server: the extension
+        // downloads the `agy` backend here at first start.
+        PathBuf::from(env::var("USERPROFILE").unwrap_or_default())
+            .join(".gemini")
+            .join("bin"),
     ]
 }
 
@@ -228,6 +233,7 @@ fn standard_install_candidates() -> Vec<PathBuf> {
         v.push(h.join(".agy/bin"));
         v.push(h.join(".agy"));
         v.push(h.join(".local/share/agy/bin"));
+        v.push(h.join(".gemini/bin"));
     }
     v
 }
