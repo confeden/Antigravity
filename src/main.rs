@@ -56,7 +56,6 @@ mod user_state_location;
 pub mod group;
 mod utils;
 mod watchdog;
-mod wsl;
 #[path = "wsl_direct/api.rs"]
 mod wsl_api;
 #[path = "wsl_direct/controller.rs"]
