@@ -2,6 +2,7 @@
 name = "ag_unlocker"
 version = "2.28.2"
 edition = "2021"
+default-run = "ag_unlocker"
 description = "Antigravity Configuration Tool"
 authors = ["Brent t.me/nova_txt"]
 
@@ -12,6 +13,12 @@ hex = "0.4"
 regex = "1.10"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+# Existing transitive package: bounded binary registration-interface search.
+memchr = "=2.8.0"
+url = "=2.5.8"
+httparse = "=1.10.1"
+ring = "=0.17.14"
+ipnet = { version = "=2.12.2", default-features = false }
 rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
 webpki-roots = "1"
 # Decrypts the relay credential baked in by build.rs (owner build only; the
@@ -45,12 +52,18 @@ ratatui = { version = "0.30", default-features = false, features = ["crossterm"]
 # window ever opened, whichever adapter would have been chosen. D3D12 and its
 # software rasteriser WARP ship with every Windows 10, so nothing else is needed.
 [target.'cfg(windows)'.dependencies]
+windows = { version = "=0.62.2", features = ["Win32_Foundation", "Win32_System_Com", "Win32_System_Ole", "Win32_System_Variant", "Win32_System_TaskScheduler"] }
+# Already present in the lock/cache: typed native process/token/RunAs handles.
+windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Console", "Win32_System_Diagnostics_ToolHelp", "Win32_System_IO", "Win32_System_Pipes", "Win32_System_Registry", "Win32_System_Threading", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 eframe = { version = "0.36", default-features = false, features = ["accesskit", "default_fonts", "links", "wgpu_no_default_features", "glow"] }
 wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "wgsl", "dx12"] }
 
 [target.'cfg(not(windows))'.dependencies]
 # Linux has no DirectX: wgpu's default Vulkan + GL, then glow.
 eframe = { version = "0.36", features = ["glow"] }
+
+[target.'cfg(windows)'.dev-dependencies]
+winit = { version = "=0.30.13", default-features = false }
 
 [build-dependencies]
 winres = "0.1"
@@ -74,3 +87,7 @@ codegen-units = 1
 panic = "abort"
 strip = true
 
+
+# Private Linux launcher: directory-anchored I/O, liveness polling and fd execution.
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "=1.1.4", features = ["fs", "process", "event", "stdio", "runtime"] }

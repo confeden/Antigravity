@@ -31,16 +31,6 @@ use crate::utils::{powershell, powershell_within};
 // substituting a name, which is exactly how the tool broke. This module is back
 // to its one job: naming the interface those queries must leave through.
 
-/// Prefixes an earlier build pinned to the physical adapter. They are harmless
-/// but pointless, and the persistent ones outlive the tool, so cleanup drops
-/// them. Remove this once no installed build can still have written them.
-const LEGACY_PINNED_PREFIXES: &[&str] = &[
-    "111.88.96.50/32",
-    "111.88.96.51/32",
-    "2a00:ab00:1233:26::50/128",
-    "2a00:ab00:1233:26::51/128",
-];
-
 #[derive(Debug, Clone)]
 pub struct Egress {
     pub if_index: u32,
@@ -236,10 +226,15 @@ pub fn read() -> Reading {
 /// `Get-Process` wants the image name without its extension. Taken from the
 /// installed path rather than spelled out again, so the two cannot drift.
 fn relay_process_name() -> String {
+    #[cfg(windows)]
+    return crate::background::relay_process_name();
+    #[cfg(not(windows))]
+    {
     crate::background::installed_exe()
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "ag_dns".to_string())
+    }
 }
 
 fn parse_reading(line: &str) -> Reading {
@@ -330,37 +325,11 @@ pub fn vpn_verdict(egress: Option<&Egress>) -> (bool, ClientEgress) {
     (client == ClientEgress::Tunnel, client)
 }
 
-/// Drops the host routes an earlier build pinned. Deleted per interface rather
-/// than by prefix alone, so a route stranded on an adapter the machine no longer
-/// uses goes too; netsh cleans up whatever the cmdlet could not.
-pub fn remove_legacy_routes() {
-    let list = LEGACY_PINNED_PREFIXES
-        .iter()
-        .map(|p| format!("'{}'", p))
-        .collect::<Vec<_>>()
-        .join(",");
-    let cmd = format!(
-        "foreach ($d in @({})) {{ \
-           $fam=$(if ($d -like '*:*') {{'ipv6'}} else {{'ipv4'}}); \
-           foreach ($s in @('ActiveStore','PersistentStore')) {{ \
-             $st=$(if ($s -eq 'ActiveStore') {{'active'}} else {{'persistent'}}); \
-             foreach ($r in @(Get-NetRoute -DestinationPrefix $d -PolicyStore $s \
-                 -ErrorAction SilentlyContinue)) {{ \
-               Remove-NetRoute -DestinationPrefix $d -InterfaceIndex $r.ifIndex \
-                 -PolicyStore $s -Confirm:$false -ErrorAction SilentlyContinue; \
-               if (@(Get-NetRoute -DestinationPrefix $d -PolicyStore $s -ErrorAction SilentlyContinue | \
-                   Where-Object {{$_.ifIndex -eq $r.ifIndex}}).Count -gt 0) {{ \
-                 netsh interface $fam delete route prefix=$d interface=$($r.ifIndex) store=$st | Out-Null }} }} }} }}",
-        list
-    );
-    powershell(&cmd);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dns_client;
     use std::net::Ipv4Addr;
+    use crate::dns_client;
 
     #[test]
     fn egress_line_is_parsed() {

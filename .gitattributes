@@ -4,3 +4,7 @@
 *.sh text eol=lf
 *.desktop text eol=lf
 linux/README.md text eol=lf
+*.rs text eol=lf
+src/wsl_direct/policy_data/*.xml -text whitespace=-blank-at-eol
+src/wsl_direct/policy_data/IANA-LICENSING.html -text whitespace=-blank-at-eol
+src/wsl_direct/policy_data/ipnet-2.12.2.index.json -text whitespace=-blank-at-eol

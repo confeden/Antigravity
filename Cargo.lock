@@ -181,16 +181,25 @@ dependencies = [
  "eframe",
  "getrandom 0.2.17",
  "hex",
+ "httparse",
+ "ipnet",
+ "memchr",
  "obfstr",
  "ratatui",
  "regex",
+ "ring",
+ "rustix 1.1.4",
  "rustls",
  "serde",
  "serde_json",
  "sha2",
  "socket2",
+ "url",
  "webpki-roots",
  "wgpu",
+ "windows",
+ "windows-sys 0.61.2",
+ "winit",
  "winres",
 ]
 
@@ -1682,6 +1691,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
+name = "httparse"
+version = "1.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87"
+
+[[package]]
 name = "icu_collections"
 version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1845,6 +1860,12 @@ dependencies = [
  "quote",
  "syn 3.0.5",
 ]
+
+[[package]]
+name = "ipnet"
+version = "2.12.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "791930b43c0d5973160d90a8f3894509f2b273430f5c5c73b668636d0287c5c0"
 
 [[package]]
 name = "itertools"

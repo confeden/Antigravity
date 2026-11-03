@@ -219,8 +219,23 @@ fn path() -> Option<PathBuf> {
 }
 
 pub fn read() -> Option<Report> {
-    let raw = std::fs::read_to_string(path()?).ok()?;
-    serde_json::from_str(&raw).ok()
+    read_checked().ok().flatten()
+}
+
+/// Fresh report evidence: only a missing file means that no report exists.
+pub(crate) fn read_checked() -> Result<Option<Report>, String> {
+    let path = path().ok_or("relay report path unavailable")?;
+    checked_report(std::fs::read_to_string(path))
+}
+
+fn checked_report(raw: std::io::Result<String>) -> Result<Option<Report>, String> {
+    match raw {
+        Ok(raw) => serde_json::from_str(&raw)
+            .map(Some)
+            .map_err(|e| format!("invalid relay report: {e}")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("read relay report: {e}")),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -656,6 +671,16 @@ fn worth_sending(fresh: &View, shown: &View) -> bool {
 mod tests {
     use super::*;
     use crate::ls_log::Sighting;
+
+    #[test]
+    fn checked_report_distinguishes_missing_invalid_and_io_failure() {
+        let encoded = serde_json::to_string(&Report::default()).unwrap();
+        assert!(checked_report(Ok(encoded)).unwrap().is_some());
+        assert!(checked_report(Err(std::io::ErrorKind::NotFound.into())).unwrap().is_none());
+        assert!(checked_report(Err(std::io::ErrorKind::PermissionDenied.into())).is_err());
+        assert!(checked_report(Ok(String::new())).is_err());
+        assert!(checked_report(Ok("{".into())).is_err());
+    }
 
     fn seen(ago: u64, count: usize) -> Option<Sighting> {
         Some(Sighting {

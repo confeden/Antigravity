@@ -9,8 +9,12 @@ struct AsarHeader {
 }
 
 fn read_header(file: &mut File) -> Option<AsarHeader> {
+    read_header_checked(file).ok()
+}
+
+fn read_header_checked(file: &mut File) -> Result<AsarHeader, String> {
     let mut header_size_bytes = [0u8; 16];
-    file.read_exact(&mut header_size_bytes).ok()?;
+    file.read_exact(&mut header_size_bytes).map_err(|e| format!("ASAR header read: {e}"))?;
 
     let header_size = u32::from_le_bytes([
         header_size_bytes[4],
@@ -25,45 +29,60 @@ fn read_header(file: &mut File) -> Option<AsarHeader> {
         header_size_bytes[15],
     ]);
 
-    let mut header_bytes = vec![0u8; header_string_size as usize];
-    file.read_exact(&mut header_bytes).ok()?;
+    let file_size = file.metadata().map_err(|e| format!("ASAR metadata: {e}"))?.len();
+    let json_end = 16u64.checked_add(u64::from(header_string_size)).ok_or("ASAR header extent overflow")?;
+    let base_offset = u64::from(header_size).checked_add(8).ok_or("ASAR data offset overflow")?;
+    if json_end > base_offset || base_offset > file_size { return Err("ASAR header extent is outside the file".into()); }
+    let mut header_bytes = vec![0u8; usize::try_from(header_string_size).map_err(|_| "ASAR header size overflow")?];
+    file.read_exact(&mut header_bytes).map_err(|e| format!("ASAR JSON read: {e}"))?;
 
-    let header_json = String::from_utf8(header_bytes).ok()?;
-    let tree: serde_json::Value = serde_json::from_str(&header_json).ok()?;
+    let header_json = String::from_utf8(header_bytes).map_err(|_| "ASAR header is not UTF-8")?;
+    let tree: serde_json::Value = serde_json::from_str(&header_json).map_err(|e| format!("ASAR header JSON: {e}"))?;
+    if tree.get("files").and_then(|value| value.as_object()).is_none() { return Err("ASAR file tree is malformed".into()); }
 
-    Some(AsarHeader {
+    Ok(AsarHeader {
         tree,
-        base_offset: (header_size + 8) as u64,
+        base_offset,
     })
 }
 
 /// Reads a single file out of an asar archive without unpacking it.
 /// `rel_path` uses forward slashes, e.g. "dist/main.js".
 pub fn read_asar_entry(app_asar: &Path, rel_path: &str) -> Option<Vec<u8>> {
-    let mut file = File::open(app_asar).ok()?;
-    let header = read_header(&mut file)?;
+    read_asar_entry_checked(app_asar, rel_path).ok().flatten()
+}
+
+pub(crate) fn read_asar_entry_checked(app_asar: &Path, rel_path: &str) -> Result<Option<Vec<u8>>, String> {
+    let mut file = File::open(app_asar).map_err(|e| format!("ASAR open: {e}"))?;
+    let header = read_header_checked(&mut file)?;
 
     let mut node = &header.tree;
     for part in rel_path.split('/') {
-        node = node.get("files")?.get(part)?;
+        let files = node.get("files").and_then(|value| value.as_object()).ok_or("ASAR member parent is malformed")?;
+        let Some(found) = files.get(part) else { return Ok(None); };
+        node = found;
     }
 
     // Directories have no payload, and unpacked entries live on disk instead.
     if node.get("files").is_some() || node.get("unpacked").and_then(|u| u.as_bool()) == Some(true) {
-        return None;
+        return Err("ASAR member payload is a directory or unpacked".into());
     }
 
-    let size = node.get("size").and_then(|s| s.as_u64())?;
+    let size = node.get("size").and_then(|s| s.as_u64()).ok_or("ASAR member size is malformed")?;
     let offset = node
         .get("offset")
         .and_then(|o| o.as_str())
-        .and_then(|o| o.parse::<u64>().ok())?;
+        .and_then(|o| o.parse::<u64>().ok()).ok_or("ASAR member offset is malformed")?;
+    let start = header.base_offset.checked_add(offset).ok_or("ASAR member offset overflow")?;
+    let end = start.checked_add(size).ok_or("ASAR member extent overflow")?;
+    if end > file.metadata().map_err(|e| format!("ASAR member metadata: {e}"))?.len() {
+        return Err("ASAR member extent is outside the file".into());
+    }
 
-    file.seek(SeekFrom::Start(header.base_offset + offset))
-        .ok()?;
-    let mut buf = vec![0u8; size as usize];
-    file.read_exact(&mut buf).ok()?;
-    Some(buf)
+    file.seek(SeekFrom::Start(start)).map_err(|e| format!("ASAR member seek: {e}"))?;
+    let mut buf = vec![0u8; usize::try_from(size).map_err(|_| "ASAR member size overflow")?];
+    file.read_exact(&mut buf).map_err(|e| format!("ASAR member read: {e}"))?;
+    Ok(Some(buf))
 }
 
 fn extract_entry(
@@ -204,4 +223,26 @@ pub fn extract_asar(app_asar: &Path, app_dir: &Path) -> bool {
     }
 
     true
+}
+
+#[cfg(all(test, windows))]
+mod wsl_checked_reader_contract_cases {
+    use super::*;
+    use crate::wsl_discovery_contract_cases::{fixture_asar, fixture_dir, fixture_file};
+
+    #[test]
+    fn wsl_checked_asar_distinguishes_missing_from_invalid() {
+        let root = fixture_dir("asar");
+        let valid = root.join("valid.asar");
+        fixture_asar(&valid, r#"{"files":{"old.js":{"size":3,"offset":"0"}}}"#, b"old");
+        assert_eq!(read_asar_entry_checked(&valid, "old.js").unwrap(), Some(b"old".to_vec()));
+        assert_eq!(read_asar_entry_checked(&valid, "missing.js").unwrap(), None);
+        assert!(read_asar_entry_checked(&root.join("absent.asar"), "old.js").is_err());
+        let truncated = root.join("truncated.asar");
+        fixture_file(&truncated, b"short");
+        assert!(read_asar_entry_checked(&truncated, "old.js").is_err());
+        let malformed = root.join("malformed.asar");
+        fixture_asar(&malformed, r#"{"files":{"old.js":{"size":3,"offset":"bad"}}}"#, b"old");
+        assert!(read_asar_entry_checked(&malformed, "old.js").is_err());
+    }
 }

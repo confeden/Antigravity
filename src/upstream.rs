@@ -181,9 +181,14 @@ impl Route {
 
     pub(crate) fn probe_with(&self, probe_fn: impl FnOnce() -> Result<(), String>) {
         let started = Instant::now();
-        match probe_fn() {
+        let result = probe_fn();
+        self.record_probe(result, started.elapsed());
+    }
+
+    pub(crate) fn record_probe(&self, result: Result<(), String>, elapsed: Duration) {
+        match result {
             Ok(()) => {
-                crate::routes::record(self.kind, started.elapsed());
+                crate::routes::record(self.kind, elapsed);
                 self.health.revive("проверка прошла");
             }
             Err(why) => {
@@ -299,8 +304,16 @@ pub fn save(up: &Upstream) -> Result<(), String> {
     fs::write(&path, up.as_line()).map_err(|e| e.to_string())
 }
 
-pub fn clear() {
-    fs::remove_file(config_path()).ok();
+pub fn clear() -> Result<(), String> {
+    clear_path(&config_path())
+}
+
+fn clear_path(path: &std::path::Path) -> Result<(), String> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("Не удалось удалить сохранённый адрес своего прокси: {}", error)),
+    }
 }
 
 /// The configured proxy, or `None` when the user skipped the question.
@@ -351,7 +364,7 @@ fn basic(auth: &str) -> String {
 /// then hangs on the OS default - about 21 s on Windows - with a live client
 /// waiting behind it. The budget is spent across every candidate address rather
 /// than granted to each, so the whole step is bounded however many a name has.
-fn connect_within_budget(host: &str, port: u16, deadline: Instant) -> Result<TcpStream, String> {
+fn connect_within_budget(host: &str, port: u16, deadline: Instant, cancelled: Option<&std::sync::atomic::AtomicBool>) -> Result<TcpStream, String> {
     let addrs: Vec<_> = (host, port)
         .to_socket_addrs()
         .map_err(|e| format!("адрес не разрешается: {}", e))?
@@ -361,6 +374,9 @@ fn connect_within_budget(host: &str, port: u16, deadline: Instant) -> Result<Tcp
     }
     let mut last = String::from("время вышло");
     for addr in addrs {
+        if cancelled.is_some_and(|c| c.load(std::sync::atomic::Ordering::Acquire)) {
+            return Err("отменено".to_string());
+        }
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
             break;
@@ -387,12 +403,16 @@ fn connect_within_budget(host: &str, port: u16, deadline: Instant) -> Result<Tcp
 /// because that is the thing a waiting client experiences. Bounding each part
 /// separately is how three seconds of patience turns into fifteen (I43).
 pub fn open(up: &Upstream, host: &str, port: u16, budget: Duration) -> Result<TcpStream, String> {
+    open_with_cancellation(up, host, port, budget, None)
+}
+
+pub(crate) fn open_with_cancellation(up: &Upstream, host: &str, port: u16, budget: Duration, cancelled: Option<&std::sync::atomic::AtomicBool>) -> Result<TcpStream, String> {
     let deadline = Instant::now() + budget;
-    let mut sock = connect_within_budget(&up.host, up.port, deadline)?;
+    let mut sock = connect_within_budget(&up.host, up.port, deadline, cancelled)?;
     let left = || deadline.saturating_duration_since(Instant::now());
     // A zero timeout means "block forever" to the OS, so a spent budget has to be
     // an error here rather than a socket option.
-    if left().is_zero() {
+    if left().is_zero() || cancelled.is_some_and(|c| c.load(std::sync::atomic::Ordering::Acquire)) {
         return Err("прокси не ответил вовремя".to_string());
     }
     sock.set_read_timeout(Some(left())).ok();
@@ -406,12 +426,12 @@ pub fn open(up: &Upstream, host: &str, port: u16, budget: Duration) -> Result<Tc
     // proxy is handed Google's address instead of the name; the client's own
     // TLS still names the host, so nothing else changes.
     let target = crate::proxy::connect_target(up.host.as_str(), host);
-    let host = target.as_str();
-    let mut req = format!("CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n");
-    if let Some(a) = &up.auth {
-        req.push_str(&format!("Proxy-Authorization: Basic {}\r\n", basic(a)));
+    if left().is_zero() || cancelled.is_some_and(|c| c.load(std::sync::atomic::Ordering::Acquire)) {
+        return Err("отменено или время вышло".to_string());
     }
-    req.push_str("\r\n");
+    let host = target.as_str();
+    let encoded_basic = up.auth.as_ref().map(|a| basic(a));
+    let req = crate::connect_wire::format_request(host, port, encoded_basic.as_deref());
     sock.write_all(req.as_bytes())
         .map_err(|e| format!("не отправить CONNECT: {}", e))?;
 
@@ -423,7 +443,7 @@ pub fn open(up: &Upstream, host: &str, port: u16, budget: Duration) -> Result<Tc
         }
         // The socket timeout bounds one `read`; this bounds the loop, so a proxy
         // dribbling a byte at a time cannot outlast the budget by repeating.
-        if left().is_zero() {
+        if left().is_zero() || cancelled.is_some_and(|c| c.load(std::sync::atomic::Ordering::Acquire)) {
             return Err("прокси не ответил вовремя".to_string());
         }
         match sock.read(&mut byte) {
@@ -444,11 +464,7 @@ pub fn open(up: &Upstream, host: &str, port: u16, budget: Duration) -> Result<Tc
             Err(e) => return Err(format!("нет ответа: {}", e)),
         }
     }
-    let status = String::from_utf8_lossy(&head)
-        .lines()
-        .next()
-        .unwrap_or("")
-        .to_string();
+    let status = crate::connect_wire::response_view(&head).first_line;
     // Not `starts_with("HTTP/1.1 200")`: a CONNECT proxy is free to answer on
     // HTTP/1.0, and tinyproxy - which is what the built-in exits run - does.
     if !status.contains(" 200") {
@@ -463,6 +479,9 @@ pub fn open(up: &Upstream, host: &str, port: u16, budget: Duration) -> Result<Tc
             return Err(format!("прокси не пропускает этот хост: {}", host));
         }
         return Err(format!("прокси отказал: {}", status));
+    }
+    if left().is_zero() || cancelled.is_some_and(|c| c.load(std::sync::atomic::Ordering::Acquire)) {
+        return Err("отменено или время вышло".to_string());
     }
     // The budgets above bounded reaching the proxy and reading its answer. They
     // are mine, not the caller's, so the socket goes back clean - a caller that
@@ -662,6 +681,33 @@ pub fn region_is_blocked(loc: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn own_endpoint_unlink_failure_is_reported_and_retains_endpoint() {
+        use std::os::windows::fs::OpenOptionsExt;
+        // The compiler's manifest directory is this guard's frozen source
+        // fixture, never the actual application configuration directory.
+        let fixture = crate::wsl_discovery_contract_cases::fixture_dir("own-endpoint-unlink");
+        let path = fixture.join("upstream.txt");
+        let mut retained = fs::OpenOptions::new().write(true).create_new(true)
+            .share_mode(windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ)
+            .open(&path).unwrap();
+        let line = "synthetic:credential@192.0.2.1:8080";
+        retained.write_all(line.as_bytes()).unwrap();
+        retained.flush().unwrap();
+        let failed = clear_path(&path);
+        let preserved = fs::read_to_string(&path);
+        drop(retained);
+        let cleared = clear_path(&path);
+        let absent = clear_path(&path);
+        assert!(failed.is_err(), "failed unlink must not report success");
+        assert!(!failed.unwrap_err().contains(line), "error must not disclose endpoint credentials");
+        assert_eq!(parse(&preserved.unwrap()).unwrap(), parse(line).unwrap());
+        cleared.unwrap();
+        absent.unwrap();
+        assert!(!path.exists());
+    }
 
     /// Live: the P16 primitive reaches Cloudflare directly and reads the exit
     /// country. Ignored (needs the network); the point is that the direct

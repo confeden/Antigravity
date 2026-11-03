@@ -1,0 +1,65 @@
+// Generated offline by policy_data/generate.py from exact retained snapshots.
+// Candidate data only: this file does not supply trusted policy acceptance.
+#[rustfmt::skip]
+const IPNET_CHECKSUM: [u8; 32] = [0x79, 0x19, 0x30, 0xb4, 0x3c, 0x0d, 0x59, 0x73, 0x16, 0x0d, 0x90, 0xa8, 0xf3, 0x89, 0x45, 0x09, 0xf2, 0xb2, 0x73, 0x43, 0x0f, 0x5c, 0x5c, 0x73, 0xb6, 0x68, 0x63, 0x6d, 0x02, 0x87, 0xc5, 0xc0];
+#[rustfmt::skip]
+const ROW_BYTES_SHA256: [u8; 32] = [0xd3, 0x8f, 0x41, 0xba, 0x3d, 0xca, 0x86, 0x1f, 0x34, 0x79, 0xe2, 0x49, 0x70, 0x38, 0xdb, 0x35, 0xdf, 0x5c, 0x46, 0x25, 0x85, 0x77, 0x26, 0x08, 0x0e, 0x49, 0x1b, 0xf3, 0xf7, 0xbd, 0x84, 0x76];
+#[rustfmt::skip]
+const SOURCES: &[Source<'static>] = &[
+    Source { family: 4, url: "https://raw.githubusercontent.com/al8n/iprfc/v1.0.0/data/iana/iana-ipv4-special-registry.xml", updated: "2025-10-09", expected_hash: [0xcf, 0x24, 0xe1, 0x1f, 0x41, 0xb7, 0xd4, 0x2c, 0x68, 0xde, 0xbe, 0x2d, 0x18, 0xb9, 0x7c, 0xac, 0x81, 0x50, 0x84, 0xec, 0x41, 0x3e, 0xbb, 0x3b, 0x24, 0x4f, 0x70, 0x40, 0x28, 0xa1, 0x6f, 0x20], raw: include_bytes!("iana-ipv4-special-registry.xml") },
+    Source { family: 6, url: "https://raw.githubusercontent.com/al8n/iprfc/v1.0.0/data/iana/iana-ipv6-special-registry.xml", updated: "2025-10-09", expected_hash: [0xc1, 0x7f, 0x43, 0x80, 0xba, 0x84, 0xfb, 0x21, 0x60, 0xda, 0xe8, 0x2e, 0xbf, 0xd8, 0xbd, 0x15, 0x5a, 0x58, 0x53, 0xcf, 0xab, 0x62, 0x4e, 0xd3, 0xa9, 0xfd, 0x25, 0x16, 0x38, 0xa8, 0xbe, 0x02], raw: include_bytes!("iana-ipv6-special-registry.xml") },
+];
+#[rustfmt::skip]
+const RECORDS: &[Record<'static>] = &[
+    Record { network: IpNet::new_assert(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 8), flags: [Flag::False, Flag::False, Flag::False, Flag::True], termination: "" },
+    Record { network: IpNet::new_assert(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 32), flags: [Flag::False, Flag::False, Flag::False, Flag::True], termination: "" },
+    Record { network: IpNet::new_assert(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)), 8), flags: [Flag::True, Flag::True, Flag::False, Flag::False], termination: "" },
+    Record { network: IpNet::new_assert(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 0)), 10), flags: [Flag::True, Flag::True, Flag::False, Flag::False], termination: "" },
+    Record { network: IpNet::new_assert(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 0)), 8), flags: [Flag::False, Flag::False, Flag::False, Flag::True], termination: "" },
+    Record { network: IpNet::new_assert(IpAddr::V4(Ipv4Addr::new(169, 254, 0, 0)), 16), flags: [Flag::True, Flag::False, Flag::False, Flag::True], termination: "" },
+    Record { network: IpNet::new_assert(IpAddr::V4(Ipv4Addr::new(172, 16, 0, 0)), 12), flags: [Flag::True, Flag::True, Flag::False, Flag::False], termination: "" },
+    Record { network: IpNet::new_assert(IpAddr::V4(Ipv4Addr::new(192, 0, 0, 0)), 24), flags: [Flag::False, Flag::False, Flag::False, Flag::False], termination: "" },
+    Record { network: IpNet::new_assert(IpAddr::V4(Ipv4Addr::new(192, 0, 0, 0)), 29), flags: [Flag::True, Flag::True, Flag::False, Flag::False], termination: "" },
+    Record { network: IpNet::new_assert(IpAddr::V4(Ipv4Addr::new(192, 0, 0, 8)), 32), flags: [Flag::False, Flag::False, Flag::False, Flag::False], termination: "" },
+    Record { network: IpNet::new_assert(IpAddr::V4(Ipv4Addr::new(192, 0, 0, 9)), 32), flags: [Flag::True, Flag::True, Flag::True, Flag::False], termination: "" },
+    Record { network: IpNet::new_assert(IpAddr::V4(Ipv4Addr::new(192, 0, 0, 10)), 32), flags: [Flag::True, Flag::True, Flag::True, Flag::False], termination: "" },
+    Record { network: IpNet::new_assert(IpAddr::V4(Ipv4Addr::new(192, 0, 0, 170)), 32), flags: [Flag::False, Flag::False, Flag::False, Flag::True], termination: "" },
+    Record { network: IpNet::new_assert(IpAddr::V4(Ipv4Addr::new(192, 0, 0, 171)), 32), flags: [Flag::False, Flag::False, Flag::False, Flag::True], termination: "" },
+    Record { network: IpNet::new_assert(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 0)), 24), flags: [Flag::False, Flag::False, Flag::False, Flag::False], termination: "" },
+    Record { network: IpNet::new_assert(IpAddr::V4(Ipv4Addr::new(192, 31, 196, 0)), 24), flags: [Flag::True, Flag::True, Flag::True, Flag::False], termination: "" },
+    Record { network: IpNet::new_assert(IpAddr::V4(Ipv4Addr::new(192, 52, 193, 0)), 24), flags: [Flag::True, Flag::True, Flag::True, Flag::False], termination: "" },
+    Record { network: IpNet::new_assert(IpAddr::V4(Ipv4Addr::new(192, 88, 99, 0)), 24), flags: [Flag::Unknown, Flag::Unknown, Flag::Unknown, Flag::Unknown], termination: "2015-03" },
+    Record { network: IpNet::new_assert(IpAddr::V4(Ipv4Addr::new(192, 88, 99, 2)), 32), flags: [Flag::True, Flag::True, Flag::False, Flag::False], termination: "" },
+    Record { network: IpNet::new_assert(IpAddr::V4(Ipv4Addr::new(192, 168, 0, 0)), 16), flags: [Flag::True, Flag::True, Flag::False, Flag::False], termination: "" },
+    Record { network: IpNet::new_assert(IpAddr::V4(Ipv4Addr::new(192, 175, 48, 0)), 24), flags: [Flag::True, Flag::True, Flag::True, Flag::False], termination: "" },
+    Record { network: IpNet::new_assert(IpAddr::V4(Ipv4Addr::new(198, 18, 0, 0)), 15), flags: [Flag::True, Flag::True, Flag::False, Flag::False], termination: "" },
+    Record { network: IpNet::new_assert(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 0)), 24), flags: [Flag::False, Flag::False, Flag::False, Flag::False], termination: "" },
+    Record { network: IpNet::new_assert(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 0)), 24), flags: [Flag::False, Flag::False, Flag::False, Flag::False], termination: "" },
+    Record { network: IpNet::new_assert(IpAddr::V4(Ipv4Addr::new(240, 0, 0, 0)), 4), flags: [Flag::False, Flag::False, Flag::False, Flag::True], termination: "" },
+    Record { network: IpNet::new_assert(IpAddr::V4(Ipv4Addr::new(255, 255, 255, 255)), 32), flags: [Flag::True, Flag::False, Flag::False, Flag::True], termination: "" },
+    Record { network: IpNet::new_assert(IpAddr::V6(Ipv6Addr::new(0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0)), 128), flags: [Flag::False, Flag::False, Flag::False, Flag::True], termination: "" },
+    Record { network: IpNet::new_assert(IpAddr::V6(Ipv6Addr::new(0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1)), 128), flags: [Flag::False, Flag::False, Flag::False, Flag::True], termination: "" },
+    Record { network: IpNet::new_assert(IpAddr::V6(Ipv6Addr::new(0x0, 0x0, 0x0, 0x0, 0x0, 0xffff, 0x0, 0x0)), 96), flags: [Flag::False, Flag::False, Flag::False, Flag::True], termination: "" },
+    Record { network: IpNet::new_assert(IpAddr::V6(Ipv6Addr::new(0x64, 0xff9b, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0)), 96), flags: [Flag::True, Flag::True, Flag::True, Flag::False], termination: "" },
+    Record { network: IpNet::new_assert(IpAddr::V6(Ipv6Addr::new(0x64, 0xff9b, 0x1, 0x0, 0x0, 0x0, 0x0, 0x0)), 48), flags: [Flag::True, Flag::True, Flag::False, Flag::False], termination: "" },
+    Record { network: IpNet::new_assert(IpAddr::V6(Ipv6Addr::new(0x100, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0)), 64), flags: [Flag::True, Flag::True, Flag::False, Flag::False], termination: "" },
+    Record { network: IpNet::new_assert(IpAddr::V6(Ipv6Addr::new(0x100, 0x0, 0x0, 0x1, 0x0, 0x0, 0x0, 0x0)), 64), flags: [Flag::False, Flag::False, Flag::False, Flag::False], termination: "" },
+    Record { network: IpNet::new_assert(IpAddr::V6(Ipv6Addr::new(0x2001, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0)), 23), flags: [Flag::False, Flag::False, Flag::False, Flag::False], termination: "" },
+    Record { network: IpNet::new_assert(IpAddr::V6(Ipv6Addr::new(0x2001, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0)), 32), flags: [Flag::True, Flag::True, Flag::Unknown, Flag::False], termination: "" },
+    Record { network: IpNet::new_assert(IpAddr::V6(Ipv6Addr::new(0x2001, 0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1)), 128), flags: [Flag::True, Flag::True, Flag::True, Flag::False], termination: "" },
+    Record { network: IpNet::new_assert(IpAddr::V6(Ipv6Addr::new(0x2001, 0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x2)), 128), flags: [Flag::True, Flag::True, Flag::True, Flag::False], termination: "" },
+    Record { network: IpNet::new_assert(IpAddr::V6(Ipv6Addr::new(0x2001, 0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x3)), 128), flags: [Flag::True, Flag::True, Flag::True, Flag::False], termination: "" },
+    Record { network: IpNet::new_assert(IpAddr::V6(Ipv6Addr::new(0x2001, 0x2, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0)), 48), flags: [Flag::True, Flag::True, Flag::False, Flag::False], termination: "" },
+    Record { network: IpNet::new_assert(IpAddr::V6(Ipv6Addr::new(0x2001, 0x3, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0)), 32), flags: [Flag::True, Flag::True, Flag::True, Flag::False], termination: "" },
+    Record { network: IpNet::new_assert(IpAddr::V6(Ipv6Addr::new(0x2001, 0x4, 0x112, 0x0, 0x0, 0x0, 0x0, 0x0)), 48), flags: [Flag::True, Flag::True, Flag::True, Flag::False], termination: "" },
+    Record { network: IpNet::new_assert(IpAddr::V6(Ipv6Addr::new(0x2001, 0x10, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0)), 28), flags: [Flag::Unknown, Flag::Unknown, Flag::Unknown, Flag::Unknown], termination: "2014-03" },
+    Record { network: IpNet::new_assert(IpAddr::V6(Ipv6Addr::new(0x2001, 0x20, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0)), 28), flags: [Flag::True, Flag::True, Flag::True, Flag::False], termination: "" },
+    Record { network: IpNet::new_assert(IpAddr::V6(Ipv6Addr::new(0x2001, 0x30, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0)), 28), flags: [Flag::True, Flag::True, Flag::True, Flag::False], termination: "" },
+    Record { network: IpNet::new_assert(IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0)), 32), flags: [Flag::False, Flag::False, Flag::False, Flag::False], termination: "" },
+    Record { network: IpNet::new_assert(IpAddr::V6(Ipv6Addr::new(0x2002, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0)), 16), flags: [Flag::True, Flag::True, Flag::Unknown, Flag::False], termination: "" },
+    Record { network: IpNet::new_assert(IpAddr::V6(Ipv6Addr::new(0x2620, 0x4f, 0x8000, 0x0, 0x0, 0x0, 0x0, 0x0)), 48), flags: [Flag::True, Flag::True, Flag::True, Flag::False], termination: "" },
+    Record { network: IpNet::new_assert(IpAddr::V6(Ipv6Addr::new(0x3fff, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0)), 20), flags: [Flag::False, Flag::False, Flag::False, Flag::False], termination: "" },
+    Record { network: IpNet::new_assert(IpAddr::V6(Ipv6Addr::new(0x5f00, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0)), 16), flags: [Flag::True, Flag::True, Flag::False, Flag::False], termination: "" },
+    Record { network: IpNet::new_assert(IpAddr::V6(Ipv6Addr::new(0xfc00, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0)), 7), flags: [Flag::True, Flag::True, Flag::False, Flag::False], termination: "" },
+    Record { network: IpNet::new_assert(IpAddr::V6(Ipv6Addr::new(0xfe80, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0)), 10), flags: [Flag::True, Flag::False, Flag::False, Flag::True], termination: "" },
+];

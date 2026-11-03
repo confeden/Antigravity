@@ -1,0 +1,383 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<?xml-stylesheet type="text/xsl" href="iana-ipv6-special-registry.xsl"?>
+<?xml-model href="iana-ipv6-special-registry.rng" schematypens="http://relaxng.org/ns/structure/1.0" ?>
+<registry xmlns="http://www.iana.org/assignments" id="iana-ipv6-special-registry">
+  <title>IPv6 Special-Purpose Address Space</title>
+  <category>Internet Protocol version 6 (IPv6) Global Unicast Allocations</category>
+  <created>2006-01-10</created>
+  <updated>2025-10-09</updated>
+  
+  
+  
+  <registry id="iana-ipv6-special-registry-1">
+    <title>IPv6 Special-Purpose Address Space</title>
+    <xref type="rfc" data="rfc4773"/>
+    <xref type="rfc" data="rfc6890"/>
+    <xref type="rfc" data="rfc8190"/>
+    <registration_rule>IETF Review</registration_rule>
+    <note>Address prefixes listed in the Special-Purpose Address Registry are
+not guaranteed routability in any particular local or global context.
+
+The IPv4 and IPv6 Special-Purpose Address Registries maintain the following 
+information regarding each entry:
+
+   o  Address Block - A block of IPv4 or IPv6 addresses that has been
+      registered for a special purpose.
+
+   o  Name - A descriptive name for the special-purpose address block.
+
+   o  RFC - The RFC through which the special-purpose address block was
+      requested.
+
+   o  Allocation Date - The date upon which the special-purpose address
+      block was allocated.
+
+   o  Termination Date - The date upon which the allocation is to be
+      terminated.  This field is applicable for limited-use allocations
+      only.
+
+   o  Source - A boolean value indicating whether an address from the
+      allocated special-purpose address block is valid when used as the
+      source address of an IP datagram that transits two devices.
+
+   o  Destination - A boolean value indicating whether an address from
+      the allocated special-purpose address block is valid when used as
+      the destination address of an IP datagram that transits two
+      devices.
+
+   o  Forwardable - A boolean value indicating whether a router may
+      forward an IP datagram whose destination address is drawn from the
+      allocated special-purpose address block between external
+      interfaces.
+
+   o  Globally Reachable - A boolean value indicating whether an IP 
+      datagram whose destination address is drawn from the allocated 
+      special-purpose address block is forwardable beyond a specified 
+      administrative domain.
+
+   o  Reserved-by-Protocol - A boolean value indicating whether the
+      special-purpose address block is reserved by IP, itself.  This
+      value is "TRUE" if the RFC that created the special-purpose
+      address block requires all compliant IP implementations to behave
+      in a special way when processing packets either to or from
+      addresses contained by the address block.
+
+If the value of "Destination" is FALSE, the values of "Forwardable" and 
+"Globally Reachable" must also be false.
+
+</note>
+<note title="Formerly known as">IANA IPv6 Special-Purpose Address Registry (pursuant to <xref type="uri" data="https://datatracker.ietf.org/doc/narrative-minutes-interim-2025-iesg-18-202509181400/">IESG decision</xref>)</note>
+     <record>
+      <address>::1/128</address>
+      <name>Loopback Address</name>
+      <spec><xref type="rfc" data="rfc4291"/></spec>
+      <allocation>2006-02</allocation>
+      <source>False</source>
+      <destination>False</destination>
+      <forwardable>False</forwardable>
+      <global>False</global>
+      <reserved>True</reserved>
+    </record>   
+    
+    <record>
+      <address>::/128</address>
+      <name>Unspecified Address</name>
+      <spec><xref type="rfc" data="rfc4291"/></spec>
+      <allocation>2006-02</allocation>
+      <source>True</source>
+      <destination>False</destination>
+      <forwardable>False</forwardable>
+      <global>False</global>
+      <reserved>True</reserved>
+    </record>    
+    
+    <record>
+      <address>::ffff:0:0/96</address>
+      <name>IPv4-mapped Address</name>
+      <spec><xref type="rfc" data="rfc4291"/></spec>
+      <allocation>2006-02</allocation>
+      <source>False</source>
+      <destination>False</destination>
+      <forwardable>False</forwardable>
+      <global>False</global>
+      <reserved>True</reserved>
+    </record>
+    
+    <record>
+      <address>64:ff9b::/96</address>
+      <name>IPv4-IPv6 Translat.</name>
+      <spec><xref type="rfc" data="rfc6052"/></spec>
+      <allocation>2010-10</allocation>
+      <source>True</source>
+      <destination>True</destination>
+      <forwardable>True</forwardable>
+      <global>True</global>
+      <reserved>False</reserved>
+    </record>
+    
+    <record>
+      <address>64:ff9b:1::/48</address>
+      <name>IPv4-IPv6 Translat.</name>
+      <spec><xref type="rfc" data="rfc8215"/></spec>
+      <allocation>2017-06</allocation>
+      <source>True</source>
+      <destination>True</destination>
+      <forwardable>True</forwardable>
+      <global>False</global>
+      <reserved>False</reserved>
+    </record>
+ 
+     <record>
+      <address>100::/64</address>
+      <name>Discard-Only Address Block</name>
+      <spec><xref type="rfc" data="rfc6666"/></spec>
+      <allocation>2012-06</allocation>
+      <source>True</source>
+      <destination>True</destination>
+      <forwardable>True</forwardable>
+      <global>False</global>
+      <reserved>False</reserved>
+    </record>
+    
+    <record>
+      <address>100:0:0:1::/64</address>
+      <name>Dummy IPv6 Prefix</name>
+      <spec><xref type="rfc" data="rfc9780"/></spec>
+      <allocation>2025-04</allocation>
+      <source>True</source>
+      <destination>False</destination>
+      <forwardable>False</forwardable>
+      <global>False</global>
+      <reserved>False</reserved>
+    </record>  
+    
+    <record>
+      <address>2001::/23</address>
+      <name>IETF Protocol Assignments</name>
+      <spec><xref type="rfc" data="rfc2928"/></spec>
+      <allocation>2000-09</allocation>
+      <source>False <xref type="note" data="1"/></source>
+      <destination>False <xref type="note" data="1"/></destination>
+      <forwardable>False <xref type="note" data="1"/></forwardable>
+      <global>False <xref type="note" data="1"/></global>
+      <reserved>False</reserved>
+    </record>
+
+    <record>
+      <address>2001::/32</address>
+      <name>TEREDO</name>
+      <spec><xref type="rfc" data="rfc4380"/>
+        <xref type="rfc" data="rfc8190"/></spec>
+      <allocation>2006-01</allocation>
+      <source>True</source>
+      <destination>True</destination>
+      <forwardable>True</forwardable>
+      <global>N/A <xref type="note" data="2"/></global>
+      <reserved>False</reserved>
+    </record>     
+    
+    <record date="2015-10-29">
+      <address>2001:1::1/128</address>
+      <name>Port Control Protocol Anycast</name>
+      <spec><xref type="rfc" data="rfc7723"/></spec>
+      <allocation>2015-10</allocation>
+      <source>True</source>
+      <destination>True</destination>
+      <forwardable>True</forwardable>
+      <global>True</global>
+      <reserved>False</reserved>
+    </record>
+    
+    <record date="2017-02-23">
+      <address>2001:1::2/128</address>
+      <name>Traversal Using Relays around NAT Anycast</name>
+      <spec><xref type="rfc" data="rfc8155"/></spec>
+      <allocation>2017-02</allocation>
+      <source>True</source>
+      <destination>True</destination>
+      <forwardable>True</forwardable>
+      <global>True</global>
+      <reserved>False</reserved>
+    </record>
+
+    <record date="2024-04-12" updated="2024-09-05">
+      <address>2001:1::3/128</address>
+      <name>DNS-SD Service Registration Protocol Anycast</name>
+      <spec><xref type="rfc" data="rfc9665"/></spec>
+      <allocation>2024-04</allocation>
+      <source>True</source>
+      <destination>True</destination>
+      <forwardable>True</forwardable>
+      <global>True</global>
+      <reserved>False</reserved>
+    </record>
+    
+    <record>
+      <address>2001:2::/48</address>
+      <name>Benchmarking</name>
+      <spec><xref type="rfc" data="rfc5180"/><xref type="rfc-errata" data="1752"/></spec>
+      <allocation>2008-04</allocation>
+      <source>True</source>
+      <destination>True</destination>
+      <forwardable>True</forwardable>
+      <global>False</global>
+      <reserved>False</reserved>
+    </record>
+
+     <record date="2014-12-17">
+      <address>2001:3::/32</address>
+      <name>AMT</name>
+      <spec><xref type="rfc" data="rfc7450"/></spec>
+      <allocation>2014-12</allocation>
+      <source>True</source>
+      <destination>True</destination>
+      <forwardable>True</forwardable>
+      <global>True</global>
+      <reserved>False</reserved>
+    </record>
+
+     <record date="2014-12-17">
+      <address>2001:4:112::/48</address>
+      <name>AS112-v6</name>
+      <spec><xref type="rfc" data="rfc7535"/></spec>
+      <allocation>2014-12</allocation>
+      <source>True</source>
+      <destination>True</destination>
+      <forwardable>True</forwardable>
+      <global>True</global>
+      <reserved>False</reserved>
+    </record>
+    
+    <record>
+      <address>2001:10::/28</address>
+      <name>Deprecated (previously ORCHID)</name>
+      <spec><xref type="rfc" data="rfc4843"/></spec>
+      <allocation>2007-03</allocation>
+      <termination>2014-03</termination>
+      <source/>
+      <destination/>
+      <forwardable/>
+      <global/>
+      <reserved/>
+    </record>    
+    
+    <record date="2014-07-22">
+      <address>2001:20::/28</address>
+      <name>ORCHIDv2</name>
+      <spec><xref type="rfc" data="rfc7343"/></spec>
+      <allocation>2014-07</allocation>
+      <source>True</source>
+      <destination>True</destination>
+      <forwardable>True</forwardable>
+      <global>True</global>
+      <reserved>False</reserved>
+    </record>
+
+    <record date="2022-12-08" updated="2022-12-13">
+      <address>2001:30::/28 </address>
+      <name>Drone Remote ID Protocol Entity Tags (DETs) Prefix</name>
+      <spec><xref type="rfc" data="rfc9374"/></spec>
+      <allocation>2022-12</allocation>
+      <source>True</source>
+      <destination>True</destination>
+      <forwardable>True</forwardable>
+      <global>True</global>
+      <reserved>False</reserved>
+    </record>
+
+    <record>
+      <address>2001:db8::/32</address>
+      <name>Documentation</name>
+      <spec><xref type="rfc" data="rfc3849"/></spec>
+      <allocation>2004-07</allocation>
+      <source>False</source>
+      <destination>False</destination>
+      <forwardable>False</forwardable>
+      <global>False</global>
+      <reserved>False</reserved>
+    </record>  
+
+    <record>
+      <address>2002::/16 <xref type="note" data="3"/></address>
+      <name>6to4</name>
+      <spec><xref type="rfc" data="rfc3056"/></spec>
+      <allocation>2001-02</allocation>
+      <source>True</source>
+      <destination>True</destination>
+      <forwardable>True</forwardable>
+      <global>N/A <xref type="note" data="3"/></global>
+      <reserved>False</reserved>
+    </record>
+    
+    <record>
+      <address>2620:4f:8000::/48</address>
+      <name>Direct Delegation AS112 Service</name>
+      <spec><xref type="rfc" data="rfc7534"/></spec>
+      <allocation>2011-05</allocation>
+      <source>True</source>
+      <destination>True</destination>
+      <forwardable>True</forwardable>
+      <global>True</global>
+      <reserved>False</reserved>
+    </record>
+
+    <record>
+      <address>3fff::/20</address>
+      <name>Documentation</name>
+      <spec><xref type="rfc" data="rfc9637"/></spec>
+      <allocation>2024-07</allocation>
+      <source>False</source>
+      <destination>False</destination>
+      <forwardable>False</forwardable>
+      <global>False</global>
+      <reserved>False</reserved>
+    </record>
+    
+    <record>
+      <address>5f00::/16</address>
+      <name>Segment Routing (SRv6) SIDs</name>
+      <spec><xref type="rfc" data="rfc9602"/></spec>
+      <allocation>2024-04</allocation>
+      <source>True</source>
+      <destination>True</destination>
+      <forwardable>True</forwardable>
+      <global>False</global>
+      <reserved>False</reserved>
+    </record>
+
+    <record>
+      <address>fc00::/7</address>
+      <name>Unique-Local</name>
+      <spec><xref type="rfc" data="rfc4193"/>
+        <xref type="rfc" data="rfc8190"/></spec>
+      <allocation>2005-10</allocation>
+      <source>True</source>
+      <destination>True</destination>
+      <forwardable>True</forwardable>
+      <global>False <xref type="note" data="4"/></global>
+      <reserved>False</reserved>
+    </record>    
+    
+    <record>
+      <address>fe80::/10</address>
+      <name>Link-Local Unicast</name>
+      <spec><xref type="rfc" data="rfc4291"/></spec>
+      <allocation>2006-02</allocation>
+      <source>True</source>
+      <destination>True</destination>
+      <forwardable>False</forwardable>
+      <global>False</global>
+      <reserved>True</reserved>
+    </record> 
+
+  </registry>
+
+  
+  
+  <footnote anchor="1">Unless allowed by a more specific allocation.</footnote>
+  <footnote anchor="2">See Section 5 of <xref type="rfc" data="rfc4380"/> for details.</footnote>
+  <footnote anchor="3">See <xref type="rfc" data="rfc3056"/> for details.</footnote>
+  <footnote anchor="4">See <xref type="rfc" data="rfc4193"/> for more details on the routability of Unique-Local addresses.  The Unique-Local prefix is 
+drawn from the IPv6 Global Unicast Address range, but is specified as not globally routed.</footnote>
+  <people/>
+</registry>

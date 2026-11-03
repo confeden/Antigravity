@@ -18,8 +18,9 @@
 //!   watchdogs stop first and are put back afterwards.
 //! * **I39** — the legacy CA comes out *last*, and only once the relay is
 //!   current; pulling it from under an old relay kills every gate request.
-//! * **I45** — an undo path has no fast exit. Every step runs, each is judged on
-//!   its own, failures are collected. `?` between undo steps is the bug.
+//! * **I45** — a failed file undo stops later independent file effects, while
+//!   the background owner still receives its required service restoration.
+//!   Primary and restoration outcomes remain distinct.
 //! * **I52/I53/I54** — the proxy variable is written only after the legacy pair
 //!   is gone, no foreign proxy exists, the rename landed, and something actually
 //!   answers on the port.
@@ -34,6 +35,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
 use std::time::Duration;
 
 use crate::settings::Settings;
@@ -188,6 +190,7 @@ pub struct ProviderRow {
 /// A whole-system snapshot. Produced on the worker, rendered on the UI thread.
 #[derive(Debug, Clone)]
 pub struct Status {
+    pub wsl: crate::wsl_api::WslStatus,
     pub admin: bool,
     pub installs: Vec<InstallRow>,
     pub client_patch: State,
@@ -291,10 +294,21 @@ pub enum Event {
     /// `Some(what)` while an action runs, `None` when the queue drains. The UI
     /// dims the switches in between so a second click cannot queue a race.
     Busy(Option<String>),
+    /// Every owned GUI operation actually settled and Settings were saved.
+    ShutdownReady,
 }
 
 /// UI → worker.
 pub enum Cmd {
+    RequestElevation,
+    #[cfg(windows)]
+    Elevate(crate::instances::GuiReplacementAction),
+    SetWslEnabled(bool),
+    SetWslDistro { name: String, selected: bool },
+    RefreshWsl,
+    ApplySettings,
+    CancelWsl,
+    Shutdown,
     /// The key was accepted and the main screen is up. Auto-patch may act from
     /// here on, never before: the first scan runs under the licence screen, and
     /// patching from there would hand the patch to anyone without a key.
@@ -349,19 +363,170 @@ pub enum Cmd {
 
 pub struct Worker {
     tx: Sender<Cmd>,
+    lifetime: Arc<GuiLifetime>,
+}
+
+#[cfg(test)]
+pub(crate) fn layout_test_worker(lifetime: Arc<GuiLifetime>) -> (Worker, Receiver<Cmd>) {
+    let (tx, rx) = mpsc::channel();
+    (Worker { tx, lifetime }, rx)
+}
+
+/// Main-owned custody across GUI/TUI shutdown and renderer return. This holds
+/// actual handles, not a second status/settings store.
+#[derive(Default)]
+pub struct GuiLifetime {
+    worker: Mutex<Option<std::thread::JoinHandle<()>>>,
+    command: Mutex<Option<Sender<Cmd>>>,
+    shutdown_ready: AtomicBool,
+    save_failed: AtomicBool,
+    started: AtomicBool,
+    abort_requested: AtomicBool,
+    channel_lost: AtomicBool,
+    handoff_requested: AtomicBool,
+    arming_started: AtomicBool,
+    handoff_committed: AtomicBool,
+    failure: Mutex<Option<String>>,
+    bootstrap_hold: Mutex<Option<String>>,
+    #[cfg(windows)]
+    replacement: Mutex<Option<crate::instances::GuiReplacementReady>>,
+    #[cfg(windows)]
+    action: Mutex<Option<crate::instances::GuiReplacementAction>>,
+}
+impl GuiLifetime {
+    pub(crate) fn hold_automatic_effects(&self, reason: String) -> Result<(), String> {
+        *self.bootstrap_hold.lock().map_err(|_| "GUI startup hold receiving lock poisoned")? = Some(reason);
+        Ok(())
+    }
+    pub(crate) fn fallback_hold(&self) -> Option<String> {
+        match self.bootstrap_hold.lock() {
+            Ok(hold) => hold.clone(),
+            Err(_) => Some("Не удалось получить ограничение автоматического запуска.".into()),
+        }
+    }
+    fn clear_automatic_hold(&self) -> Result<(), String> {
+        *self.bootstrap_hold.lock().map_err(|_| "GUI startup hold lock poisoned")? = None;
+        Ok(())
+    }
+    #[cfg(windows)]
+    pub(crate) fn receive_action(&self, action: crate::instances::GuiReplacementAction) -> Result<(), String> {
+        let mut slot = self.action.lock().map_err(|_| "GUI action receiving lock poisoned")?;
+        if slot.is_some() { return Err("GUI action already received".into()); }
+        *slot = Some(action);
+        Ok(())
+    }
+    pub fn request_shutdown(&self) {
+        self.save_failed.store(false, Ordering::SeqCst);
+        self.abort_requested.store(true, Ordering::SeqCst);
+        if let Ok(command) = self.command.lock() {
+            if let Some(command) = command.as_ref() { let _ = command.send(Cmd::Shutdown); }
+        }
+    }
+    /// Event loops may retire on true. This never sends COMMIT: Main owns the
+    /// final exit corridor after the renderer/terminal loop has returned.
+    pub fn poll_close(&self) -> Result<bool, String> {
+        if self.save_failed.load(Ordering::SeqCst) { return Err("настройки не сохранены; повторите закрытие после устранения ошибки".into()); }
+        if let Some(error) = self.failure.lock().map_err(|_| "worker failure observation poisoned")?.as_ref() {
+            return Err(error.clone());
+        }
+        let mut worker = self.worker.lock().map_err(|_| "worker custody lock poisoned")?;
+        if let Some(job) = worker.as_ref() {
+            if !job.is_finished() { return Ok(false); }
+            if worker.take().unwrap().join().is_err() {
+                let error = "worker did not return a received shutdown outcome".to_owned();
+                *self.failure.lock().map_err(|_| "worker failure observation poisoned")? = Some(error.clone());
+                return Err(error);
+            }
+        }
+        if self.started.load(Ordering::SeqCst) && !self.shutdown_ready.load(Ordering::SeqCst) {
+            return Err("worker returned before saved/settled shutdown receiving".into());
+        }
+        Ok(true)
+    }
+    pub(crate) fn can_retry_renderer(&self) -> bool {
+        if self.started.load(Ordering::SeqCst) || self.abort_requested.load(Ordering::SeqCst)
+            || self.handoff_requested.load(Ordering::SeqCst) || self.fallback_hold().is_some() { return false; }
+        true
+    }
+    pub(crate) fn can_start_fallback(&self) -> bool {
+        if !self.can_retry_renderer() { return false; }
+        #[cfg(windows)]
+        if self.action.lock().map_or(true, |action| action.is_some()) { return false; }
+        true
+    }
+    pub(crate) fn request_final_retirement(&self) {
+        if !self.shutdown_ready.load(Ordering::SeqCst) { self.request_shutdown(); }
+    }
+    pub(crate) fn save_retry_pending(&self) -> bool { self.save_failed.load(Ordering::SeqCst) }
+    pub(crate) fn finalize_exit(&self) -> Result<bool, String> {
+        if !self.poll_close()? { return Ok(false); }
+        #[cfg(windows)]
+        {
+            let mut slot = self.replacement.lock().map_err(|_| "replacement custody lock poisoned")?;
+            if let Some(replacement) = slot.as_mut() {
+                if self.handoff_committed.load(Ordering::SeqCst) { return Ok(true); }
+                if self.abort_requested.load(Ordering::SeqCst) && !self.arming_started.load(Ordering::SeqCst) {
+                    replacement.request_abort()?;
+                    if !replacement.poll_retired()? { return Ok(false); }
+                    slot.take();
+                    return Ok(true);
+                }
+                // The helper marks its own possible COMMIT before writing. A
+                // failed/uncertain write must never turn back into an abort.
+                self.arming_started.store(true, Ordering::SeqCst);
+                match replacement.arm_for_exit() {
+                    Ok(true) => {
+                        self.handoff_committed.store(true, Ordering::SeqCst);
+                        return Ok(true);
+                    }
+                    Ok(false) => {},
+                    Err(error) => {
+                        if self.abort_requested.load(Ordering::SeqCst) && replacement.poll_retired()? {
+                            slot.take();
+                            return Ok(true);
+                        }
+                        return Err(error);
+                    }
+                }
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+    pub fn replacement_committed(&self) -> bool { self.handoff_committed.load(Ordering::SeqCst) }
+    #[cfg(windows)]
+    fn accept_replacement(&self, ready: crate::instances::GuiReplacementReady) -> Result<(), crate::instances::GuiReplacementReady> {
+        match self.replacement.lock() {
+            Ok(mut slot) if slot.is_none() => {
+                *slot = Some(ready);
+                self.handoff_requested.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+            _ => Err(ready),
+        }
+    }
 }
 
 impl Worker {
     pub fn send(&self, cmd: Cmd) {
+        if matches!(&cmd, Cmd::Shutdown | Cmd::Stop) {
+            self.lifetime.request_shutdown();
+            return;
+        }
         // A closed worker means the app is going down; there is nothing useful
         // to do about it and nothing to tell the user.
         let _ = self.tx.send(cmd);
     }
 }
+impl Drop for Worker {
+    fn drop(&mut self) {
+        if !self.lifetime.shutdown_ready.load(Ordering::SeqCst) { self.lifetime.request_shutdown(); }
+    }
+}
 
 /// Starts the worker. `wake` is called after every event so the UI thread
 /// repaints — egui sleeps until something asks it not to.
-pub fn spawn(events: Sender<Event>, wake: Box<dyn Fn() + Send>) -> Worker {
+pub fn spawn(events: Sender<Event>, wake: Box<dyn Fn() + Send>, lifetime: Arc<GuiLifetime>) -> Worker {
     let (tx, rx) = mpsc::channel::<Cmd>();
     // The worker keeps a sender of its own, for the one job it hands to a
     // thread and gets an answer back from (`RemeasureVpn`). It means the
@@ -369,11 +534,32 @@ pub fn spawn(events: Sender<Event>, wake: Box<dyn Fn() + Send>) -> Worker {
     // its `Worker` — which costs nothing here, because the window closing is the
     // process exiting.
     let own = tx.clone();
-    std::thread::Builder::new()
+    let mut worker_slot = match lifetime.worker.lock() {
+        Ok(slot) => slot,
+        Err(_) => {
+            let _ = events.send(Event::Log(Level::Err, "Не удалось получить владение рабочим потоком.".into()));
+            return Worker { tx, lifetime: lifetime.clone() };
+        }
+    };
+    if worker_slot.is_some() {
+        let _ = events.send(Event::Log(Level::Err, "Предыдущий рабочий поток ещё удерживается владельцем окна.".into()));
+        return Worker { tx, lifetime: lifetime.clone() };
+    }
+    let worker_lifetime = lifetime.clone();
+    let failure_events = events.clone();
+    let started = std::thread::Builder::new()
         .name("ops".to_string())
-        .spawn(move || run_worker(rx, own, events, wake))
-        .ok();
-    Worker { tx }
+        .spawn(move || run_worker(rx, own, events, wake, worker_lifetime));
+    match started {
+        Ok(job) => {
+            *worker_slot = Some(job);
+            lifetime.started.store(true, Ordering::SeqCst);
+            if let Ok(mut command) = lifetime.command.lock() { *command = Some(tx.clone()); }
+        }
+        Err(error) => { let _ = failure_events.send(Event::Log(Level::Err, format!("Рабочий поток не запущен: {error}"))); }
+    }
+    drop(worker_slot);
+    Worker { tx, lifetime }
 }
 
 // ---------------------------------------------------------------------------
@@ -382,8 +568,17 @@ pub fn spawn(events: Sender<Event>, wake: Box<dyn Fn() + Send>) -> Worker {
 
 struct Ctx {
     events: Sender<Event>,
-    wake: Box<dyn Fn() + Send>,
+    wake: Arc<Mutex<Box<dyn Fn() + Send>>>,
     settings: Settings,
+    wsl: crate::wsl_controller::WslController,
+    native_apply_pending: Arc<AtomicBool>,
+    native_cancel: Arc<AtomicBool>,
+    #[cfg(windows)]
+    background_receivings: Vec<background::BackgroundReceiving>,
+    lifetime: Arc<GuiLifetime>,
+    vpn_job: Option<std::thread::JoinHandle<()>>,
+    vpn_unsettled: bool,
+    startup: Startup,
     /// Whether the *proxy variable* rename landed in this session's patch run.
     ///
     /// Not a process-wide flag: the console build died after one run, so a
@@ -420,6 +615,21 @@ struct Ctx {
     /// user: only then does letting go of the last route switch it off again.
     carrier_set_proxy: bool,
 }
+enum Startup {
+    Ordinary,
+    Explicit,
+    Held(String),
+    #[cfg(windows)]
+    Resume(crate::instances::GuiApplyContinuation),
+}
+
+enum NativeCompletion {
+    Retired,
+    #[cfg(windows)]
+    NeedsElevation(crate::instances::GuiApplyContinuation),
+    #[cfg(windows)]
+    Held(String),
+}
 
 /// How much of the system a refresh is allowed to ask about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -438,12 +648,12 @@ enum Scan {
 
 impl Ctx {
     fn log(&self, level: Level, msg: impl Into<String>) {
-        let _ = self.events.send(Event::Log(level, msg.into()));
-        (self.wake)();
+        if self.events.send(Event::Log(level, msg.into())).is_err() { self.lifetime.channel_lost.store(true, Ordering::SeqCst); }
+        if let Ok(wake) = self.wake.lock() { (wake)(); }
     }
     fn busy(&self, what: Option<&str>) {
-        let _ = self.events.send(Event::Busy(what.map(|s| s.to_string())));
-        (self.wake)();
+        if self.events.send(Event::Busy(what.map(|s| s.to_string()))).is_err() { self.lifetime.channel_lost.store(true, Ordering::SeqCst); }
+        if let Ok(wake) = self.wake.lock() { (wake)(); }
     }
 }
 
@@ -452,16 +662,44 @@ impl Ctx {
 /// racing produce the same answer twice at twice the cost.
 static MEASURING_VPN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+fn receive_wsl_refresh_command(requested: &mut bool, command: &Option<Cmd>) -> bool {
+    match command {
+        Some(Cmd::RefreshWsl) => { *requested = true; true }
+        Some(Cmd::CancelWsl | Cmd::Shutdown | Cmd::Stop) => { *requested = false; false }
+        _ => false,
+    }
+}
+
+// Consume one coalesced presentation request only when the existing owner can start it.
+fn take_wsl_refresh(requested: &mut bool, available: bool, command: &Option<Cmd>, first_command: &Option<Cmd>) -> bool {
+    if *requested && available && command.is_none() && first_command.is_none() { *requested = false; true } else { false }
+}
+
 fn run_worker(
     rx: Receiver<Cmd>,
     own: Sender<Cmd>,
     events: Sender<Event>,
     wake: Box<dyn Fn() + Send>,
+    lifetime: Arc<GuiLifetime>,
 ) {
+    let owner_events = events.clone();
+    let owner_wake = Arc::new(Mutex::new(wake));
+    let native_apply_pending = Arc::new(AtomicBool::new(false));
+    let native_cancel = Arc::new(AtomicBool::new(false));
+    let Some((settings, startup, mut first_command)) = worker_boot(&rx, &owner_events, &owner_wake, &lifetime) else { return; };
     let mut ctx = Ctx {
         events,
-        wake,
-        settings: Settings::load(),
+        wake: owner_wake.clone(),
+        settings,
+        wsl: crate::wsl_controller::WslController::default(),
+        native_apply_pending: native_apply_pending.clone(),
+        native_cancel: native_cancel.clone(),
+        #[cfg(windows)]
+        background_receivings: Vec::new(),
+        lifetime: lifetime.clone(),
+        vpn_job: None,
+        vpn_unsettled: false,
+        startup,
         proxy_var_carried: None,
         proxy_var_retryable: false,
         patched_seen: HashMap::new(),
@@ -472,32 +710,272 @@ fn run_worker(
         carrier_set_proxy: false,
     };
 
-    settle_decline(&mut ctx);
-    startup_housekeeping(&mut ctx);
+    if matches!(ctx.startup, Startup::Ordinary) {
+        settle_decline(&mut ctx);
+        startup_housekeeping(&mut ctx);
+    }
 
     // The first snapshot is deep: the window opens on the licence screen, so
     // reading the binaries costs the user nothing here and the main screen is
     // already truthful when it appears.
     push_status(&mut ctx, Scan::Deep);
 
-    while let Ok(cmd) = rx.recv() {
+    let shared = Arc::new(Mutex::new(ctx));
+    let mut native_job: Option<std::thread::JoinHandle<Result<NativeCompletion, String>>> = None;
+    let mut shutdown = false;
+    let mut refresh_requested = cfg!(windows);
+    let mut native_unsettled = false;
+    #[cfg(windows)]
+    let mut elevation_progress: Option<Receiver<crate::instances::ElevationProgress>> = None;
+    loop {
+        let mut native_finished = false;
+        #[cfg(windows)]
+        let mut native_hold = None;
+        #[cfg(windows)]
+        if let Some(progress) = elevation_progress.as_ref() {
+            while let Ok(progress) = progress.try_recv() {
+                let event = match progress {
+                    crate::instances::ElevationProgress::WaitingForConsent => Event::Busy(Some("Ожидание подтверждения администратора".into())),
+                    crate::instances::ElevationProgress::WaitingForReplacement => Event::Busy(Some("Подготовка нового окна".into())),
+                    crate::instances::ElevationProgress::ObservationPending(error) => Event::Log(Level::Warn, format!("Ожидается завершение передачи окна: {error}")),
+                };
+                if owner_events.send(event).is_err() { lifetime.channel_lost.store(true, Ordering::SeqCst); }
+                if let Ok(wake) = owner_wake.lock() { (wake)(); }
+            }
+        }
+        let mut command = if let Some(command) = first_command.take() { Some(command) } else { match rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(command) => Some(command),
+            Err(mpsc::RecvTimeoutError::Timeout) => None,
+            Err(mpsc::RecvTimeoutError::Disconnected) => { shutdown = true; None },
+        } };
+        if receive_wsl_refresh_command(&mut refresh_requested, &command) { command = None; }
+        if native_job.as_ref().is_some_and(|job| job.is_finished()) {
+            match native_job.take().unwrap().join() {
+                Ok(Ok(completion)) => {
+                    native_apply_pending.store(false, Ordering::SeqCst);
+                    native_finished = true;
+                    match completion {
+                        NativeCompletion::Retired => {},
+                        #[cfg(windows)]
+                        NativeCompletion::NeedsElevation(intent) => {
+                            if !native_cancel.load(Ordering::SeqCst)
+                                && !lifetime.abort_requested.load(Ordering::SeqCst)
+                                && !lifetime.channel_lost.load(Ordering::SeqCst) {
+                                first_command = Some(Cmd::Elevate(crate::instances::GuiReplacementAction::ResumeApply(intent)));
+                            }
+                        },
+                        #[cfg(windows)]
+                        NativeCompletion::Held(reason) => native_hold = Some(reason),
+                    }
+                },
+                Ok(Err(error)) => {
+                    native_apply_pending.store(false, Ordering::SeqCst);
+                    native_finished = true;
+                    let _ = owner_events.send(Event::Log(Level::Err, error));
+                }
+                Err(_) => {
+                    native_unsettled = true;
+                    let _ = owner_events.send(Event::Log(Level::Err, "Наблюдение применения прервано; требуется восстановление.".into()));
+                }
+            }
+            #[cfg(windows)]
+            { elevation_progress = None; }
+        }
+        if lifetime.abort_requested.load(Ordering::SeqCst) || lifetime.channel_lost.load(Ordering::SeqCst) {
+            native_cancel.store(true, Ordering::SeqCst);
+            shutdown = true;
+        }
+        if lifetime.handoff_requested.load(Ordering::SeqCst) { shutdown = true; }
+        if native_job.is_some() || native_unsettled {
+            match command {
+                Some(Cmd::CancelWsl) => native_cancel.store(true, Ordering::SeqCst),
+                Some(Cmd::Shutdown | Cmd::Stop) => { native_cancel.store(true, Ordering::SeqCst); shutdown = true; },
+                Some(Cmd::Probed { .. }) => MEASURING_VPN.store(false, Ordering::SeqCst),
+                Some(_) => { let _ = owner_events.send(Event::Log(Level::Warn, "Подождите завершения применения настроек.".into())); },
+                None => {},
+            }
+            if let Ok(wake) = owner_wake.lock() { (wake)(); }
+            continue;
+        }
+        let mut ctx = match shared.lock() {
+            Ok(ctx) => ctx,
+            Err(_) => { native_unsettled = true; continue; },
+        };
+        #[cfg(windows)]
+        if let Some(reason) = native_hold { hold_apply(&mut ctx, reason); }
+        if ctx.vpn_job.as_ref().is_some_and(|job| job.is_finished()) {
+            if ctx.vpn_job.take().unwrap().join().is_err() {
+                ctx.vpn_unsettled = true;
+                ctx.log(Level::Err, "Наблюдение проверки сети прервано; завершение не подтверждено.");
+            }
+        }
+        if native_finished {
+            push_status(&mut ctx, Scan::Settings);
+            if !ctx.wsl.is_pending() && !lifetime.handoff_requested.load(Ordering::SeqCst) { ctx.busy(None); }
+        }
+        if ctx.wsl.poll() {
+            push_status(&mut ctx, Scan::Settings);
+            if !ctx.wsl.is_pending() { ctx.busy(None); }
+            #[cfg(windows)]
+            if ctx.wsl.take_elevation_request() && !shutdown
+                && !native_cancel.load(Ordering::SeqCst) {
+                ctx.log(Level::Err, "Права изменились после начала применения. Оставшиеся действия WSL остановлены; проверьте результат и повторите «Применить».");
+            }
+        }
+        if shutdown {
+            ctx.wsl.request_cancel();
+            if finish_shutdown(&mut ctx, &lifetime) { return; }
+            continue;
+        }
+        if take_wsl_refresh(&mut refresh_requested, !ctx.wsl.is_pending(), &command, &first_command) {
+            if let Err(error) = ctx.wsl.request_discovery() { ctx.log(Level::Warn, error); }
+            push_status(&mut ctx, Scan::Settings);
+        }
+        let Some(cmd) = command else { continue; };
+        if matches!(ctx.startup, Startup::Held(_)) && !matches!(&cmd, Cmd::Shutdown | Cmd::Stop | Cmd::CancelWsl) {
+            if !genuine_command(&cmd) { continue; }
+            if crate::settings::saved_intent_sha256(&ctx.settings).is_err() {
+                if let Some(display) = saved_display() { ctx.settings = display; push_status(&mut ctx, Scan::Settings); }
+                ctx.log(Level::Err, "Настройки снова изменились; автоматическое применение не выполняется.");
+                continue;
+            }
+            if let Err(error) = lifetime.clear_automatic_hold() { ctx.log(Level::Err, error); continue; }
+            ctx.startup = Startup::Explicit;
+            ctx.log(Level::Info, "Принят новый выбор пользователя; прежнее продолжение не повторяется.");
+        }
+        if ctx.wsl.is_applying() && !matches!(&cmd, Cmd::CancelWsl | Cmd::Shutdown | Cmd::Stop | Cmd::Probed { .. }) {
+            ctx.log(Level::Warn, "Подождите завершения подготовки WSL.");
+            continue;
+        }
         match cmd {
-            Cmd::Stop => return,
+            Cmd::RequestElevation => {
+                #[cfg(windows)]
+                { first_command = Some(Cmd::Elevate(crate::instances::GuiReplacementAction::ShowMain {})); }
+                #[cfg(not(windows))]
+                ctx.log(Level::Warn, "Передача Windows-окна недоступна на этой платформе.");
+            },
+            #[cfg(windows)]
+            Cmd::Elevate(action) => {
+                #[cfg(windows)]
+                {
+                    if ctx.wsl.is_pending() || ctx.vpn_job.is_some() || ctx.vpn_unsettled {
+                        ctx.log(Level::Warn, "Дождитесь завершения текущей операции перед передачей окна.");
+                        continue;
+                    }
+                    match &action {
+                        crate::instances::GuiReplacementAction::ShowMain {} => {
+                            if !ctx.settings.save() { ctx.log(Level::Err, "Настройки не сохранены; новое окно не запущено."); continue; }
+                        },
+                        crate::instances::GuiReplacementAction::ResumeApply(intent) => {
+                            let _ = intent; // Receiving stays inside the owned cancellable job.
+                        }
+                    };
+                    let (progress, received) = mpsc::channel();
+                    elevation_progress = Some(received);
+                    native_cancel.store(false, Ordering::SeqCst);
+                    native_apply_pending.store(true, Ordering::SeqCst);
+                    ctx.busy(Some("Подготовка передачи окна"));
+                    push_status(&mut ctx, Scan::Settings);
+                    let cancellation = native_cancel.clone();
+                    let lifetime = lifetime.clone();
+                    native_job = match std::thread::Builder::new().name("gui-elevation".into()).spawn(move || {
+                        if let crate::instances::GuiReplacementAction::ResumeApply(intent) = &action {
+                            if let Err(error) = receive_apply_continuation(intent, &cancellation) {
+                                return Ok(NativeCompletion::Held(format!("Данные применения изменились; передача остановлена: {error}")));
+                            }
+                        }
+                        if cancellation.load(Ordering::SeqCst) { return Ok(NativeCompletion::Retired); }
+                        let mut ready = crate::instances::request_elevation(action, cancellation.clone(), progress.clone())?;
+                        if cancellation.load(Ordering::SeqCst) {
+                            retire_replacement(&mut ready, &progress);
+                            return Ok(NativeCompletion::Retired);
+                        }
+                        if let Err(mut ready) = lifetime.accept_replacement(ready) {
+                            retire_replacement(&mut ready, &progress);
+                            return Err("Передача окна не принята; новое окно завершено.".into());
+                        }
+                        Ok(NativeCompletion::Retired)
+                    }) {
+                        Ok(job) => Some(job),
+                        Err(error) => {
+                            native_apply_pending.store(false, Ordering::SeqCst);
+                            elevation_progress = None;
+                            ctx.log(Level::Err, format!("Не удалось начать передачу окна: {error}"));
+                            ctx.busy(None);
+                            push_status(&mut ctx, Scan::Settings);
+                            None
+                        }
+                    };
+                }
+            },
+            Cmd::Stop | Cmd::Shutdown => { ctx.wsl.request_cancel(); shutdown = true; },
+            Cmd::CancelWsl => ctx.wsl.request_cancel(),
+            Cmd::RefreshWsl => unreachable!("refresh is latched before busy handling"),
+            Cmd::SetWslEnabled(enabled) => {
+                if wsl_status(&ctx).pending { ctx.log(Level::Warn, "Дождитесь завершения операции WSL."); continue; }
+                let mut wanted = ctx.settings.clone();
+                wanted.wsl = Some(crate::wsl_api::WslPreferences { enabled,
+                    distros: wanted.wsl.as_ref().map(|p| p.distros.clone()).unwrap_or_default() });
+                if wanted.save() { ctx.settings = wanted; }
+                else { ctx.log(Level::Err, "Настройки WSL не сохранились; выбор не изменён."); }
+                push_status(&mut ctx, Scan::Settings);
+            },
+            Cmd::SetWslDistro { name, selected } => {
+                let current = wsl_status(&ctx);
+                if name.is_empty() || name.chars().any(char::is_control)
+                    || !current.can_set_distro(&name, selected) {
+                    ctx.log(Level::Err, "Дистрибутив не подтверждён; обновите список WSL.");
+                    continue;
+                }
+                let mut wanted = ctx.settings.clone();
+                let preferences = wanted.wsl.get_or_insert(crate::wsl_api::WslPreferences { enabled: false, distros: Vec::new() });
+                preferences.distros.retain(|old| old != &name);
+                if selected { preferences.distros.push(name); }
+                if wanted.save() { ctx.settings = wanted; }
+                else { ctx.log(Level::Err, "Настройки WSL не сохранились; выбор не изменён."); }
+                push_status(&mut ctx, Scan::Settings);
+            },
+            Cmd::ApplySettings => {
+                if ctx.wsl.is_pending() { ctx.log(Level::Warn, "Подождите завершения поиска WSL."); continue; }
+                #[allow(unused_mut)]
+                let mut resumed = false;
+                #[cfg(windows)]
+                let mut resume_intent = None;
+                #[cfg(windows)]
+                if let Startup::Resume(intent) = &ctx.startup {
+                    resume_intent = Some(intent.clone());
+                    ctx.startup = Startup::Explicit;
+                    resumed = true;
+                }
+                if !resumed && !ctx.settings.save() { ctx.log(Level::Err, "Настройки не сохранены; применение не начато."); continue; }
+                let wanted = ctx.settings.clone();
+                native_cancel.store(false, Ordering::SeqCst);
+                native_apply_pending.store(true, Ordering::SeqCst);
+                ctx.busy(Some("Применение настроек"));
+                push_status(&mut ctx, Scan::Settings);
+                let shared = shared.clone();
+                let cancellation = native_cancel.clone();
+                native_job = match std::thread::Builder::new().name("apply-settings".into()).spawn(move || {
+                    let mut ctx = shared.lock().map_err(|_| "settings owner lock was poisoned".to_owned())?;
+                    let result = apply_acknowledged(&mut ctx, wanted, &cancellation, #[cfg(windows)] resume_intent);
+                    push_status(&mut ctx, Scan::Deep);
+                    result
+                }) {
+                    Ok(job) => Some(job),
+                    Err(error) => {
+                        native_apply_pending.store(false, Ordering::SeqCst);
+                        ctx.log(Level::Err, format!("Не удалось начать применение: {error}"));
+                        ctx.busy(None);
+                        push_status(&mut ctx, Scan::Settings);
+                        None
+                    }
+                };
+            },
             Cmd::RememberLicense(key) => {
                 if ctx.settings.license_key != key {
                     ctx.settings.license_key = key;
                     ctx.settings.save();
                 }
-            }
-            Cmd::Unlocked => {
-                // The first snapshot was taken while the licence screen was up;
-                // a fresh one either way, deep when auto-patch just wrote.
-                if auto_patch_found(&mut ctx) {
-                    push_status(&mut ctx, Scan::Deep);
-                } else {
-                    push_status(&mut ctx, Scan::System);
-                }
-                ctx.busy(None);
             }
             // Off the queue, not on it. The measurement drives PowerShell and
             // takes seconds; on the queue, a user flipping a switch in the
@@ -507,7 +985,7 @@ fn run_worker(
             // running.
             Cmd::RemeasureVpn => {
                 use std::sync::atomic::Ordering;
-                if !MEASURING_VPN.swap(true, Ordering::SeqCst) {
+                if ctx.vpn_job.is_none() && !MEASURING_VPN.swap(true, Ordering::SeqCst) {
                     let back = own.clone();
                     let spawned = std::thread::Builder::new()
                         .name("vpn-probe".to_string())
@@ -521,10 +999,13 @@ fn run_worker(
                                 relay_egress,
                             });
                         });
-                    if spawned.is_err() {
+                    match spawned {
+                        Ok(job) => ctx.vpn_job = Some(job),
+                        Err(_) => {
                         // Or the flag would stay raised and this window would
                         // never measure again.
                         MEASURING_VPN.store(false, Ordering::SeqCst);
+                        }
                     }
                 }
             }
@@ -552,89 +1033,37 @@ fn run_worker(
                 push_status(&mut ctx, Scan::Deep);
                 ctx.busy(None);
             }
-            Cmd::Set(cap, on) => {
-                ctx.busy(Some(cap.title()));
-                apply(&mut ctx, cap, on);
-                ctx.settings.save();
-                push_status(&mut ctx, scan_after(cap));
-                // Turning auto-patch on is asking for Antigravity to be patched;
-                // waiting for the watchdog's next poll would show the switch on
-                // and the install still grey.
-                if cap == Cap::Watchdog && on && auto_patch_found(&mut ctx) {
-                    push_status(&mut ctx, Scan::Deep);
-                }
-                ctx.busy(None);
-            }
-            Cmd::AddPath(p) => {
-                if !ctx.settings.manual_paths.contains(&p) {
-                    ctx.settings.manual_paths.push(p);
-                    ctx.settings.save();
-                }
-                ctx.busy(Some("Проверка установок"));
-                push_status(&mut ctx, Scan::Deep);
-                // The path the user just pointed at is an install found at last.
-                if auto_patch_found(&mut ctx) {
-                    push_status(&mut ctx, Scan::Deep);
-                }
-                ctx.busy(None);
-            }
-            Cmd::PatchInstall(p) => {
-                ctx.busy(Some("Патч"));
-                let label = crate::install_label(&p);
-                if !patch_found(&mut ctx, vec![(label, p)]) {
-                    ctx.log(Level::Warn, format!("{}: патч не записан, см. выше", label));
-                }
-                push_status(&mut ctx, Scan::Deep);
-                ctx.busy(None);
-            }
+            command @ (Cmd::Set(_, _) | Cmd::EnableAll | Cmd::Repair
+                | Cmd::SetOwnProxy(_) | Cmd::SetGroupKey(_) | Cmd::Unlocked
+                | Cmd::AddPath(_) | Cmd::PatchInstall(_)) => {
+                native_cancel.store(false, Ordering::SeqCst);
+                native_apply_pending.store(true, Ordering::SeqCst);
+                ctx.busy(Some("Применение выбранного действия"));
+                push_status(&mut ctx, Scan::Settings);
+                let shared = shared.clone();
+                native_job = match std::thread::Builder::new().name("settings-command".into()).spawn(move || {
+                    let mut ctx = shared.lock().map_err(|_| "settings owner lock was poisoned".to_owned())?;
+                    dispatch_owned_command(&mut ctx, command)
+                }) {
+                    Ok(job) => Some(job),
+                    Err(error) => {
+                        native_apply_pending.store(false, Ordering::SeqCst);
+                        ctx.log(Level::Err, format!("Не удалось начать выбранное действие: {error}"));
+                        ctx.busy(None);
+                        push_status(&mut ctx, Scan::Settings);
+                        None
+                    }
+                };
+            },
             Cmd::ForgetPath(p) => {
                 ctx.settings.manual_paths.retain(|x| x != &p);
                 ctx.settings.save();
                 push_status(&mut ctx, Scan::System);
             }
-            Cmd::SetOwnProxy(text) => {
-                ctx.busy(Some("Проверка прокси"));
-                set_own_proxy(&mut ctx, &text);
-                ctx.settings.save();
-                push_status(&mut ctx, Scan::System);
-                ctx.busy(None);
-            }
             Cmd::SetCustomDns(text) => {
                 set_custom_dns(&mut ctx, &text);
                 ctx.settings.save();
                 push_status(&mut ctx, Scan::Settings);
-            }
-            Cmd::SetGroupKey(text) => {
-                ctx.busy(Some("Проверка ключа"));
-                match crate::group_key::parse_key(&text) {
-                    Ok(_) => {
-                        ctx.settings.group_key = text.trim().to_string();
-                        ctx.settings.group_key_at = crate::gate::now_unix();
-                        ctx.settings.group_proxy = true;
-                        ctx.settings.save();
-                        apply(&mut ctx, Cap::GroupProxy, true);
-                        ctx.log(crate::ops::Level::Ok, "Ключ принят.");
-                        push_status(&mut ctx, scan_after(Cap::GroupProxy));
-                    }
-                    Err(e) => {
-                        ctx.log(crate::ops::Level::Err, format!("{}", e));
-                    }
-                }
-                ctx.busy(None);
-            }
-            Cmd::EnableAll => {
-                ctx.busy(Some("Включаю"));
-                enable_all(&mut ctx);
-                ctx.settings.save();
-                push_status(&mut ctx, Scan::Deep);
-                ctx.busy(None);
-            }
-            Cmd::Repair => {
-                ctx.busy(Some("Чиню службу обхода"));
-                repair(&mut ctx);
-                ctx.settings.save();
-                push_status(&mut ctx, Scan::System);
-                ctx.busy(None);
             }
             Cmd::ReorderProviders(order) => {
                 ctx.settings.provider_order = order;
@@ -695,6 +1124,29 @@ fn run_worker(
             }
         }
     }
+}
+
+fn finish_shutdown(ctx: &mut Ctx, lifetime: &GuiLifetime) -> bool {
+    if ctx.wsl.is_pending() || ctx.vpn_job.is_some() || ctx.vpn_unsettled
+        || lifetime.save_failed.load(Ordering::SeqCst) { return false; }
+    #[cfg(windows)]
+    if lifetime.handoff_requested.load(Ordering::SeqCst)
+        && crate::settings::saved_intent_sha256(&ctx.settings).is_err() {
+        hold_apply(ctx, "Сохранённые настройки изменились перед передачей окна; они не перезаписаны. Закройте окно для отмены передачи.".into());
+        if !lifetime.abort_requested.load(Ordering::SeqCst) {
+            lifetime.save_failed.store(true, Ordering::SeqCst);
+            return false;
+        }
+    }
+    if matches!(ctx.startup, Startup::Held(_)) || lifetime.handoff_requested.load(Ordering::SeqCst) || ctx.settings.save() {
+        lifetime.shutdown_ready.store(true, Ordering::SeqCst);
+        let _ = ctx.events.send(Event::ShutdownReady);
+        if let Ok(wake) = ctx.wake.lock() { (wake)(); }
+        return true;
+    }
+    ctx.log(Level::Err, "Не удалось сохранить настройки; окно остаётся открытым.");
+    lifetime.save_failed.store(true, Ordering::SeqCst);
+    false
 }
 
 /// The one thing that runs on its own, before the user has touched anything.
@@ -805,8 +1257,204 @@ fn push_status(ctx: &mut Ctx, scan: Scan) {
             .collect();
     }
     ctx.last = Some(status.clone());
-    let _ = ctx.events.send(Event::Status(Box::new(status)));
-    (ctx.wake)();
+    if ctx.events.send(Event::Status(Box::new(status))).is_err() { ctx.lifetime.channel_lost.store(true, Ordering::SeqCst); }
+    if let Ok(wake) = ctx.wake.lock() { (wake)(); }
+}
+
+fn wsl_status(ctx: &Ctx) -> crate::wsl_api::WslStatus {
+    let mut status = ctx.wsl.snapshot(ctx.settings.wsl.clone());
+    status.pending |= ctx.native_apply_pending.load(Ordering::SeqCst) || ctx.vpn_unsettled;
+    if let Startup::Held(reason) = &ctx.startup { status.error = Some(reason.clone()); }
+    status
+}
+
+/// The existing native job owns Ctx while the outer loop receives cancel/close.
+/// These selected command effects run off the command-receiving thread.
+fn dispatch_owned_command(ctx: &mut Ctx, command: Cmd) -> Result<NativeCompletion, String> {
+    if ctx.native_cancel.load(Ordering::SeqCst) {
+        return Err("Выбранное действие отменено до начала.".into());
+    }
+    let saves_intent = matches!(&command, Cmd::Set(_, _) | Cmd::SetOwnProxy(_) | Cmd::SetGroupKey(_) | Cmd::EnableAll | Cmd::Repair);
+    let effect = (|| -> Result<(), String> { match command {
+            Cmd::Set(cap, on) => {
+                ctx.busy(Some(cap.title()));
+                apply(ctx, cap, on)?;
+                push_status(ctx, scan_after(cap));
+                // Turning auto-patch on is asking for Antigravity to be patched;
+                // waiting for the watchdog's next poll would show the switch on
+                // and the install still grey.
+                if cap == Cap::Watchdog && on && auto_patch_found(ctx) {
+                    push_status(ctx, Scan::Deep);
+                }
+            }
+            Cmd::SetOwnProxy(text) => {
+                ctx.busy(Some("Проверка прокси"));
+                set_own_proxy(ctx, &text)?;
+                push_status(ctx, Scan::System);
+            }
+            Cmd::SetGroupKey(text) => {
+                ctx.busy(Some("Проверка ключа"));
+                match crate::group_key::parse_key(&text) {
+                    Ok(_) => {
+                        ctx.settings.group_key = text.trim().to_string();
+                        ctx.settings.group_key_at = crate::gate::now_unix();
+                        ctx.settings.group_proxy = true;
+                        if !ctx.settings.save() { return Err("Ключ не сохранён; применение не начиналось.".into()); }
+                        apply(ctx, Cap::GroupProxy, true)?;
+                        ctx.log(crate::ops::Level::Ok, "Ключ принят.");
+                        push_status(ctx, scan_after(Cap::GroupProxy));
+                    }
+                    Err(e) => {
+                        ctx.log(crate::ops::Level::Err, format!("{}", e));
+                    }
+                }
+            }
+            Cmd::EnableAll => {
+                ctx.busy(Some("Включаю"));
+                enable_all(ctx)?;
+                push_status(ctx, Scan::Deep);
+            }
+            Cmd::Repair => {
+                ctx.busy(Some("Чиню службу обхода"));
+                repair(ctx)?;
+                push_status(ctx, Scan::System);
+            }
+        Cmd::Unlocked => {
+            if matches!(ctx.startup, Startup::Ordinary) {
+                if auto_patch_found(ctx) { push_status(ctx, Scan::Deep); }
+                else { push_status(ctx, Scan::System); }
+            } else { push_status(ctx, Scan::Settings); }
+        },
+        Cmd::AddPath(path) => {
+            if !ctx.settings.manual_paths.contains(&path) {
+                ctx.settings.manual_paths.push(path);
+                if !ctx.settings.save() { return Err("Путь не сохранён; патч не начинался.".into()); }
+            }
+            push_status(ctx, Scan::Deep);
+            if auto_patch_found(ctx) { push_status(ctx, Scan::Deep); }
+        },
+        Cmd::PatchInstall(path) => {
+            let label = crate::install_label(&path);
+            if !patch_found(ctx, vec![(label, path)]) {
+                return Err(format!("{label}: патч не записан, см. предыдущий результат"));
+            }
+            push_status(ctx, Scan::Deep);
+        },
+        _ => return Err("Команда не относится к выбранному действию.".into()),
+    }; Ok(()) })();
+    let saved = !saves_intent || ctx.settings.save();
+    match (effect, saved) {
+        (Ok(()), true) => {},
+        (Err(error), true) => return Err(error),
+        (Ok(()), false) => return Err("Действие получено, но выбранные настройки не сохранены.".into()),
+        (Err(error), false) => return Err(format!("{error}; выбранные настройки также не сохранены")),
+    }
+    Ok(NativeCompletion::Retired)
+}
+
+fn genuine_command(command: &Cmd) -> bool {
+    matches!(command, Cmd::RequestElevation | Cmd::ApplySettings | Cmd::SetWslEnabled(_) | Cmd::SetWslDistro { .. }
+        | Cmd::Set(_, _) | Cmd::AddPath(_) | Cmd::ForgetPath(_) | Cmd::PatchInstall(_) | Cmd::SetOwnProxy(_)
+        | Cmd::SetCustomDns(_) | Cmd::SetGroupKey(_) | Cmd::SetProvider(_, _) | Cmd::ReorderProviders(_)
+        | Cmd::EnableAll | Cmd::Repair)
+}
+
+fn worker_boot(rx: &Receiver<Cmd>, events: &Sender<Event>, wake: &Arc<Mutex<Box<dyn Fn() + Send>>>,
+    lifetime: &Arc<GuiLifetime>) -> Option<(Settings, Startup, Option<Cmd>)> {
+    let hold = match lifetime.bootstrap_hold.lock() {
+        Ok(mut hold) => hold.take(),
+        Err(_) => return rejected_boot(rx, events, wake, lifetime, "Не удалось получить ограничение автоматического запуска.".into()),
+    };
+    if let Some(reason) = hold { return held_boot(rx, events, wake, lifetime, reason); }
+    #[cfg(windows)]
+    {
+        let action = match lifetime.action.lock() {
+            Ok(mut action) => action.take(),
+            Err(_) => return rejected_boot(rx, events, wake, lifetime, "Не удалось получить продолжение GUI.".into()),
+        };
+        if let Some(crate::instances::GuiReplacementAction::ResumeApply(intent)) = action {
+            match receive_apply_continuation(&intent, &lifetime.abort_requested) {
+                Ok(plan) => return Some((plan.wanted.clone(), Startup::Resume(intent), Some(Cmd::ApplySettings))),
+                Err(error) => {
+                    let reason = format!("Данные изменились во время передачи окна; применение не выполнялось: {error}");
+                    return held_boot(rx, events, wake, lifetime, reason);
+                }
+            }
+        }
+    }
+    Some((Settings::load(), Startup::Ordinary, None))
+}
+
+fn held_boot(rx: &Receiver<Cmd>, events: &Sender<Event>, wake: &Arc<Mutex<Box<dyn Fn() + Send>>>,
+    lifetime: &Arc<GuiLifetime>, reason: String) -> Option<(Settings, Startup, Option<Cmd>)> {
+    if let Err(error) = lifetime.hold_automatic_effects(reason.clone()) { let _ = events.send(Event::Log(Level::Err, error)); }
+    let _ = events.send(Event::Log(Level::Err, reason.clone()));
+    // Display-only receiving never qualifies a rejected or already-consumed
+    // continuation. Only an actual canonical saved snapshot may enter Ctx.
+    if let Some(display) = saved_display() {
+        Some((display, Startup::Held(reason), None))
+    } else { rejected_boot(rx, events, wake, lifetime, reason) }
+}
+
+fn saved_display() -> Option<Settings> {
+    let display = Settings::load();
+    crate::settings::saved_intent_sha256(&display).ok().map(|_| display)
+}
+
+#[cfg(windows)]
+fn hold_apply(ctx: &mut Ctx, reason: String) {
+    if let Some(display) = saved_display() { ctx.settings = display; }
+    ctx.startup = Startup::Held(reason.clone());
+    if let Err(error) = ctx.lifetime.hold_automatic_effects(reason.clone()) { ctx.log(Level::Err, error); }
+    ctx.log(Level::Err, reason);
+}
+
+fn rejected_boot(rx: &Receiver<Cmd>, events: &Sender<Event>, wake: &Arc<Mutex<Box<dyn Fn() + Send>>>,
+    lifetime: &Arc<GuiLifetime>, reason: String) -> Option<(Settings, Startup, Option<Cmd>)> {
+    let _ = events.send(Event::Log(Level::Err, reason.clone()));
+    let _ = events.send(Event::Busy(Some("Сохранённые данные не подтверждены; применение остановлено.".into())));
+    if let Ok(wake) = wake.lock() { (wake)(); }
+    loop {
+        match rx.recv() {
+            Ok(Cmd::Shutdown | Cmd::Stop) | Err(_) => {
+                // No Settings or effects were accepted, so preserve the actual
+                // saved bytes instead of writing a fabricated default snapshot.
+                lifetime.shutdown_ready.store(true, Ordering::SeqCst);
+                let _ = events.send(Event::ShutdownReady);
+                if let Ok(wake) = wake.lock() { (wake)(); }
+                return None;
+            }
+            Ok(Cmd::ApplySettings) => {
+                let settings = Settings::load();
+                if crate::settings::saved_intent_sha256(&settings).is_ok() {
+                    return Some((settings, Startup::Explicit, Some(Cmd::ApplySettings)));
+                }
+                let _ = events.send(Event::Log(Level::Err, "Сохранённые настройки не подтверждены; данные не изменены.".into()));
+                if let Ok(wake) = wake.lock() { (wake)(); }
+            }
+            _ => {},
+        }
+    }
+}
+
+#[cfg(windows)]
+fn retire_replacement(ready: &mut crate::instances::GuiReplacementReady,
+    progress: &Sender<crate::instances::ElevationProgress>) {
+    let mut last_error = None;
+    loop {
+        let outcome = ready.request_abort().and_then(|_| ready.poll_retired());
+        match outcome {
+            Ok(true) => return,
+            Ok(false) => {},
+            Err(error) => {
+                if last_error.as_ref() != Some(&error) {
+                    let _ = progress.send(crate::instances::ElevationProgress::ObservationPending(error.clone()));
+                    last_error = Some(error);
+                }
+            }
+        }
+        std::thread::sleep(crate::wsl_runtime::OWNER_OBSERVATION_CADENCE);
+    }
 }
 
 /// The last snapshot with every settings-derived field recomputed, and nothing
@@ -819,6 +1467,7 @@ fn push_status(ctx: &mut Ctx, scan: Scan) {
 fn settings_only_status(ctx: &Ctx, prev: Status) -> Status {
     let (rules, relay) = ctx.dns_probe;
     Status {
+        wsl: wsl_status(ctx),
         dns: dns_state(
             prev.admin,
             rules,
@@ -934,6 +1583,7 @@ fn read_status(ctx: &mut Ctx, deep: bool) -> Status {
     };
 
     Status {
+        wsl: wsl_status(ctx),
         admin,
         client_patch,
         watchdog,
@@ -1222,13 +1872,10 @@ fn collect_installs(
 // Applying a switch
 // ---------------------------------------------------------------------------
 
-fn apply(ctx: &mut Ctx, cap: Cap, on: bool) {
+fn apply(ctx: &mut Ctx, cap: Cap, on: bool) -> Result<(), String> {
+    if ctx.native_cancel.load(Ordering::SeqCst) { return Err("Действие отменено до следующего эффекта.".into()); }
     if cap.needs_admin() && !is_admin() {
-        ctx.log(
-            Level::Err,
-            "Нужны права администратора. Нажмите «Перезапустить от имени администратора».",
-        );
-        return;
+        return Err("Нужны права администратора. Нажмите «Перезапустить от имени администратора».".into());
     }
 
     match (cap, on) {
@@ -1240,7 +1887,11 @@ fn apply(ctx: &mut Ctx, cap: Cap, on: bool) {
             // Set from the result, not from the click: a run that found no
             // install patched nothing, and persisting `true` there would leave
             // the switch reading On for ever on a machine with no Antigravity.
-            ctx.settings.client_patch = enable_client_patch(ctx);
+            #[cfg(windows)]
+            let patched = enable_client_patch_received(ctx, None)?;
+            #[cfg(not(windows))]
+            let patched = enable_client_patch_received(ctx)?;
+            ctx.settings.client_patch = patched;
             // Switching the patch off took the watchdog task down with it. The
             // relay's own watchdog thread acts again the moment the decline is
             // gone, so without the task back the switch would read off while
@@ -1250,7 +1901,7 @@ fn apply(ctx: &mut Ctx, cap: Cap, on: bool) {
                 && ctx.settings.auto_patch_wanted()
                 && !background::is_watchdog_enabled()
             {
-                set_watchdog(ctx, true);
+                set_watchdog_effect(ctx, true)?;
             }
         }
         (Cap::ClientPatch, false) => {
@@ -1260,12 +1911,12 @@ fn apply(ctx: &mut Ctx, cap: Cap, on: bool) {
             // already sees it.
             ctx.settings.patch_declined = true;
             if !ctx.settings.save() {
-                ctx.log(
-                    Level::Warn,
-                    "Настройки не сохранились (файл занят?) — автопатч может вернуть патч. Выключите и «Автопатч».",
-                );
+                return Err("Отказ от автопатча не сохранён; отмена файлов не начиналась.".into());
             }
-            disable_client_patch(ctx);
+            #[cfg(windows)]
+            disable_client_patch_received(ctx, None)?;
+            #[cfg(not(windows))]
+            disable_client_patch_received(ctx)?;
         }
         (Cap::Watchdog, on) => {
             ctx.settings.auto_patch = on;
@@ -1275,22 +1926,22 @@ fn apply(ctx: &mut Ctx, cap: Cap, on: bool) {
             if on {
                 ctx.settings.patch_declined = false;
             }
-            set_watchdog(ctx, on);
+            set_watchdog_effect(ctx, on)?;
         }
         (Cap::Dns, on) => {
             ctx.settings.dns = on;
             if on {
-                enable_dns(ctx)
+                enable_dns_effect(ctx)?;
             } else {
-                disable_dns(ctx)
+                disable_dns_effect(ctx)?;
             }
         }
         (Cap::LocalProxy, on) => {
             ctx.settings.local_proxy = on;
             if on {
-                enable_local_proxy(ctx)
+                enable_local_proxy_effect(ctx)?;
             } else {
-                disable_local_proxy(ctx)
+                disable_local_proxy_effect(ctx)?;
             }
         }
         (Cap::OwnProxy, on) => {
@@ -1304,18 +1955,18 @@ fn apply(ctx: &mut Ctx, cap: Cap, on: bool) {
                     );
                     ctx.settings.own_proxy_enabled = false;
                 } else {
-                    set_own_proxy(ctx, &text);
+                    set_own_proxy(ctx, &text)?;
                 }
             } else {
-                upstream::clear();
+                upstream::clear()?;
                 ctx.log(Level::Ok, "Свой прокси отключён.");
-                release_route_carrier(ctx);
+                release_route_carrier(ctx)?;
             }
         }
         (Cap::DnsRotation, on) => {
             ctx.settings.rotate_providers = on;
             ctx.settings.save();
-            reapply_dns_rules(ctx);
+            reapply_dns_rules_checked(ctx)?;
             ctx.log(
                 Level::Ok,
                 if on {
@@ -1343,9 +1994,9 @@ fn apply(ctx: &mut Ctx, cap: Cap, on: bool) {
                 },
             );
             if on {
-                ensure_route_carrier(ctx);
+                ensure_route_carrier(ctx)?;
             } else {
-                release_route_carrier(ctx);
+                release_route_carrier(ctx)?;
             }
         }
         (Cap::GroupProxy, on) => {
@@ -1359,22 +2010,493 @@ fn apply(ctx: &mut Ctx, cap: Cap, on: bool) {
                 },
             );
             if on {
-                ensure_route_carrier(ctx);
+                ensure_route_carrier(ctx)?;
             } else {
-                release_route_carrier(ctx);
+                release_route_carrier(ctx)?;
             }
         }
     }
+    Ok(())
 }
 
 // --- the two buttons --------------------------------------------------------
+
+/// Reconcile acknowledged intent through existing effect owners. This action
+/// never aliases EnableAll/Repair and never derives wanted booleans from an
+/// effect result. The owning job serializes Ctx while the command loop can
+/// still receive cancellation and close requests.
+#[cfg(windows)]
+#[derive(Debug)]
+pub(crate) enum ApplyPlanError { Cancelled, Receiving(String), GatewayRecoveryRequired(GatewayApplyRecovery) }
+#[cfg(windows)]
+pub(crate) struct GatewayApplyRecovery {
+    pub(crate) observation: crate::windows_coordinator::windows_installation::GatewayPendingObservation,
+    pub(crate) target: crate::instances::GuiReplacementTarget,
+    pub(crate) bound: crate::windows_coordinator::windows_installation::BoundInstallation,
+}
+#[cfg(windows)]
+impl std::fmt::Debug for GatewayApplyRecovery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GatewayApplyRecovery").field("observation", &self.observation).finish_non_exhaustive()
+    }
+}
+#[cfg(windows)]
+impl From<String> for ApplyPlanError { fn from(value: String) -> Self { Self::Receiving(value) } }
+#[cfg(windows)]
+impl std::fmt::Display for ApplyPlanError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self { Self::Cancelled => f.write_str("Применение отменено."), Self::Receiving(error) => f.write_str(error),
+            Self::GatewayRecoveryRequired(_) => f.write_str("RecoveryRequired: selected Desktop has an exact Pending gateway prerequisite") }
+    }
+}
+
+#[cfg(windows)]
+pub(crate) struct ApplyInstallation {
+    kind: crate::InstallationKind,
+    root: crate::windows_coordinator::windows_installation::CheckedPath,
+    anchor: crate::windows_coordinator::windows_installation::CheckedPath,
+    expectation: crate::instances::GuiTargetExpectation,
+}
+#[cfg(windows)]
+impl ApplyInstallation {
+    pub(crate) fn root(&self) -> &std::path::Path { self.root.as_path() }
+    pub(crate) fn anchor(&self) -> &std::path::Path { self.anchor.as_path() }
+    fn recheck(&self) -> Result<(), String> {
+        self.root.recheck()?;
+        self.anchor.recheck()?;
+        let layout = crate::receive_installation_layout(self.root())?;
+        if layout.kind != self.kind { return Err("installation effect kind changed".into()); }
+        let anchor = crate::windows_coordinator::windows_installation::CheckedPath::open(&layout.anchor,
+            crate::windows_coordinator::windows_installation::PathKind::File,
+            crate::windows_coordinator::windows_installation::PathPurpose::ReplaceSource)?;
+        if anchor.native_id() != self.anchor.native_id() { return Err("installation effect anchor changed".into()); }
+        Ok(())
+    }
+    pub(crate) fn desktop_binding(&self) -> Result<crate::windows_coordinator::windows_installation::BoundInstallation, String> {
+        use crate::windows_coordinator::{self as coordinator, windows_installation as owner};
+        if self.kind != crate::InstallationKind::Desktop { return Err("WSL requires a received Desktop target".into()); }
+        self.recheck()?;
+        let mut bound = owner::BoundInstallation::open(self.anchor())?;
+        if bound.native_root_id() != self.root.native_id() || bound.native_executable_id() != self.anchor.native_id() {
+            return Err("Desktop target native identity changed".into());
+        }
+        if let Some(context) = coordinator::receive_saved_context(&bound)? { bound.attach_ancestor_context(context)?; }
+        Ok(bound)
+    }
+    pub(crate) fn recheck_desktop_current(&self) -> Result<(), String> {
+        let current = receive_desktop_current(&self.desktop_binding()?)?;
+        if current != self.expectation.current { return Err("Desktop Current changed before execution".into()); }
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+pub(crate) struct AllTargetApplyPlan {
+    wanted: Settings,
+    saved_sha256: [u8; 32],
+    targets: Vec<ApplyInstallation>,
+    native: NativeApplyPlan,
+    client_patch: Option<bool>,
+    wsl: Option<crate::wsl_runtime::WslApplyPreparation>,
+}
+#[cfg(windows)]
+impl AllTargetApplyPlan {
+    pub(crate) fn wanted(&self) -> &Settings { &self.wanted }
+    pub(crate) fn wsl(&self) -> Result<&crate::wsl_runtime::WslApplyPreparation, String> {
+        self.wsl.as_ref().ok_or_else(|| "WSL requirements were not received".into())
+    }
+    pub(crate) fn wsl_desktops(&self) -> impl Iterator<Item = &ApplyInstallation> {
+        self.targets.iter().filter(|target| target.kind == crate::InstallationKind::Desktop)
+    }
+    fn expectations(&self) -> Vec<crate::instances::GuiTargetExpectation> {
+        self.targets.iter().map(|target| target.expectation.clone()).collect()
+    }
+    fn recheck(&self) -> Result<(), String> {
+        if crate::settings::saved_intent_sha256(&self.wanted)? != self.saved_sha256 { return Err("saved Apply input changed".into()); }
+        for target in &self.targets {
+            target.recheck()?;
+            if target.kind == crate::InstallationKind::Desktop { target.recheck_desktop_current()?; }
+        }
+        Ok(())
+    }
+    fn continuation(&self) -> Result<crate::instances::GuiApplyContinuation, String> {
+        self.recheck()?;
+        Ok(crate::instances::GuiApplyContinuation { request_id: crate::windows_coordinator::windows_installation::new_request_id()?,
+            saved_settings_sha256: self.saved_sha256, targets: self.expectations() })
+    }
+}
+
+#[cfg(windows)]
+fn receive_desktop_current(bound: &crate::windows_coordinator::windows_installation::BoundInstallation)
+    -> Result<crate::instances::GuiCurrentExpectation, String> {
+    Ok(match crate::windows_coordinator::windows_installation::capture_current_expectation(bound)? {
+        None => crate::instances::GuiCurrentExpectation::Absent {},
+        Some((slot_id, current_sha256)) => crate::instances::GuiCurrentExpectation::Present { slot_id, current_sha256 },
+    })
+}
+
+#[cfg(windows)]
+fn apply_target_key(target: &crate::instances::GuiTargetExpectation) -> (u8, u64, [u8; 16], u64, [u8; 16]) {
+    use crate::instances::GuiTargetKind;
+    let kind = match target.target.kind { GuiTargetKind::Desktop => 0, GuiTargetKind::Ide => 1, GuiTargetKind::Cli => 2 };
+    (kind, target.target.native_root_id.volume, target.target.native_root_id.file,
+        target.target.anchor_native_id.volume, target.target.anchor_native_id.file)
+}
+
+#[cfg(windows)]
+pub(crate) fn receive_all_target_apply_plan(wanted: Settings, cancel: &AtomicBool) -> Result<AllTargetApplyPlan, ApplyPlanError> {
+    use crate::{instances::{GuiCurrentExpectation, GuiReplacementTarget, GuiTargetExpectation, GuiTargetKind},
+        windows_coordinator::{self as coordinator, windows_installation as owner}};
+    let saved_sha256 = crate::settings::saved_intent_sha256(&wanted)?;
+    let mut roots = crate::find_all_installs_checked(cancel)?;
+    for root in &wanted.manual_paths { if !roots.contains(root) { roots.push(root.clone()); } }
+    let mut targets: Vec<ApplyInstallation> = Vec::new();
+    let mut all_patched = !roots.is_empty();
+    let mut any_patched = false;
+    for path in roots {
+        if cancel.load(Ordering::SeqCst) { return Err(ApplyPlanError::Cancelled); }
+        let root = owner::CheckedPath::open(&path, owner::PathKind::Directory, owner::PathPurpose::Source)?;
+        let layout = crate::receive_installation_layout(root.as_path())?;
+        let anchor = owner::CheckedPath::open(&layout.anchor, owner::PathKind::File, owner::PathPurpose::ReplaceSource)?;
+        let state = patch_binary::inspect_install(root.as_path());
+        for (_, state) in &state.files {
+            if let patch_binary::FileState::Unreadable(error) = state { return Err(error.clone().into()); }
+        }
+        all_patched &= state.fully_patched();
+        any_patched |= state.files.iter().any(|(_, state)| matches!(state, patch_binary::FileState::Patched));
+        let kind = match layout.kind { crate::InstallationKind::Desktop => GuiTargetKind::Desktop,
+            crate::InstallationKind::Ide => GuiTargetKind::Ide, crate::InstallationKind::Cli => GuiTargetKind::Cli };
+        let target = GuiReplacementTarget { kind, root_path: root.as_path().to_owned(),
+            native_root_id: root.native_id(), anchor_path: anchor.as_path().to_owned(), anchor_native_id: anchor.native_id() };
+        let current = if layout.kind == crate::InstallationKind::Desktop {
+            let mut bound = owner::BoundInstallation::open(anchor.as_path())?;
+            if let Some(context) = coordinator::receive_saved_context(&bound)? { bound.attach_ancestor_context(context)?; }
+            match owner::observe_apply_current(&bound)? {
+                owner::ApplyCurrentObservation::Absent => GuiCurrentExpectation::Absent {},
+                owner::ApplyCurrentObservation::Settled { slot_id, current_sha256 } => GuiCurrentExpectation::Present { slot_id, current_sha256 },
+                owner::ApplyCurrentObservation::GatewayPending(observation) => return Err(ApplyPlanError::GatewayRecoveryRequired(
+                    GatewayApplyRecovery { observation, target, bound })),
+            }
+        } else { GuiCurrentExpectation::NotApplicable {} };
+        let expectation = GuiTargetExpectation { target, current };
+        if let Some(prior) = targets.iter().find(|prior| prior.root.native_id() == root.native_id()) {
+            if apply_target_key(&prior.expectation) != apply_target_key(&expectation) || prior.expectation.current != expectation.current {
+                return Err("target aliases have conflicting kind/anchor/Current observations".to_owned().into());
+            }
+        } else { targets.push(ApplyInstallation { kind: layout.kind, root, anchor, expectation }); }
+    }
+    targets.sort_by_key(|target| apply_target_key(&target.expectation));
+    let Some(mut native) = inspect_native_apply(&wanted, cancel)? else { return Err(ApplyPlanError::Cancelled); };
+    let client_patch = if wanted.client_patch && !all_patched { Some(true) }
+        else if !wanted.client_patch && any_patched { Some(false) } else { None };
+    native.revert_services = client_patch == Some(false) && native.services_present;
+    let mut plan = AllTargetApplyPlan { wanted, saved_sha256, targets, native, client_patch, wsl: None };
+    plan.wsl = Some(crate::wsl_runtime::inspect_selection(&plan, cancel)?);
+    plan.recheck()?;
+    Ok(plan)
+}
+
+#[cfg(windows)]
+fn receive_apply_continuation(intent: &crate::instances::GuiApplyContinuation, cancel: &AtomicBool)
+    -> Result<AllTargetApplyPlan, String> {
+    use crate::{instances::{GuiCurrentExpectation, GuiTargetKind}, windows_coordinator::windows_installation as owner};
+    owner::validate_request_id(&intent.request_id)?;
+    let wanted = crate::settings::receive_saved_intent(&intent.saved_settings_sha256)?;
+    let plan = receive_all_target_apply_plan(wanted, cancel).map_err(|error| error.to_string())?;
+    let mut expected = intent.targets.clone();
+    expected.sort_by_key(apply_target_key);
+    if expected.windows(2).any(|pair| apply_target_key(&pair[0]) == apply_target_key(&pair[1])) {
+        return Err("Apply target expectations are duplicated".into());
+    }
+    for expectation in &expected {
+        let root = owner::CheckedPath::open(&expectation.target.root_path, owner::PathKind::Directory, owner::PathPurpose::Source)?;
+        let anchor = owner::CheckedPath::open(&expectation.target.anchor_path, owner::PathKind::File, owner::PathPurpose::ReplaceSource)?;
+        if root.native_id() != expectation.target.native_root_id || anchor.native_id() != expectation.target.anchor_native_id {
+            return Err("Apply target native identity changed".into());
+        }
+        let layout = crate::receive_installation_layout(root.as_path())?;
+        let kind = match layout.kind { crate::InstallationKind::Desktop => GuiTargetKind::Desktop,
+            crate::InstallationKind::Ide => GuiTargetKind::Ide, crate::InstallationKind::Cli => GuiTargetKind::Cli };
+        let actual_anchor = owner::CheckedPath::open(&layout.anchor, owner::PathKind::File, owner::PathPurpose::ReplaceSource)?;
+        if kind != expectation.target.kind || actual_anchor.native_id() != anchor.native_id() {
+            return Err("Apply target kind/anchor binding changed".into());
+        }
+        if !matches!((kind, &expectation.current),
+            (GuiTargetKind::Desktop, GuiCurrentExpectation::Absent {} | GuiCurrentExpectation::Present { .. })
+            | (GuiTargetKind::Ide | GuiTargetKind::Cli, GuiCurrentExpectation::NotApplicable {})) {
+            return Err("Apply target Current applicability differs from its kind".into());
+        }
+    }
+    let actual = plan.expectations();
+    if actual.len() != expected.len() || actual.iter().zip(&expected)
+        .any(|(actual, expected)| apply_target_key(actual) != apply_target_key(expected) || actual.current != expected.current) {
+        return Err("Apply target set or canonical Current changed during handoff".into());
+    }
+    plan.recheck()?;
+    Ok(plan)
+}
+
+#[cfg(windows)]
+struct NativeApplyFacts {
+    core_rules: bool,
+    owned_rules: bool,
+    relay_task: bool,
+    relay: Option<NativeRelayFacts>,
+    watchdog_task: bool,
+    program_outdated: Option<bool>,
+}
+
+#[cfg(windows)]
+struct NativeRelayFacts {
+    relay_compatible: bool,
+    relay_outdated: bool,
+    relay_reporting: bool,
+}
+
+#[cfg(windows)]
+#[derive(Debug, PartialEq, Eq)]
+struct NativeApplyPlan {
+    update_shared_program: bool,
+    ensure_relay: bool,
+    enable_dns: bool,
+    disable_dns: bool,
+    stop_relay: bool,
+    watchdog: Option<bool>,
+    services_present: bool,
+    revert_services: bool,
+}
+
+#[cfg(windows)]
+impl NativeApplyPlan {
+    fn receive(wanted: &Settings, facts: &NativeApplyFacts) -> Result<Self, String> {
+        let wants_relay = wanted.dns || routes_want_relay(wanted);
+        let update_shared_program = if wants_relay || wanted.auto_patch_wanted() {
+            facts.program_outdated.ok_or("selected background executable generation was not received")?
+        } else { false };
+        let ensure_relay = if wants_relay {
+            let relay = facts.relay.as_ref().ok_or("selected relay health was not received")?;
+            !(facts.relay_task && relay.relay_compatible
+                && !relay.relay_outdated && relay.relay_reporting)
+        } else { false };
+        let disable_dns = !wanted.dns && facts.owned_rules;
+        Ok(Self {
+            update_shared_program,
+            ensure_relay,
+            enable_dns: wanted.dns && !facts.core_rules,
+            disable_dns,
+            stop_relay: !wants_relay && !disable_dns && facts.relay_task,
+            watchdog: (wanted.auto_patch_wanted() != facts.watchdog_task).then_some(wanted.auto_patch_wanted()),
+            services_present: facts.relay_task || facts.watchdog_task,
+            revert_services: false,
+        })
+    }
+
+    fn requires_elevation(&self) -> bool {
+        self.update_shared_program || self.ensure_relay || self.enable_dns || self.disable_dns || self.stop_relay || self.watchdog.is_some() || self.revert_services
+    }
+}
+
+#[cfg(windows)]
+fn inspect_native_apply(wanted: &Settings, cancellation: &AtomicBool) -> Result<Option<NativeApplyPlan>, String> {
+    if cancellation.load(Ordering::SeqCst) { return Ok(None); }
+    let rules = dns::checked_nrpt_state()?;
+    if cancellation.load(Ordering::SeqCst) { return Ok(None); }
+    let tasks = background::checked_task_state_with_cancel(cancellation)?;
+    if cancellation.load(Ordering::SeqCst) { return Ok(None); }
+    let program_outdated = if wanted.dns || routes_want_relay(wanted) || wanted.auto_patch_wanted() {
+        Some(background::checked_relay_outdated_with_cancel(cancellation)?)
+    } else { None };
+    if cancellation.load(Ordering::SeqCst) { return Ok(None); }
+    let relay = if wanted.dns || routes_want_relay(wanted) {
+        let relay_compatible = background::checked_relay_compatible_with_cancel(cancellation)?;
+        if cancellation.load(Ordering::SeqCst) { return Ok(None); }
+        let relay_outdated = program_outdated.ok_or("selected relay generation was not received")?;
+        let relay_reporting = crate::gate::read_checked()?.is_some_and(|report|
+            !report.is_stale() && report.version >= crate::dns_forwarder::RELAY_VERSION);
+        if cancellation.load(Ordering::SeqCst) { return Ok(None); }
+        Some(NativeRelayFacts {
+            relay_compatible, relay_outdated, relay_reporting,
+        })
+    } else { None };
+    NativeApplyPlan::receive(wanted, &NativeApplyFacts {
+        core_rules: rules.core_applied, owned_rules: rules.owned_rules_present,
+        relay_task: tasks.relay_enabled, relay, watchdog_task: tasks.watchdog_enabled, program_outdated,
+    }).map(Some)
+}
+
+fn apply_acknowledged(ctx: &mut Ctx, wanted: Settings, cancellation: &AtomicBool,
+    #[cfg(windows)] resume: Option<crate::instances::GuiApplyContinuation>) -> Result<NativeCompletion, String> {
+    #[cfg(windows)]
+    let mut recovery_results = Vec::new();
+    let result = (|| {
+        if cancellation.load(Ordering::SeqCst) { return Ok(NativeCompletion::Retired); }
+        #[cfg(windows)]
+        {
+            let received = match resume.as_ref() {
+                Some(intent) => receive_apply_continuation(intent, cancellation),
+                None => {
+                    let mut attempted = std::collections::BTreeSet::new();
+                    loop {
+                        if cancellation.load(Ordering::SeqCst) { break Err("Применение отменено до следующих действий.".into()); }
+                        match receive_all_target_apply_plan(wanted.clone(), cancellation) {
+                            Ok(plan) => break Ok(plan),
+                            Err(ApplyPlanError::GatewayRecoveryRequired(prerequisite)) => {
+                                if let Err(error) = receive_gateway_prerequisite_once(&mut attempted, &prerequisite.observation, cancellation) { break Err(error); }
+                                match crate::wsl_runtime::recover_apply_gateway(prerequisite.bound, &prerequisite.target,
+                                    &prerequisite.observation, cancellation) {
+                                    Ok(outcome) => { ctx.log(Level::Ok, outcome.clone()); recovery_results.push(outcome); }
+                                    Err(error) => {
+                                        let received = format!("recovery prerequisite {:?}; {error}", prerequisite.observation);
+                                        ctx.log(Level::Err, received.clone()); recovery_results.push(received);
+                                        break Err(error);
+                                    }
+                                }
+                                // Same acknowledged intent and discovery owner;
+                                // no native/profile effect before a full new plan.
+                            }
+                            Err(error) => break Err(error.to_string()),
+                        }
+                    }
+                },
+            };
+            let plan = match received {
+                Ok(plan) => Arc::new(plan),
+                Err(error) => {
+                    let error = apply_receiving_failure(&error, &recovery_results);
+                    if !cancellation.load(Ordering::SeqCst) { hold_apply(ctx, error.clone()); }
+                    return Err(error);
+                },
+            };
+            if (plan.native.requires_elevation() && !is_admin()) || plan.wsl()?.requires_elevation() {
+                return Ok(NativeCompletion::NeedsElevation(plan.continuation()?));
+            }
+            reconcile_native(ctx, &wanted, cancellation, &plan)?;
+            if !cancellation.load(Ordering::SeqCst) { ctx.wsl.request_apply(plan)?; }
+            return Ok(NativeCompletion::Retired);
+        }
+        #[cfg(not(windows))]
+        {
+        reconcile_native(ctx, &wanted, cancellation)?;
+        if !cancellation.load(Ordering::SeqCst) { ctx.wsl.request_apply(wanted.clone())?; }
+        Ok(NativeCompletion::Retired)
+        }
+    })();
+    if cancellation.load(Ordering::SeqCst) {
+        if ctx.wsl.is_pending() { ctx.wsl.request_cancel(); }
+        else { ctx.wsl.cancelled_before_apply(wanted.wsl.as_ref()); }
+        result.map(|_| NativeCompletion::Retired)
+    } else { result }
+}
+
+#[cfg(windows)]
+fn receive_gateway_prerequisite_once(
+    attempted: &mut std::collections::BTreeSet<(String, String, [u8; 32])>,
+    observation: &crate::windows_coordinator::windows_installation::GatewayPendingObservation,
+    cancellation: &AtomicBool,
+) -> Result<(), String> {
+    if cancellation.load(Ordering::SeqCst) { return Err("Cancelled: gateway prerequisite not started".into()); }
+    if !attempted.insert((observation.slot_id.clone(), observation.operation_id.clone(), observation.current_sha256)) {
+        return Err("RecoveryRequired: the same Pending gateway prerequisite remains unresolved; no automatic retry".into());
+    }
+    Ok(())
+}
+#[cfg(windows)]
+fn apply_receiving_failure(error: &str, recovery_results: &[String]) -> String {
+    if recovery_results.is_empty() { format!("Применение остановлено до изменений: {error}") }
+    else { format!("Применение остановлено; полученные результаты восстановления сохранены: [{}]; незавершённый остаток: {error}", recovery_results.join("; ")) }
+}
+
+fn reconcile_native(ctx: &mut Ctx, wanted: &Settings, cancellation: &AtomicBool,
+    #[cfg(windows)] plan: &AllTargetApplyPlan) -> Result<(), String> {
+    if cancellation.load(Ordering::SeqCst) { return Ok(()); }
+    #[cfg(windows)]
+    let Some(mut native) = inspect_native_apply(wanted, cancellation)? else { return Ok(()); };
+    #[cfg(windows)]
+    { plan.recheck()?; native.revert_services = plan.client_patch == Some(false) && native.services_present; }
+    #[cfg(windows)]
+    if native.requires_elevation() && !is_admin() {
+        return Err("Состояние Windows изменилось после проверки прав; оставшиеся действия остановлены. Повторите «Применить».".into());
+    }
+    #[cfg(windows)]
+    if native.disable_dns {
+        // A client undo may retire the shared relay before its file operation.
+        // Receive removal of our no-longer-wanted rules before that transition.
+        remove_dns_rules_effect(ctx)?;
+        native.disable_dns = false;
+        native.stop_relay = !wanted.dns && !routes_want_relay(wanted) && native.services_present;
+    }
+    #[cfg(windows)]
+    match plan.client_patch {
+        Some(true) => { enable_client_patch_received(ctx, Some(plan))?; },
+        Some(false) => disable_client_patch_received(ctx, Some(plan))?,
+        None => {},
+    }
+    #[cfg(not(windows))]
+    {
+    let observed = read_status(ctx, false);
+    if wanted.client_patch && observed.client_patch != State::On {
+        enable_client_patch(ctx);
+    } else if !wanted.client_patch && observed.client_patch.is_on() {
+        disable_client_patch(ctx);
+    }
+    }
+    if cancellation.load(Ordering::SeqCst) { return Ok(()); }
+    let configured = upstream::configured();
+    if wanted.own_proxy_enabled {
+        match upstream::parse(&wanted.own_proxy) {
+            Ok(upstream) if configured.as_ref() != Some(&upstream) => {
+                upstream::save(&upstream).map_err(|error| format!("Свой прокси не сохранился: {error}"))?;
+            }
+            Ok(_) => {},
+            Err(error) => return Err(format!("Параметры своего прокси не подтверждены: {error}")),
+        }
+    } else if configured.is_some() { upstream::clear()?; }
+    if cancellation.load(Ordering::SeqCst) { return Ok(()); }
+    #[cfg(windows)]
+    {
+        if native.disable_dns { disable_dns_effect(ctx)?; }
+        else if native.enable_dns { enable_dns_effect(ctx)?; }
+        else if native.update_shared_program || native.ensure_relay || native.stop_relay || native.watchdog.is_some() {
+            background_roles_effect(ctx, wanted.dns || routes_want_relay(wanted), wanted.auto_patch_wanted())?;
+        }
+        if cancellation.load(Ordering::SeqCst) { return Ok(()); }
+        let local_applied = endpoint::proxy_env_is_ours();
+        if wanted.local_proxy && !local_applied { enable_local_proxy_effect(ctx)?; }
+        else if !wanted.local_proxy && local_applied { disable_local_proxy_effect(ctx)?; }
+        if cancellation.load(Ordering::SeqCst) { return Ok(()); }
+        return Ok(());
+    }
+    #[cfg(not(windows))]
+    {
+    let rules = dns::is_nrpt_applied();
+    let relay = background::is_running();
+    let relay_outdated = background::relay_is_outdated();
+    if wanted.dns && (!rules || !relay || relay_outdated) {
+        if cfg!(windows) && !is_admin() { ctx.log(Level::Warn, "Для применения DNS нужны права администратора."); }
+        else { enable_dns_effect(ctx)?; }
+    } else if !wanted.dns && rules { disable_dns_effect(ctx)?; }
+    if cancellation.load(Ordering::SeqCst) { return Ok(()); }
+    let local_applied = endpoint::proxy_env_is_ours();
+    if wanted.local_proxy && (!local_applied || !background::is_running() || background::relay_is_outdated()) {
+        if background::is_running() && !background::relay_is_outdated() { enable_local_proxy_effect(ctx)?; }
+        else { ensure_route_carrier(ctx)?; }
+    } else if !wanted.local_proxy && local_applied { disable_local_proxy_effect(ctx)?; }
+    if cancellation.load(Ordering::SeqCst) { return Ok(()); }
+    let watchdog = background::is_watchdog_enabled();
+    if wanted.auto_patch != watchdog {
+        if cfg!(windows) && !is_admin() { ctx.log(Level::Warn, "Для применения автопатча нужны права администратора."); }
+        else { set_watchdog_effect(ctx, wanted.auto_patch)?; }
+    }
+    Ok(())
+    }
+}
 
 /// «Включить всё». Each part only if it is not on already, and in the order the
 /// switches themselves need: the patch first (it closes Antigravity, so nothing
 /// is holding a file), then the relay (I5 - the rules name it), the proxy
 /// variable only once something answers on its port (I53), and auto-patch last,
 /// because it runs out of the relay's install directory.
-fn enable_all(ctx: &mut Ctx) {
+fn enable_all(ctx: &mut Ctx) -> Result<(), String> {
     let admin = is_admin() || !cfg!(target_os = "windows");
     // "Everything" includes the patch on installs that do not exist yet.
     ctx.settings.patch_declined = false;
@@ -1382,7 +2504,7 @@ fn enable_all(ctx: &mut Ctx) {
     // and closing it for a no-op is exactly the kind of surprise this button
     // must not have.
     if !patch_is_on(ctx) {
-        apply(ctx, Cap::ClientPatch, true);
+        apply(ctx, Cap::ClientPatch, true)?;
     }
     // Nothing but a line in settings.json, so it needs nobody's permission.
     // The service they ride on is brought up below, with DNS.
@@ -1394,28 +2516,25 @@ fn enable_all(ctx: &mut Ctx) {
         if !admin {
             // Said only when it is actually missing: the card offers this button
             // for a patch that is off too, with the bypass already running.
-            ctx.log(
-                Level::Warn,
-                "Обход ошибки 400 не включён: нужны права администратора. Нажмите «Перезапустить от имени администратора».",
-            );
-            return;
+            return Err("Обход ошибки 400 не включён: нужны права администратора. Нажмите «Перезапустить от имени администратора».".into());
         }
-        apply(ctx, Cap::Dns, true);
+        apply(ctx, Cap::Dns, true)?;
     }
     // A proxy the user set up themselves stays theirs (G33): `enable_local_proxy`
     // says so and leaves ours off, which also keeps the loopback door shut.
     if !endpoint::proxy_env_is_ours() {
-        apply(ctx, Cap::LocalProxy, true);
+        apply(ctx, Cap::LocalProxy, true)?;
     }
     // Whether or not the patch found anything to patch: auto-patch is what
     // patches the Antigravity installed after this click (D27).
     if watchdog_allowed(admin) && !background::is_watchdog_enabled() {
-        apply(ctx, Cap::Watchdog, true);
+        apply(ctx, Cap::Watchdog, true)?;
     }
     ctx.log(
         Level::Ok,
         "Готово. Откройте Antigravity и напишите что-нибудь в чат — здесь появится подтверждение, что модель ответила.",
     );
+    Ok(())
 }
 
 fn patch_is_on(ctx: &Ctx) -> bool {
@@ -1428,13 +2547,9 @@ fn patch_is_on(ctx: &Ctx) -> bool {
 /// task's restart policy gave up on, a relay older than this build, an antivirus
 /// that ate the copy in `%ProgramData%` - and every one of those is fixed by
 /// installing it again and putting its rules and variable back.
-fn repair(ctx: &mut Ctx) {
+fn repair(ctx: &mut Ctx) -> Result<(), String> {
     if cfg!(target_os = "windows") && !is_admin() {
-        ctx.log(
-            Level::Err,
-            "Нужны права администратора. Нажмите «Перезапустить от имени администратора».",
-        );
-        return;
+        return Err("Нужны права администратора. Нажмите «Перезапустить от имени администратора».".into());
     }
     // DNS is put back only when it was wanted, or when nothing else is: a user
     // running just their own proxy must not get DNS rules from a repair.
@@ -1442,18 +2557,19 @@ fn repair(ctx: &mut Ctx) {
     if with_dns {
         ctx.settings.dns = true;
     }
-    // `ensure_running` reinstalls only a copy that differs from this build;
-    // a relay that is merely stopped or outdated needs the full `enable`.
-    if let Err(e) = background::enable() {
-        ctx.log(Level::Err, format!("Служба обхода не запустилась: {}", e));
-        return;
-    }
-    ctx.log(Level::Ok, "Служба обхода переустановлена и запущена.");
+    #[cfg(windows)]
+    let reconciled = background_roles_effect(ctx,
+        ctx.settings.dns || routes_want_relay(&ctx.settings), ctx.settings.auto_patch_wanted());
+    #[cfg(not(windows))]
+    let reconciled = background::enable();
+    reconciled.map_err(|error| format!("Служба обхода не подготовлена: {error}"))?;
+    ctx.log(Level::Ok, "Выбранное состояние служб обхода подтверждено.");
     if with_dns {
-        enable_dns(ctx);
+        enable_dns_effect(ctx)?;
     } else {
-        ensure_route_carrier(ctx);
+        ensure_route_carrier(ctx)?;
     }
+    Ok(())
 }
 
 // --- client patch ----------------------------------------------------------
@@ -1481,12 +2597,9 @@ fn settle_decline(ctx: &mut Ctx) {
 /// patch was not switched off by hand. True when something was written, so the
 /// caller knows the dots need a deep re-read.
 ///
-/// The watchdog's own primitive, not `enable_client_patch`: that one closes
-/// every Antigravity process up front, which is right for a button the user
-/// pressed and wrong for something nobody asked for this second. This one
-/// closes a process only when a binary it holds cannot be written otherwise -
-/// and Desktop restarts its language server by itself and reloads the window,
-/// which is what brings a black window back to life.
+/// Uses the watchdog's selected-file writer. On Windows a busy native file is
+/// held for a normal application close; this operation owns no process-kill
+/// capability. Its cancellation and first write failure stop later files.
 fn auto_patch_found(ctx: &mut Ctx) -> bool {
     // Only while the switch is drawn on («при включенной опции»). Its state is
     // the standalone task, which a user without admin rights cannot have and
@@ -1522,6 +2635,7 @@ fn patch_found(ctx: &mut Ctx, found: Vec<(&'static str, PathBuf)>) -> bool {
     ctx.busy(Some("Автопатч"));
     let mut wrote = false;
     for (label, inst) in found {
+        if ctx.native_cancel.load(Ordering::SeqCst) { break; }
         // Never a password prompt nobody asked for: the automatic pass leaves a
         // root-owned install to the button, which asks.
         if crate::elevate::needs_root(&inst) {
@@ -1537,7 +2651,7 @@ fn patch_found(ctx: &mut Ctx, found: Vec<(&'static str, PathBuf)>) -> bool {
         let mut patched = 0usize;
         let mut unknown = 0usize;
         let mut failed: Option<String> = None;
-        for (_, outcome) in crate::watchdog::patch_now(&inst) {
+        for (_, outcome) in crate::watchdog::patch_now_received(&inst, &ctx.native_cancel) {
             match outcome {
                 patch_binary::RepatchOutcome::Repatched(_) => patched += 1,
                 patch_binary::RepatchOutcome::AlreadyPatched => {}
@@ -1561,6 +2675,7 @@ fn patch_found(ctx: &mut Ctx, found: Vec<(&'static str, PathBuf)>) -> bool {
                     label, e
                 ),
             );
+            break;
         } else if unknown > 0 && patched == 0 {
             // The watchdog's rule (I19): a build this patcher does not know is
             // left exactly as it is, so Antigravity shows its own error.
@@ -1583,25 +2698,34 @@ fn patch_found(ctx: &mut Ctx, found: Vec<(&'static str, PathBuf)>) -> bool {
     wrote
 }
 
+#[cfg(not(windows))]
 fn enable_client_patch(ctx: &mut Ctx) -> bool {
+    let result = enable_client_patch_received(ctx);
+    match result { Ok(value) => value, Err(error) => { ctx.log(Level::Err, error); false } }
+}
+
+fn legacy_client_targets(ctx: &Ctx) -> Vec<PathBuf> {
+    let mut targets = crate::find_all_installs();
+    for path in &ctx.settings.manual_paths { if !targets.contains(path) { targets.push(path.clone()); } }
+    targets
+}
+
+fn enable_client_patch_received(ctx: &mut Ctx, #[cfg(windows)] plan: Option<&AllTargetApplyPlan>) -> Result<bool, String> {
     ctx.log(Level::Step, "Патч клиента Antigravity");
+    #[cfg(not(windows))]
     patch_binary::kill_affected_processes();
 
-    let installs = crate::find_all_installs();
-    let manual: Vec<PathBuf> = ctx.settings.manual_paths.clone();
-    let mut targets = installs;
-    for p in manual {
-        if !targets.contains(&p) {
-            targets.push(p);
-        }
-    }
+    #[cfg(windows)]
+    let targets = match plan { Some(plan) => plan.targets.iter().map(|target| target.root().to_owned()).collect(), None => legacy_client_targets(ctx) };
+    #[cfg(not(windows))]
+    let targets = legacy_client_targets(ctx);
 
     if targets.is_empty() {
         ctx.log(
             Level::Err,
             "Установки Antigravity не найдены. Укажите путь вручную (карандаш).",
         );
-        return false;
+        return Ok(false);
     }
 
     // Recomputed every run: see Ctx::proxy_var_carried.
@@ -1610,6 +2734,17 @@ fn enable_client_patch(ctx: &mut Ctx) -> bool {
 
     let mut ok = 0usize;
     for inst in &targets {
+        if ctx.native_cancel.load(Ordering::SeqCst) {
+            return Err(format!("Патч отменён перед следующей установкой; завершено установок: {ok}."));
+        }
+        #[cfg(windows)]
+        let expected = if let Some(plan) = plan {
+            let target = plan.targets.iter().find(|target| target.root() == inst).ok_or("planned target is missing")?;
+            target.recheck()?;
+            Some(target.kind)
+        } else { Some(crate::receive_installation_layout(inst)?.kind) };
+        #[cfg(not(windows))]
+        let expected = None;
         // A root-owned Linux install: only this write is done as root, behind
         // the desktop's password prompt (`elevate`).
         if crate::elevate::needs_root(inst) {
@@ -1636,7 +2771,7 @@ fn enable_client_patch(ctx: &mut Ctx) -> bool {
             }
             continue;
         }
-        match crate::process_install(inst) {
+        match crate::process_install_received(inst, expected) {
             Ok(outcome) => {
                 ok += 1;
                 if outcome.summary.proxy_var > 0 {
@@ -1657,20 +2792,18 @@ fn enable_client_patch(ctx: &mut Ctx) -> bool {
                     ctx.log(Level::Warn, w);
                 }
             }
-            Err(e) => ctx.log(
-                Level::Err,
-                format!(
-                    "{} — {}",
-                    crate::utils::mask_path(&inst.display().to_string()),
-                    e
-                ),
-            ),
+            Err(e) => {
+                #[cfg(windows)]
+                return Err(format!("Запись установки остановлена; завершено установок: {ok}; {} — {e}", crate::utils::mask_path(&inst.display().to_string())));
+                #[cfg(not(windows))]
+                ctx.log(Level::Err, format!("{} — {e}", crate::utils::mask_path(&inst.display().to_string())));
+            },
         }
     }
 
     if ok == 0 {
         ctx.log(Level::Err, "Ни одна установка не пропатчена.");
-        return false;
+        return Ok(false);
     }
 
     // I39: the legacy CA comes out last, and `remove_legacy_ca` itself refuses
@@ -1678,42 +2811,82 @@ fn enable_client_patch(ctx: &mut Ctx) -> bool {
     crate::remove_legacy_ca_quiet();
 
     ctx.log(Level::Ok, format!("Пропатчено установок: {}", ok));
-    true
+    Ok(true)
 }
 
+#[cfg(not(windows))]
 fn disable_client_patch(ctx: &mut Ctx) {
-    ctx.log(Level::Step, "Снятие патча клиента");
+    let result = disable_client_patch_received(ctx);
+    if let Err(error) = result { ctx.log(Level::Err, error); }
+}
 
-    // I20: a live watchdog treats an unpatch as an update and puts the patch
-    // straight back. Both of them stop first — the standalone task and the one
-    // that runs inside the relay — and are restored below to whatever the user
-    // still has switched on.
-    // The relay comes back if the user still wants the DNS bypass. The watchdog
-    // does NOT: a watchdog is a process whose whole job is to put the patch back.
-    // Restoring it here undid the unpatch about four seconds later and flipped
-    // the switch on again. The relay's own watchdog thread comes back with the
-    // relay and stays idle, because `patch_declined` is already on disk - the
-    // caller saved it before calling this, and the relay reads the file fresh
-    // when it starts (a save after the relay was up would lose the race to its
-    // first two polls). `settings.auto_patch` keeps its value, so the watchdog
-    // returns the moment the patch does.
-    let want_relay = ctx.settings.dns;
-    background::disable_watchdog();
-    if let Err(e) = background::disable() {
-        ctx.log(Level::Warn, format!("Служба DNS не остановлена: {}", e));
+fn disable_client_patch_received(ctx: &mut Ctx, #[cfg(windows)] plan: Option<&AllTargetApplyPlan>) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        if plan.is_none() && !ctx.settings.dns && dns::checked_nrpt_state()?.owned_rules_present {
+            remove_dns_rules_effect(ctx)?;
+        }
+        let desired = background::BackgroundDesired { relay: ctx.settings.dns || routes_want_relay(&ctx.settings),
+            watchdog: ctx.settings.auto_patch_wanted() };
+        let cancellation = ctx.native_cancel.clone();
+        if plan.is_none_or(|plan| plan.native.revert_services) {
+            let receiving = background::with_suspended_background(desired, &cancellation, || revert_client_primary(ctx, plan));
+            let restoration = receiving.background.result.clone();
+            let primary = receiving.primary;
+            ctx.background_receivings.push(receiving.background);
+            return receive_client_undo(primary, restoration);
+        }
+        return receive_client_undo(Some(revert_client_primary(ctx, plan)), Ok(()));
     }
+    #[cfg(not(windows))]
+    {
+        background::disable_watchdog();
+        background::disable()?;
+        let primary = revert_client_primary(ctx);
+        let restoration = if ctx.settings.dns || routes_want_relay(&ctx.settings) { background::ensure_running() } else { Ok(()) };
+        receive_client_undo(Some(primary), restoration)
+    }
+}
 
+fn receive_client_undo(primary: Option<Result<crate::elevate::Reverted, crate::elevate::Reverted>>,
+    restoration: Result<(), String>) -> Result<(), String> {
+    let primary_error = match primary {
+        Some(Ok(_)) => None,
+        Some(Err(outcome)) => Some(format!("Отмена файлов: подтверждено {}; предупреждения {}; ошибки {}",
+            outcome.files, outcome.warnings.join("; "), outcome.errors.join("; "))),
+        None => Some("Отмена файлов не вызывалась: владение/приостановка не получены.".into()),
+    };
+    match (primary_error, restoration) {
+        (None, Ok(())) => Ok(()),
+        (Some(primary), Ok(())) => Err(primary),
+        (None, Err(restoration)) => Err(format!("Файлы получены, но восстановление служб не завершено: {restoration}")),
+        (Some(primary), Err(restoration)) => Err(format!("{primary}; восстановление служб: {restoration}")),
+    }
+}
+
+fn revert_client_primary(ctx: &mut Ctx, #[cfg(windows)] plan: Option<&AllTargetApplyPlan>)
+    -> Result<crate::elevate::Reverted, crate::elevate::Reverted> {
+    ctx.log(Level::Step, "Снятие патча клиента");
+    let mut receiving = crate::elevate::Reverted::default();
+    let primary = (|| -> Result<(), String> {
+
+    #[cfg(not(windows))]
     patch_binary::kill_affected_processes();
 
-    let mut targets = crate::find_all_installs();
-    for p in ctx.settings.manual_paths.clone() {
-        if !targets.contains(&p) {
-            targets.push(p);
-        }
-    }
 
-    // I45: every step runs, each judged on its own. No `?` between them.
+    #[cfg(windows)]
+    let targets = match plan { Some(plan) => plan.targets.iter().map(|target| target.root().to_owned()).collect(), None => legacy_client_targets(ctx) };
+    #[cfg(not(windows))]
+    let targets = legacy_client_targets(ctx);
+
+    // Independent file work stops on its first actual failure. I20 restoration
+    // is received by the surrounding background owner on every granted exit.
     for inst in &targets {
+        if ctx.native_cancel.load(Ordering::SeqCst) { return Err("Отмена файлов прервана пользователем; восстановление служб обязательно.".into()); }
+        #[cfg(windows)]
+        if let Some(plan) = plan {
+            plan.targets.iter().find(|target| target.root() == inst).ok_or("planned target is missing")?.recheck()?;
+        }
         let where_ = crate::utils::mask_path(&inst.display().to_string());
         // Each file is judged on its own (I45), and a failure is said out loud:
         // a count alone turned "one of two files could not be written" into a
@@ -1739,16 +2912,34 @@ fn disable_client_patch(ctx: &mut Ctx) {
                 }
             }
         } else {
-            crate::elevate::revert_files(inst)
+            #[cfg(windows)]
+            {
+                match crate::elevate::revert_files_checked(inst) {
+                    Ok(done) => done,
+                    Err(done) => {
+                        receiving.files += done.files;
+                        receiving.warnings.extend(done.warnings);
+                        return Err(done.errors.join("; "));
+                    },
+                }
+            }
+            #[cfg(not(windows))]
+            { crate::elevate::revert_files(inst) }
         };
         for e in &done.errors {
+            receiving.errors.push(e.clone());
             ctx.log(Level::Err, format!("{} — {}", where_, e));
         }
         for w in &done.warnings {
+            receiving.warnings.push(w.clone());
             ctx.log(Level::Warn, format!("{} — {}", where_, w));
         }
         let reverted = done.files;
+        receiving.files += reverted;
         if let Err(e) = endpoint::remove_ide(inst) {
+            #[cfg(windows)]
+            return Err(format!("Откат файлов получен, но оверрайд не снят: {e}"));
+            #[cfg(not(windows))]
             ctx.log(Level::Warn, format!("Оверрайд эндпоинта не снят: {}", e));
         }
         ctx.log(
@@ -1757,99 +2948,104 @@ fn disable_client_patch(ctx: &mut Ctx) {
         );
     }
     if let Err(e) = endpoint::remove_cli() {
+        #[cfg(windows)]
+        return Err(format!("Откат файлов получен, но переменная CLI не снята: {e}"));
+        #[cfg(not(windows))]
         ctx.log(Level::Warn, format!("Переменная CLI не снята: {}", e));
     }
 
     // The proxy variable is only read by a patched binary, so an unpatched
     // machine must not keep it: it would sit in the user environment forever,
     // naming a port nothing listens on.
-    disable_local_proxy(ctx);
+    disable_local_proxy_effect(ctx)?;
     ctx.proxy_var_carried = Some(false);
-
-    if want_relay {
-        if let Err(e) = background::ensure_running() {
-            ctx.log(
-                Level::Warn,
-                format!("Служба DNS не поднялась обратно: {}", e),
-            );
-        }
-    }
+    Ok(())
+    })();
+    if let Err(error) = primary { receiving.errors.push(error); }
+    if receiving.errors.is_empty() { Ok(receiving) } else { Err(receiving) }
 }
 
 // --- watchdog --------------------------------------------------------------
 
-fn set_watchdog(ctx: &mut Ctx, on: bool) {
+#[cfg(windows)]
+fn background_roles_effect(ctx: &mut Ctx, relay: bool, watchdog: bool) -> Result<(), String> {
+    let cancellation = ctx.native_cancel.clone();
+    let receiving = background::reconcile_with_receiving(background::BackgroundDesired { relay, watchdog }, &cancellation);
+    let result = receiving.result.clone();
+    // The existing background owner finishes its full private diagnostic before
+    // returning. Retain the complete typed packet before interpreting result.
+    ctx.background_receivings.push(receiving);
+    result
+}
+
+fn set_watchdog_effect(ctx: &mut Ctx, on: bool) -> Result<(), String> {
+    #[cfg(windows)]
+    return background_roles_effect(ctx, ctx.settings.dns || routes_want_relay(&ctx.settings), ctx.settings.auto_patch_wanted());
+    #[cfg(not(windows))]
+    {
     if !on {
         background::disable_watchdog();
         ctx.log(Level::Ok, "Автовосстановление патча отключено.");
-        return;
+        return Ok(());
     }
     // The task launches the copy in %ProgramData%, so it has to be there - but
     // only the file: starting the relay here switched the 400 bypass on for a
     // user who asked for auto-patch alone.
-    if let Err(e) = background::ensure_installed() {
-        ctx.log(
-            Level::Warn,
-            format!("Не удалось установить копию для автопатча: {}", e),
-        );
-    }
-    match background::enable_watchdog() {
-        Ok(()) => ctx.log(Level::Ok, "Автовосстановление патча включено."),
-        Err(e) => ctx.log(Level::Err, format!("Не удалось включить: {}", e)),
+    background::ensure_installed().map_err(|error| format!("Копия для автопатча не установлена: {error}"))?;
+    background::enable_watchdog().map_err(|error| format!("Автопатч не включён: {error}"))?;
+    ctx.log(Level::Ok, "Автовосстановление патча включено.");
+    Ok(())
     }
 }
 
 // --- DNS -------------------------------------------------------------------
 
-fn enable_dns(ctx: &mut Ctx) {
+fn enable_dns_effect(ctx: &mut Ctx) -> Result<(), String> {
     ctx.log(Level::Step, "Обход через DNS");
 
     // I5: the rules name the relay as their first nameserver, so it has to be
     // answering before they are written.
-    if let Err(e) = background::ensure_running() {
-        ctx.log(Level::Err, format!("Служба DNS не запустилась: {}", e));
-        return;
-    }
+    #[cfg(windows)]
+    background_roles_effect(ctx, true, ctx.settings.auto_patch_wanted()).map_err(|error| format!("Служба DNS не запустилась: {error}"))?;
+    #[cfg(not(windows))]
+    background::ensure_running().map_err(|error| format!("Служба DNS не запустилась: {error}"))?;
     ctx.log(Level::Ok, "Локальная служба DNS запущена.");
+    if ctx.native_cancel.load(Ordering::SeqCst) {
+        return Err("Служба получена; создание правил DNS отменено.".into());
+    }
 
-    match dns::setup_dns_nrpt() {
-        Ok(outcome) => {
+    let outcome = dns::setup_dns_nrpt().map_err(|error| format!("Служба подготовлена, но правила DNS не установлены: {error}"))?;
             dns::invalidate_cache();
             // The rules are in; what the client cached before them is not ours
             // to keep (G75). The relay does the same at its own start.
-            dns::flush_client_cache();
             if outcome.stood_down_for_vpn {
                 // Not a failure, and not "on" either: with the client measured
                 // inside a tunnel the rules would override the resolver the user
                 // turned on, and the substituted address is reached through the
                 // tunnel anyway (D13, G26, G29).
-                ctx.log(
-                    Level::Warn,
-                    "Обнаружен активный VPN, через который идёт Antigravity — \
-                     правила DNS не создавались. Выключите VPN и включите переключатель заново.",
-                );
+                return Err("Правила DNS не создавались: применение отложено владельцем DNS.".into());
             } else {
                 ctx.log(Level::Ok, "Правила DNS установлены.");
             }
+            if !dns::flush_client_cache() { return Err("Правила DNS установлены, но очистка кэша клиента не завершилась.".into()); }
             if let Some(note) = dns::outcome_note(&outcome) {
                 ctx.log(Level::Info, strip_ansi(&note));
             }
-        }
-        Err(e) => ctx.log(Level::Err, format!("Правила DNS не установлены: {}", e)),
-    }
 
     // Both of these were taken down *by* `disable_dns` rather than by the user,
     // so they come back with it. Anything the user switched off themselves stays
     // off: these read the saved wish, not the previous system state.
     if ctx.settings.local_proxy && !endpoint::proxy_env_is_ours() {
-        enable_local_proxy(ctx);
+        enable_local_proxy_effect(ctx)?;
     }
+    #[cfg(not(windows))]
     if ctx.settings.auto_patch_wanted() && !background::is_watchdog_enabled() {
-        set_watchdog(ctx, true);
+        set_watchdog_effect(ctx, true)?;
     }
+    Ok(())
 }
 
-fn disable_dns(ctx: &mut Ctx) {
+fn disable_dns_effect(ctx: &mut Ctx) -> Result<(), String> {
     ctx.log(Level::Step, "Отключение обхода через DNS");
 
     // The relay is also the carrier of every route (local proxy, own proxy,
@@ -1863,28 +3059,33 @@ fn disable_dns(ctx: &mut Ctx) {
     // `dial tcp 127.0.0.1: ... actively refused` (I53, G31). The user's wish for
     // the proxy is kept in settings, so it comes back when the relay does.
     if !keep_relay && endpoint::proxy_env_is_ours() {
-        disable_local_proxy(ctx);
+        disable_local_proxy_effect(ctx)?;
     }
 
-    // I45: both steps run regardless of what the first one did.
-    dns::remove_dns_nrpt();
-    dns::invalidate_cache();
-    ctx.log(Level::Ok, "Правила DNS сняты.");
+    remove_dns_rules_effect(ctx)?;
     if keep_relay {
         ctx.log(
             Level::Info,
             "Служба осталась запущенной: она нужна включённым прокси и выходам.",
         );
     } else {
-        stop_relay(ctx);
+        stop_relay_effect(ctx)?;
         // Again, after: the relay's own maintainer re-reads the settings on a
         // timer and may have put the variable back between the removal above and
         // the stop, leaving it on a port nothing answers (the window's switch
         // read off while Antigravity still died on `actively refused`).
         if endpoint::proxy_env_is_ours() {
-            disable_local_proxy(ctx);
+            disable_local_proxy_effect(ctx)?;
         }
     }
+    Ok(())
+}
+
+fn remove_dns_rules_effect(ctx: &mut Ctx) -> Result<(), String> {
+    dns::remove_dns_nrpt_checked()?;
+    dns::invalidate_cache();
+    ctx.log(Level::Ok, "Правила DNS сняты.");
+    Ok(())
 }
 
 /// Takes the relay service down for good, with auto-patch kept.
@@ -1893,20 +3094,23 @@ fn disable_dns(ctx: &mut Ctx) {
 /// `background::disable` is about to delete. It is taken down first and put
 /// back after, on a copy of its own: auto-patch is not part of the bypass,
 /// and switching the bypass off must not switch it off too.
-fn stop_relay(ctx: &mut Ctx) {
-    let restore_watchdog = ctx.settings.auto_patch && background::is_watchdog_enabled();
+fn stop_relay_effect(ctx: &mut Ctx) -> Result<(), String> {
+    #[cfg(windows)]
+    return background_roles_effect(ctx, false, ctx.settings.auto_patch_wanted());
+    #[cfg(not(windows))]
+    {
+    let watchdog_enabled = background::is_watchdog_enabled();
+    let restore_watchdog = ctx.settings.auto_patch && watchdog_enabled;
     if restore_watchdog {
         background::disable_watchdog();
+        ctx.log(Level::Ok, "Автопатч временно остановлен перед отключением службы.");
     }
-    match background::disable() {
-        Ok(()) => ctx.log(Level::Ok, "Локальная служба DNS остановлена."),
-        Err(e) => ctx.log(
-            Level::Warn,
-            format!("Служба остановлена не полностью: {}", e),
-        ),
-    }
+    background::disable().map_err(|error| format!("Отключение службы не завершено; следующие действия остановлены: {error}"))?;
+    ctx.log(Level::Ok, "Локальная служба DNS остановлена.");
     if restore_watchdog {
-        set_watchdog(ctx, true);
+        set_watchdog_effect(ctx, true)?;
+    }
+    Ok(())
     }
 }
 
@@ -1924,52 +3128,53 @@ fn routes_want_relay(s: &Settings) -> bool {
 /// carried nothing - which is exactly how «свой прокси» "did not work" with the
 /// other ways off. Starts the service and points the client at it; the DNS
 /// rules are not touched.
-fn ensure_route_carrier(ctx: &mut Ctx) {
+fn ensure_route_carrier(ctx: &mut Ctx) -> Result<(), String> {
+    if ctx.native_cancel.load(Ordering::SeqCst) { return Err("Подготовка службы отменена.".into()); }
     if cfg!(target_os = "windows") && !is_admin() {
-        ctx.log(
-            Level::Warn,
-            "Служба обхода не запущена: нужны права администратора. Нажмите «Перезапустить от имени администратора».",
-        );
-        return;
+        return Err("Служба обхода не запущена: нужны права администратора. Нажмите «Перезапустить от имени администратора».".into());
     }
-    if let Err(e) = background::ensure_running() {
-        ctx.log(Level::Err, format!("Служба обхода не запустилась: {}", e));
-        return;
-    }
+    #[cfg(windows)]
+    let reconciled = background_roles_effect(ctx,
+        ctx.settings.dns || routes_want_relay(&ctx.settings), ctx.settings.auto_patch_wanted());
+    #[cfg(not(windows))]
+    let reconciled = background::ensure_running();
+    reconciled.map_err(|error| format!("Служба обхода не запустилась: {error}"))?;
+    if ctx.native_cancel.load(Ordering::SeqCst) { return Err("Служба получена; настройка прокси отменена.".into()); }
     // Wanted, whatever `enable_local_proxy` manages below: the relay writes the
     // variable itself once its listener answers, and the door opens only while
     // this is set (`loopback::is_up`).
     if !ctx.settings.local_proxy {
         ctx.carrier_set_proxy = true;
+        ctx.settings.local_proxy = true;
+        ctx.settings.save();
     }
-    ctx.settings.local_proxy = true;
-    ctx.settings.save();
     if !endpoint::proxy_env_is_ours() {
-        enable_local_proxy(ctx);
+        enable_local_proxy_effect(ctx)?;
     }
+    Ok(())
 }
 
 /// The counterpart: a route went off, and if nothing else wants the service it
 /// goes too. Not while DNS is on - then it is the DNS layer's.
-fn release_route_carrier(ctx: &mut Ctx) {
+fn release_route_carrier(ctx: &mut Ctx) -> Result<(), String> {
     if ctx.settings.dns || routes_want_relay_without_proxy_var(&ctx.settings) {
-        return;
+        return Ok(());
     }
     if cfg!(target_os = "windows") && !is_admin() {
-        return;
+        return Err("Отключение службы требует прав администратора.".into());
     }
     if ctx.carrier_set_proxy {
         ctx.carrier_set_proxy = false;
         ctx.settings.local_proxy = false;
         if endpoint::proxy_env_is_ours() {
-            disable_local_proxy(ctx);
+            disable_local_proxy_effect(ctx)?;
         }
     }
     // The local proxy switched on by the user keeps the service.
     if ctx.settings.local_proxy {
-        return;
+        return Ok(());
     }
-    stop_relay(ctx);
+    stop_relay_effect(ctx)
 }
 
 /// `routes_want_relay` minus the proxy variable's own wish: a route's carrier
@@ -1988,30 +3193,31 @@ fn routes_want_relay_without_proxy_var(s: &Settings) -> bool {
 /// Returns whether it actually went near the system — the caller uses that to
 /// decide whether the following refresh has anything new to read.
 fn reapply_dns_rules(ctx: &mut Ctx) -> bool {
+    match reapply_dns_rules_checked(ctx) {
+        Ok(changed) => changed,
+        Err(error) => { ctx.log(Level::Warn, error); false },
+    }
+}
+
+fn reapply_dns_rules_checked(ctx: &mut Ctx) -> Result<bool, String> {
+    if ctx.native_cancel.load(Ordering::SeqCst) { return Err("Изменение правил DNS отменено.".into()); }
     if !dns::is_nrpt_applied() {
-        return false;
+        return Ok(false);
     }
     if !is_admin() && cfg!(target_os = "windows") {
-        ctx.log(
-            Level::Warn,
-            "Список DNS сохранён, но правила не переписаны — нужны права администратора.",
-        );
-        return false;
+        return Err("Список DNS сохранён, но правила не переписаны — нужны права администратора.".into());
     }
-    match dns::setup_dns_nrpt() {
-        Ok(_) => {
-            dns::invalidate_cache();
-            dns::flush_client_cache();
-            ctx.log(Level::Ok, "Правила DNS переписаны под новый список.");
-        }
-        Err(e) => ctx.log(Level::Warn, format!("Правила DNS не переписаны: {}", e)),
-    }
-    true
+    let outcome = dns::setup_dns_nrpt().map_err(|error| format!("Правила DNS не переписаны: {error}"))?;
+    if outcome.stood_down_for_vpn { return Err("Изменение правил отложено владельцем DNS.".into()); }
+    dns::invalidate_cache();
+    if !dns::flush_client_cache() { return Err("Правила DNS переписаны, но кэш клиента не очищен.".into()); }
+    ctx.log(Level::Ok, "Правила DNS переписаны под новый список.");
+    Ok(true)
 }
 
 // --- local proxy -----------------------------------------------------------
 
-fn enable_local_proxy(ctx: &mut Ctx) {
+fn enable_local_proxy_effect(ctx: &mut Ctx) -> Result<(), String> {
     ctx.log(Level::Step, "Локальный прокси");
     let url = proxy::proxy_url();
 
@@ -2021,8 +3227,7 @@ fn enable_local_proxy(ctx: &mut Ctx) {
         Ok(true) => ctx.log(Level::Ok, "Прежняя общесистемная HTTPS_PROXY снята."),
         Ok(false) => {}
         Err(e) => {
-            ctx.log(Level::Err, format!("Прежняя HTTPS_PROXY не снята: {}", e));
-            return;
+            return Err(format!("Прежняя HTTPS_PROXY не снята: {e}"));
         }
     }
 
@@ -2030,43 +3235,19 @@ fn enable_local_proxy(ctx: &mut Ctx) {
     //    who configured their own proxy must keep it, so ours comes off — this
     //    is not a "skip".
     if endpoint::foreign_proxy(&url).is_some() {
-        match endpoint::remove_proxy(&url, "") {
-            Ok(()) => {
-                ctx.log(
-                    Level::Warn,
-                    "В системе задан свой прокси — наш не включаем, чтобы не перехватывать чужой.",
-                );
-                ctx.settings.local_proxy = false;
-            }
-            // Swallowed by a `let _ =` until `2.15.1_2`, and that is one way the
-            // two readers came apart: the setting went off while the variable
-            // stayed set, so the relay stopped writing it and the window went on
-            // drawing it as on (G74). A removal that did not happen must not be
-            // recorded as a switch that did.
-            Err(e) => ctx.log(
-                Level::Err,
-                format!(
-                    "В системе задан свой прокси, но нашу переменную снять не удалось: {}",
-                    e
-                ),
-            ),
-        }
-        return;
+        endpoint::remove_proxy(&url, "").map_err(|error| format!("Своя переменная прокси не снята при чужом прокси: {error}"))?;
+        return Err("В системе задан свой прокси — наш не включён, чтобы не перехватывать чужой. Выбор сохранён.".into());
     }
 
     // 3. The variable has a private name that only a patched binary reads. If
     //    the rename did not land, writing it is writing into nothing.
     if ctx.proxy_var_carried == Some(false) {
-        ctx.log(
-            Level::Err,
-            if ctx.proxy_var_retryable {
+        return Err(if ctx.proxy_var_retryable {
                 "Файл был занят — закройте Antigravity полностью и включите переключатель заново."
             } else {
                 "В этой сборке Antigravity нет места для переменной прокси — \
                  вероятно, вышла новая версия и нужен более новый анлокер."
-            },
-        );
-        return;
+            }.into());
     }
 
     // 4. I53/G31: never name a listener that is not there. A variable pointing
@@ -2074,29 +3255,23 @@ fn enable_local_proxy(ctx: &mut Ctx) {
     //    Named by the port that answered, not the one read above: the relay can
     //    move the proxy while this waits (P26), and a URL for the port it left
     //    would be a dead one no watchdog takes back off.
-    let Some(port) = proxy::wait_for_our_listener(Duration::from_secs(3)) else {
-        ctx.log(
-            Level::Err,
-            "Локальный прокси не отвечает — сначала включите «Обход через DNS».",
-        );
-        return;
+    let Some(port) = proxy::wait_for_our_listener(Duration::from_secs(3))? else {
+        return Err("Локальный прокси не отвечает — сначала включите «Обход через DNS».".into());
     };
     let url = proxy::url_at(port);
 
-    match endpoint::apply_proxy(&url, "") {
-        Ok(_) => ctx.log(Level::Ok, "Локальный прокси включён."),
-        Err(e) => ctx.log(Level::Err, format!("Не удалось включить: {}", e)),
-    }
+    endpoint::apply_proxy(&url, "").map_err(|error| format!("Локальный прокси не включён: {error}"))?;
+    ctx.log(Level::Ok, "Локальный прокси включён.");
+    Ok(())
 }
 
-fn disable_local_proxy(ctx: &mut Ctx) {
+fn disable_local_proxy_effect(ctx: &mut Ctx) -> Result<(), String> {
     let url = proxy::proxy_url();
     // I45 again: `remove_proxy` collects its own failures and joins them, so a
     // half-failed removal still takes off everything it can.
-    match endpoint::remove_proxy(&url, "") {
-        Ok(()) => ctx.log(Level::Ok, "Локальный прокси отключён."),
-        Err(e) => ctx.log(Level::Warn, format!("Снято не полностью: {}", e)),
-    }
+    endpoint::remove_proxy(&url, "").map_err(|error| format!("Снято не полностью: {error}"))?;
+    ctx.log(Level::Ok, "Локальный прокси отключён.");
+    Ok(())
 }
 
 // --- own proxy -------------------------------------------------------------
@@ -2138,22 +3313,20 @@ fn set_custom_dns(ctx: &mut Ctx, text: &str) {
     );
 }
 
-fn set_own_proxy(ctx: &mut Ctx, text: &str) {
+fn set_own_proxy(ctx: &mut Ctx, text: &str) -> Result<(), String> {
     ctx.settings.own_proxy = text.trim().to_string();
     if ctx.settings.own_proxy.is_empty() {
-        upstream::clear();
         ctx.settings.own_proxy_enabled = false;
+        upstream::clear()?;
         ctx.log(Level::Ok, "Свой прокси убран.");
-        release_route_carrier(ctx);
-        return;
+        return release_route_carrier(ctx);
     }
 
     let up = match upstream::parse(&ctx.settings.own_proxy) {
         Ok(u) => u,
         Err(e) => {
-            ctx.log(Level::Err, format!("Адрес не разобран: {}", e));
             ctx.settings.own_proxy_enabled = false;
-            return;
+            return Err(format!("Адрес не разобран: {e}"));
         }
     };
 
@@ -2163,15 +3336,14 @@ fn set_own_proxy(ctx: &mut Ctx, text: &str) {
     // one that draws a region 400 is benched by the watch (G81). Refusing to save
     // it made the user keep a proxy they wanted out of the table altogether.
     if let Err(e) = upstream::save(&up) {
-        ctx.log(Level::Err, format!("Не сохранён: {}", e));
         ctx.settings.own_proxy_enabled = false;
-        return;
+        return Err(format!("Не сохранён: {e}"));
     }
     ctx.settings.own_proxy_enabled = true;
     ctx.settings.own_proxy_at = crate::gate::now_unix();
     ctx.log(Level::Ok, format!("Свой прокси включён: {}", up.display()));
     // Alone it needs the service and the variable; DNS is not part of it.
-    ensure_route_carrier(ctx);
+    ensure_route_carrier(ctx)?;
 
     // Whether it carries a request to Google, and nothing else. Its exit country
     // is never traced (D34): through the user's proxy the only traffic is to
@@ -2191,6 +3363,7 @@ fn set_own_proxy(ctx: &mut Ctx, text: &str) {
             );
         }
     }
+    Ok(())
 }
 
 /// Strips SGR escapes from a string built for a terminal.
@@ -2222,7 +3395,227 @@ pub fn resolve_manual_path(raw: &Path) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[cfg(windows)]
+    fn later_plan_failure_or_cancel_preserves_recovery_results_including_error_after_publish() {
+        let completed = vec!["scope A: RecoverySettled; actualCurrent=Settled digest=A".to_owned()];
+        for later in ["selected target B failed", "Cancelled: fresh plan receiving"] {
+            let message = apply_receiving_failure(later, &completed);
+            assert!(message.contains(&completed[0]) && message.contains(later));
+            assert!(!message.contains("до изменений"));
+        }
+        let partial = vec!["scope A: readiness Err after publish; actualCurrent=Settled digest=P".to_owned()];
+        let message = apply_receiving_failure("NotReady", &partial);
+        assert!(message.contains(&partial[0]) && !message.contains("до изменений"));
+        assert!(apply_receiving_failure("read-only failure", &[]).contains("до изменений"));
+    }
+    #[test]
+    #[cfg(windows)]
+    fn positive_apply_pending_tuple_is_once_per_intent_and_cancel_is_effect_free() {
+        let mut attempted = std::collections::BTreeSet::new();
+        let cancel = AtomicBool::new(false);
+        let pending = crate::windows_coordinator::windows_installation::GatewayPendingObservation {
+            slot_id: "a".repeat(32), operation_id: "b".repeat(32), current_sha256: [7;32],
+        };
+        receive_gateway_prerequisite_once(&mut attempted, &pending, &cancel).unwrap();
+        assert!(receive_gateway_prerequisite_once(&mut attempted, &pending, &cancel).unwrap_err().contains("same Pending"));
+        assert_eq!(attempted.len(), 1);
+        cancel.store(true, Ordering::SeqCst);
+        let other = crate::windows_coordinator::windows_installation::GatewayPendingObservation {
+            slot_id: "c".repeat(32), ..pending.clone()
+        };
+        assert!(receive_gateway_prerequisite_once(&mut attempted, &other, &cancel).unwrap_err().starts_with("Cancelled:"));
+        assert_eq!(attempted.len(), 1);
+        let mut fresh_positive_apply = std::collections::BTreeSet::new();
+        cancel.store(false, Ordering::SeqCst);
+        receive_gateway_prerequisite_once(&mut fresh_positive_apply, &pending, &cancel).unwrap();
+    }
+    #[test]
+    fn refresh_waits_for_owned_native_settlement_and_coalesces() {
+        use std::sync::mpsc;
+        let (release, wait) = mpsc::channel::<()>();
+        let (entered, received) = mpsc::channel();
+        let job = std::thread::spawn(move || { entered.send(()).unwrap(); wait.recv().unwrap(); });
+        received.recv().unwrap();
+        let mut requested = true; // startup
+        assert!(super::receive_wsl_refresh_command(&mut requested, &Some(super::Cmd::RefreshWsl)));
+        assert!(super::receive_wsl_refresh_command(&mut requested, &Some(super::Cmd::RefreshWsl)));
+        assert!(!super::take_wsl_refresh(&mut requested, job.is_finished(), &None, &None));
+        assert!(requested);
+        release.send(()).unwrap();
+        job.join().unwrap();
+        let mut queries = 0;
+        if super::take_wsl_refresh(&mut requested, true, &None, &None) { queries += 1; }
+        if super::take_wsl_refresh(&mut requested, true, &None, &None) { queries += 1; }
+        assert_eq!(queries, 1);
+        requested = true;
+        assert!(!super::receive_wsl_refresh_command(&mut requested, &Some(super::Cmd::CancelWsl)));
+        assert!(!super::take_wsl_refresh(&mut requested, true, &None, &None));
+        requested = true;
+        assert!(!super::receive_wsl_refresh_command(&mut requested, &Some(super::Cmd::Shutdown)));
+        assert!(!super::take_wsl_refresh(&mut requested, true, &None, &None));
+    }
+
+    #[test]
+    fn received_commands_precede_coalesced_refresh() {
+        use super::{Cmd, receive_wsl_refresh_command, take_wsl_refresh};
+        let mut requested = true;
+        assert!(!take_wsl_refresh(&mut requested, true, &Some(Cmd::RequestElevation), &None));
+        #[cfg(windows)]
+        assert!(!take_wsl_refresh(&mut requested, true, &None,
+            &Some(Cmd::Elevate(crate::instances::GuiReplacementAction::ShowMain {}))));
+        assert!(!take_wsl_refresh(&mut requested, true,
+            &Some(Cmd::SetWslDistro { name: "Ubuntu".into(), selected: false }), &None));
+        assert!(receive_wsl_refresh_command(&mut requested, &Some(Cmd::RefreshWsl)));
+        assert!(receive_wsl_refresh_command(&mut requested, &Some(Cmd::RefreshWsl)));
+        assert!(take_wsl_refresh(&mut requested, true, &None, &None));
+        assert!(!take_wsl_refresh(&mut requested, true, &None, &None));
+    }
+
     use super::*;
+
+    #[test]
+    fn client_undo_keeps_primary_and_required_restoration_failures() {
+        let primary = crate::elevate::Reverted { files: 1,
+            errors: vec!["first file I/O failure".into()], warnings: vec!["retained warning".into()] };
+        let error = receive_client_undo(Some(Err(primary)), Err("wanted relay resume failure".into())).unwrap_err();
+        assert!(error.contains("подтверждено 1"));
+        assert!(error.contains("first file I/O failure") && error.contains("retained warning"));
+        assert!(error.contains("wanted relay resume failure"));
+        assert!(receive_client_undo(None, Ok(())).unwrap_err().contains("не вызывалась"));
+    }
+
+    #[test]
+    fn retired_worker_cannot_restart_renderer_or_commit_from_ui_poll() {
+        let lifetime = GuiLifetime::default();
+        assert!(lifetime.can_start_fallback());
+        lifetime.started.store(true, Ordering::SeqCst);
+        lifetime.shutdown_ready.store(true, Ordering::SeqCst);
+        *lifetime.worker.lock().unwrap() = Some(std::thread::spawn(|| {}));
+        while !lifetime.poll_close().unwrap() { std::thread::yield_now(); }
+        assert!(!lifetime.can_retry_renderer());
+        assert!(!lifetime.can_start_fallback());
+        assert!(!lifetime.arming_started.load(Ordering::SeqCst));
+        assert!(!lifetime.replacement_committed());
+        assert!(lifetime.finalize_exit().unwrap());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires an explicit vacant owned AG_GUI_LIFETIME_TEST_ROOT"]
+    fn actual_save_failure_accepts_a_fresh_close_and_joins_before_exit() {
+        let root = PathBuf::from(std::env::var_os("AG_GUI_LIFETIME_TEST_ROOT").expect("owned fixture root required"));
+        crate::windows_coordinator::windows_installation::WindowsLocalPath::parse(root.as_os_str()).unwrap();
+        assert!(!root.exists(), "fixture leaf must be vacant");
+        std::fs::create_dir(&root).unwrap();
+        let local = root.join("local-appdata");
+        std::fs::write(&local, b"owned not-a-directory precondition").unwrap();
+        let previous = std::env::var_os("LOCALAPPDATA");
+        // The exact test runs alone. This worker only calls the shutdown owner;
+        // it never runs startup, discovery, system probes or selected effects.
+        unsafe { std::env::set_var("LOCALAPPDATA", &local); }
+        let lifetime = Arc::new(GuiLifetime::default());
+        struct Restore { lifetime: Arc<GuiLifetime>, previous: Option<std::ffi::OsString> }
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                self.lifetime.command.lock().unwrap().take();
+                if let Some(worker) = self.lifetime.worker.lock().unwrap().take() {
+                    if worker.join().is_err() { eprintln!("owned close fixture worker panicked"); }
+                }
+                unsafe { match &self.previous {
+                    Some(previous) => std::env::set_var("LOCALAPPDATA", previous),
+                    None => std::env::remove_var("LOCALAPPDATA"),
+                } }
+            }
+        }
+        let _restore = Restore { lifetime: lifetime.clone(), previous };
+        let (events, received) = mpsc::channel();
+        let (command, commands) = mpsc::channel();
+        *lifetime.command.lock().unwrap() = Some(command);
+        let worker_lifetime = lifetime.clone();
+        let settings = Settings::default();
+        let expected = settings.clone();
+        let worker = std::thread::spawn(move || {
+            let mut ctx = Ctx { events, wake: Arc::new(Mutex::new(Box::new(|| {}))), settings,
+                wsl: crate::wsl_controller::WslController::default(), native_apply_pending: Arc::new(AtomicBool::new(false)),
+                native_cancel: Arc::new(AtomicBool::new(false)), background_receivings: Vec::new(),
+                lifetime: worker_lifetime.clone(), vpn_job: None, vpn_unsettled: false, startup: Startup::Explicit,
+                proxy_var_carried: None, proxy_var_retryable: false, patched_seen: HashMap::new(), vpn: None,
+                relay_egress: None, last: None, dns_probe: (false, false), carrier_set_proxy: false };
+            while commands.recv().is_ok() { if finish_shutdown(&mut ctx, &worker_lifetime) { return; } }
+        });
+        *lifetime.worker.lock().unwrap() = Some(worker);
+        lifetime.started.store(true, Ordering::SeqCst);
+        lifetime.request_shutdown();
+        loop {
+            match received.recv().unwrap() {
+                Event::Log(Level::Err, _) => break,
+                Event::ShutdownReady => panic!("failed actual save cannot acknowledge retirement"),
+                _ => {},
+            }
+        }
+        while !lifetime.save_failed.load(Ordering::SeqCst) { std::thread::yield_now(); }
+        assert!(lifetime.poll_close().is_err());
+        assert!(!lifetime.shutdown_ready.load(Ordering::SeqCst));
+        std::fs::remove_file(&local).unwrap();
+        std::fs::create_dir(&local).unwrap();
+        lifetime.request_shutdown();
+        while !lifetime.poll_close().unwrap() { std::thread::yield_now(); }
+        assert!(crate::settings::saved_intent_sha256(&expected).is_ok());
+        assert!(!lifetime.can_start_fallback());
+        assert!(!lifetime.arming_started.load(Ordering::SeqCst));
+        assert!(lifetime.finalize_exit().unwrap());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_apply_plan_requires_real_rule_and_relay_noops() {
+        let mut wanted = Settings::default();
+        wanted.dns = true;
+        wanted.local_proxy = false;
+        wanted.own_proxy_enabled = false;
+        wanted.group_proxy = false;
+        wanted.builtin_exits = false;
+        wanted.auto_patch = true;
+        let mut facts = NativeApplyFacts { core_rules: true, owned_rules: true, relay_task: true,
+            relay: Some(NativeRelayFacts { relay_compatible: true,
+                relay_outdated: false, relay_reporting: true }), watchdog_task: true, program_outdated: Some(false) };
+        assert!(!NativeApplyPlan::receive(&wanted, &facts).unwrap().requires_elevation());
+        facts.relay.as_mut().unwrap().relay_reporting = false;
+        assert!(NativeApplyPlan::receive(&wanted, &facts).unwrap().ensure_relay);
+        facts.relay.as_mut().unwrap().relay_reporting = true;
+        wanted.dns = false;
+        facts.core_rules = false;
+        let partial_owned = NativeApplyPlan::receive(&wanted, &facts).unwrap();
+        assert!(partial_owned.disable_dns);
+        assert!(!partial_owned.stop_relay);
+        assert!(partial_owned.requires_elevation());
+        facts.owned_rules = false;
+        assert!(NativeApplyPlan::receive(&wanted, &facts).unwrap().stop_relay);
+        wanted.own_proxy_enabled = true;
+        let retained_carrier = NativeApplyPlan::receive(&wanted, &facts).unwrap();
+        assert!(!retained_carrier.stop_relay);
+        assert!(!retained_carrier.ensure_relay);
+        assert!(!wanted.local_proxy);
+        wanted.own_proxy_enabled = false;
+        facts.relay_task = false;
+        facts.relay = None;
+        // The watchdog has the same image name. That observation alone is not
+        // a positive relay-stop requirement.
+        assert!(!NativeApplyPlan::receive(&wanted, &facts).unwrap().requires_elevation());
+        wanted.local_proxy = true;
+        assert!(NativeApplyPlan::receive(&wanted, &facts).is_err());
+        wanted.local_proxy = false;
+        facts.program_outdated = Some(true);
+        let watchdog_only = NativeApplyPlan::receive(&wanted, &facts).unwrap();
+        assert!(watchdog_only.update_shared_program && watchdog_only.requires_elevation());
+        assert_eq!(watchdog_only.watchdog, None, "generation update must retain the wanted running watchdog");
+        facts.program_outdated = None;
+        assert!(NativeApplyPlan::receive(&wanted, &facts).is_err());
+        wanted.patch_declined = true;
+        let declined = NativeApplyPlan::receive(&wanted, &facts).unwrap();
+        assert_eq!(declined.watchdog, Some(false), "explicit decline owns effective watchdog intent");
+    }
 
     #[test]
     fn terminal_colours_do_not_reach_the_window() {
@@ -2396,8 +3789,17 @@ mod tests {
         let (tx, _rx) = mpsc::channel();
         let mut ctx = Ctx {
             events: tx,
-            wake: Box::new(|| {}),
+            wake: Arc::new(Mutex::new(Box::new(|| {}))),
             settings: Settings::load(),
+            wsl: crate::wsl_controller::WslController::default(),
+            native_apply_pending: Arc::new(AtomicBool::new(false)),
+            native_cancel: Arc::new(AtomicBool::new(false)),
+            #[cfg(windows)]
+            background_receivings: Vec::new(),
+            lifetime: Arc::new(GuiLifetime::default()),
+            vpn_job: None,
+            vpn_unsettled: false,
+            startup: Startup::Ordinary,
             proxy_var_carried: None,
             proxy_var_retryable: false,
             patched_seen: HashMap::new(),
@@ -2429,6 +3831,7 @@ mod tests {
 
     fn blank_status() -> Status {
         Status {
+            wsl: crate::wsl_api::WslStatus::default(),
             admin: true,
             installs: Vec::new(),
             client_patch: State::Off,

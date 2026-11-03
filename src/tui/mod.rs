@@ -17,6 +17,7 @@
 
 use std::io::Write as _;
 use std::sync::mpsc::{channel, Receiver};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{
@@ -60,7 +61,7 @@ pub fn only_terminal() -> bool {
 
 /// Runs until the user quits. `note` is shown first in the journal — why the
 /// window did not open, when that is why we are here.
-pub fn run(note: Option<String>) -> Result<(), String> {
+pub fn run(note: Option<String>, lifetime: Arc<ops::GuiLifetime>) -> Result<(), String> {
     #[cfg(windows)]
     {
         console::open()?;
@@ -87,7 +88,7 @@ pub fn run(note: Option<String>) -> Result<(), String> {
         ratatui::crossterm::event::EnableBracketedPaste
     );
 
-    let result = App::new(note).run(&mut terminal);
+    let result = App::new(note, lifetime).run(&mut terminal);
 
     #[cfg(not(windows))]
     let _ = ratatui::crossterm::execute!(
@@ -116,7 +117,7 @@ enum Input {
 }
 
 /// One selectable line of the main list.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, PartialEq)]
 enum Row {
     /// The status card's one action, when it has one.
     Action(Action),
@@ -134,6 +135,18 @@ enum Row {
     GroupProxyCopy,
     GroupProxyPaste,
     Report,
+    #[cfg(windows)]
+    WslMaster,
+    #[cfg(windows)]
+    WslDistro(String),
+    #[cfg(windows)]
+    WslRefresh,
+    #[cfg(windows)]
+    WslApply,
+    #[cfg(windows)]
+    WslCancel,
+    #[cfg(windows)]
+    WslInfo(String),
 }
 
 struct App {
@@ -165,15 +178,18 @@ struct App {
     /// A line in place of the key hints for a few seconds: what just happened.
     toast: Option<(String, Instant)>,
     quit: bool,
+    shutdown_ready: bool,
+    shutdown_error: Option<String>,
+    lifetime: Arc<ops::GuiLifetime>,
 }
 
 impl App {
-    fn new(note: Option<String>) -> Self {
+    fn new(note: Option<String>, lifetime: Arc<ops::GuiLifetime>) -> Self {
         let (up_tx, update_rx) = channel();
         update::spawn_watch(up_tx, Box::new(|| {}));
         // The loop below polls every 200 ms, so nothing needs waking.
         let (ev_tx, events) = channel();
-        let worker = ops::spawn(ev_tx, Box::new(|| {}));
+        let worker = ops::spawn(ev_tx, Box::new(|| {}), lifetime.clone());
         let (gate_tx, gate_rx) = channel();
         gate::spawn_watch(gate_tx, Box::new(|| {}));
 
@@ -223,6 +239,9 @@ impl App {
             input: None,
             toast: None,
             quit: false,
+            shutdown_ready: false,
+            shutdown_error: None,
+            lifetime,
         }
     }
 
@@ -231,6 +250,19 @@ impl App {
         let mut dirty = true;
         while !self.quit {
             dirty |= self.drain();
+            if self.shutdown_ready {
+                match self.lifetime.poll_close() {
+                    Ok(true) => { self.quit = true; continue; }
+                    Ok(false) => {}
+                    Err(error) => {
+                        if self.shutdown_error.as_ref() != Some(&error) {
+                            self.log.push((Level::Err, format!("Не удалось завершить работу: {error}")));
+                            self.shutdown_error = Some(error);
+                            dirty = true;
+                        }
+                    }
+                }
+            }
             // Ages on the card count up by themselves, so a quiet screen is
             // still redrawn once a second.
             if dirty || drawn_at.is_none_or(|t| t.elapsed() >= Duration::from_secs(1)) {
@@ -283,6 +315,7 @@ impl App {
                 }
                 Event::Status(s) => self.status = Some(*s),
                 Event::Busy(what) => self.busy = what,
+                Event::ShutdownReady => self.shutdown_ready = true,
             }
             any = true;
         }
@@ -298,6 +331,11 @@ impl App {
         self.toast = Some((text.into(), Instant::now()));
     }
 
+    fn request_shutdown(&mut self) {
+        self.lifetime.request_shutdown();
+        self.toast("Завершение работы: ожидаю сохранения и остановки задач.");
+    }
+
     // -----------------------------------------------------------------------
     // Keys
     // -----------------------------------------------------------------------
@@ -306,7 +344,7 @@ impl App {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         // Raw mode turns Ctrl+C into a key; it still means "leave".
         if ctrl && matches!(k.code, KeyCode::Char('c') | KeyCode::Char('C')) {
-            self.quit = true;
+            if k.kind == KeyEventKind::Press { self.request_shutdown(); }
             return;
         }
         if self.screen == Screen::License {
@@ -334,7 +372,7 @@ impl App {
 
     fn on_license_key(&mut self, k: KeyEvent, ctrl: bool) {
         match k.code {
-            KeyCode::Esc => self.quit = true,
+            KeyCode::Esc if k.kind == KeyEventKind::Press => self.request_shutdown(),
             KeyCode::Enter => self.try_key(),
             KeyCode::Backspace => {
                 self.key.pop();
@@ -427,7 +465,7 @@ impl App {
             None => {
                 let at = self.list.selected().unwrap_or(0).min(last);
                 if let Some(r) = rows.get(at) {
-                    self.selected = *r;
+                    self.selected = r.clone();
                 }
                 (at, false)
             }
@@ -436,7 +474,7 @@ impl App {
 
     fn go(&mut self, rows: &[Row], at: usize) {
         if let Some(r) = rows.get(at) {
-            self.selected = *r;
+            self.selected = r.clone();
             self.list.select(Some(at));
         }
     }
@@ -445,7 +483,7 @@ impl App {
         let rows = self.rows();
         let last = rows.len().saturating_sub(1);
         let (at, still_there) = self.cursor(&rows);
-        let row = rows.get(at).copied();
+        let row = rows.get(at).cloned();
         // The row that was on screen under the cursor has just gone: a key that
         // acts on a row was aimed at it, not at its replacement.
         let acts_on_row = matches!(
@@ -462,7 +500,7 @@ impl App {
             return;
         }
         match k.code {
-            KeyCode::Char('q') => self.quit = true,
+            KeyCode::Char('q') if k.kind == KeyEventKind::Press => self.request_shutdown(),
             KeyCode::Up | KeyCode::Char('k') => self.go(&rows, at.saturating_sub(1)),
             KeyCode::Down | KeyCode::Char('j') => self.go(&rows, (at + 1).min(last)),
             KeyCode::PageUp => self.go(&rows, at.saturating_sub(8)),
@@ -578,6 +616,37 @@ impl App {
                 })
             }
             Row::Report => self.save_report(),
+            #[cfg(windows)]
+            Row::WslMaster => {
+                if let Some(wsl) = self.status.as_ref().map(|s| &s.wsl) {
+                    let enabled = wsl.preferences.as_ref().is_some_and(|p| p.enabled);
+                    if !wsl.pending && !wsl.loading { self.worker.send(Cmd::SetWslEnabled(!enabled)); }
+                }
+            }
+            #[cfg(windows)]
+            Row::WslDistro(name) => {
+                if let Some(wsl) = self.status.as_ref().map(|s| &s.wsl) {
+                    if let Some(distro) = wsl.distributions.iter().find(|d| d.name == name) {
+                        if wsl.can_set_distro(&name, !distro.selected) { self.worker.send(Cmd::SetWslDistro { name, selected: !distro.selected }); }
+                    }
+                }
+            }
+            #[cfg(windows)]
+            Row::WslRefresh => {
+                if self.status.as_ref().is_some_and(|s| !s.wsl.loading && !s.wsl.pending) {
+                    self.worker.send(Cmd::RefreshWsl);
+                }
+            }
+            #[cfg(windows)]
+            Row::WslApply => {
+                if self.status.as_ref().is_some_and(|s| !s.wsl.pending) {
+                    self.worker.send(Cmd::ApplySettings);
+                }
+            }
+            #[cfg(windows)]
+            Row::WslCancel => self.worker.send(Cmd::CancelWsl),
+            #[cfg(windows)]
+            Row::WslInfo(_) => {},
         }
     }
 
@@ -599,11 +668,7 @@ impl App {
             Action::Repair => self.worker.send(Cmd::Repair),
             Action::Elevate => {
                 #[cfg(windows)]
-                if crate::utils::relaunch_elevated_with("--tui") {
-                    self.quit = true;
-                    return;
-                }
-                self.toast("Права администратора не получены.");
+                self.worker.send(Cmd::RequestElevation);
             }
             // Opened, and also shown: a terminal with no desktop behind it has
             // no browser to open, and the link is then copied from here.
@@ -717,6 +782,33 @@ impl App {
         rows.push(Row::Cap(Cap::Watchdog));
         let installs = self.status.as_ref().map_or(0, |s| s.installs.len());
         rows.extend((0..installs).map(Row::Install));
+        #[cfg(windows)]
+        {
+            rows.push(Row::WslMaster);
+            if let Some(wsl) = self.status.as_ref().map(|s| &s.wsl) {
+                if wsl.pending { rows.push(Row::WslInfo("Операция выполняется или её завершение ещё не подтверждено".into())); }
+                if wsl.loading { rows.push(Row::WslInfo("Поиск дистрибутивов WSL…".into())); }
+                if let Some(error) = &wsl.error { rows.push(Row::WslInfo(format!("WSL: {error}"))); }
+                if wsl.registration_freshness == crate::wsl_api::RegistrationFreshness::Current && wsl.distributions.is_empty() {
+                    rows.push(Row::WslInfo("Дистрибутивы WSL не найдены".into()));
+                }
+                rows.extend(wsl.distributions.iter().map(|d| Row::WslDistro(d.name.clone())));
+                for result in &wsl.results {
+                    use crate::wsl_api::WslTargetState::*;
+                    let state = match result.state {
+                        Unconfirmed => "Не подтверждено", NotApplied => "Не применено",
+                        Preparing => "Подготовка", ReadyToOpen => "Готово к открытию",
+                        Blocked => "Заблокировано", Pending => "Выполняется",
+                        Failed => "Ошибка", Cancelled => "Отменено",
+                    };
+                    let detail = result.detail.as_deref().map(|s| format!(": {s}")).unwrap_or_default();
+                    rows.push(Row::WslInfo(format!("{}: {state}{detail}", result.name)));
+                }
+                if wsl.pending { rows.push(Row::WslCancel); }
+            }
+            rows.push(Row::WslRefresh);
+            rows.push(Row::WslApply);
+        }
         rows.push(Row::Advanced);
         if self.advanced {
             rows.push(Row::Cap(Cap::Dns));
@@ -775,6 +867,16 @@ impl App {
             Row::Report => {
                 "Всё, что нужно, чтобы понять, почему Antigravity отвечает или нет — одним текстом для группы.".into()
             }
+            #[cfg(windows)]
+            Row::WslMaster | Row::WslDistro(_) => "Пробел — изменить выбор; применение выполняется отдельно.".into(),
+            #[cfg(windows)]
+            Row::WslRefresh => "Enter — обновить список дистрибутивов.".into(),
+            #[cfg(windows)]
+            Row::WslApply => "Enter — применить текущие настройки.".into(),
+            #[cfg(windows)]
+            Row::WslCancel => "Enter — отменить выполнение.".into(),
+            #[cfg(windows)]
+            Row::WslInfo(_) => String::new(),
         }
     }
 
@@ -898,6 +1000,26 @@ impl App {
                 Span::styled("⎘ ", Style::new().fg(Color::Cyan)),
                 Span::raw("Сохранить отчёт"),
             ])),
+            #[cfg(windows)]
+            Row::WslMaster => {
+                let enabled = self.status.as_ref().and_then(|s| s.wsl.preferences.as_ref()).is_some_and(|p| p.enabled);
+                ListItem::new(format!("[{}] применить и для WSL", if enabled { "x" } else { " " }))
+            }
+            #[cfg(windows)]
+            Row::WslDistro(name) => {
+                let distro = self.status.as_ref().and_then(|s| s.wsl.distributions.iter().find(|d| d.name == name));
+                let selected = distro.is_some_and(|d| d.selected);
+                let suffix = match distro { Some(d) if d.registration == crate::wsl_api::RegistrationState::Absent => " — больше не найден", Some(d) if d.registration == crate::wsl_api::RegistrationState::Unknown => " — список не подтверждён", Some(d) if d.running == Some(false) => " — остановлен", _ => "" };
+                ListItem::new(format!("  [{}] {name}{suffix}", if selected { "x" } else { " " }))
+            }
+            #[cfg(windows)]
+            Row::WslRefresh => ListItem::new("  Обновить список WSL"),
+            #[cfg(windows)]
+            Row::WslApply => ListItem::new("  Применить"),
+            #[cfg(windows)]
+            Row::WslCancel => ListItem::new("  Отменить"),
+            #[cfg(windows)]
+            Row::WslInfo(text) => ListItem::new(format!("  {text}")),
         }
     }
 
@@ -1032,13 +1154,13 @@ impl App {
         let rows = self.rows();
         let (at, _) = self.cursor(&rows);
         self.list.select(Some(at));
-        let items: Vec<ListItem> = rows.iter().map(|r| self.row_item(*r, list.width)).collect();
+        let items: Vec<ListItem> = rows.iter().map(|r| self.row_item(r.clone(), list.width)).collect();
         let list_widget = List::new(items)
             .highlight_style(Style::new().add_modifier(Modifier::REVERSED))
             .highlight_symbol("› ");
         f.render_stateful_widget(list_widget, list, &mut self.list);
 
-        let selected = self.list.selected().and_then(|i| rows.get(i).copied());
+        let selected = self.list.selected().and_then(|i| rows.get(i).cloned());
         let hint_text = selected.map(|r| self.row_hint(r)).unwrap_or_default();
         f.render_widget(
             Paragraph::new(hint_text)
@@ -1271,8 +1393,6 @@ fn wrapped_height(text: &str, width: u16) -> u16 {
         .min(usize::from(u16::MAX)) as u16
 }
 
-/// The licence screen, always — except in a *debug* build started with
-/// `AG_UNLOCKER_DEV_SKIP_KEY`, as in the window.
 fn first_screen(settings: &crate::settings::Settings) -> Screen {
     #[cfg(debug_assertions)]
     if std::env::var_os("AG_UNLOCKER_DEV_SKIP_KEY").is_some() {

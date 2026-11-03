@@ -35,10 +35,9 @@ use crate::utils::mask_path;
 // only hide it. `RepatchOutcome::SignatureMissing` is that case, and it is held
 // distinct from a transient `Failed` (a file locked mid-update, worth a retry).
 //
-// Enforcement of "no unpatched server keeps running" needs no separate kill:
-// `patch_binary::write_binary` already kills a process holding the binary open
-// and retries, so a running-but-reverted Language Server is replaced in the
-// same write - and the editor shell, which never holds that file, is untouched.
+// Windows writes require canonical native-file admission. A busy file remains
+// held until its application closes normally; this watcher owns no native
+// process termination capability. Unix retains its existing writer behavior.
 
 /// Cheap to run, because a real read only happens when a file's size or mtime
 /// actually changes. Two seconds is far inside the window an update leaves
@@ -355,6 +354,13 @@ fn inspect(target: &Path, st: &mut FileState) {
             if !is_native || !looks_locked {
                 return;
             }
+            #[cfg(windows)]
+            {
+                log("файл оставлен без изменений: требуется обычное закрытие приложения или общий владелец WSL");
+                return;
+            }
+            #[cfg(not(windows))]
+            {
             if st.blocked >= MAX_LAUNCH_HOLDS {
                 if st.blocked == MAX_LAUNCH_HOLDS {
                     st.blocked += 1;
@@ -374,6 +380,7 @@ fn inspect(target: &Path, st: &mut FileState) {
                 show(target)
             ));
             patch_binary::kill_holder(target);
+            }
         }
     }
 }
@@ -394,11 +401,7 @@ fn repatch(target: &Path) -> RepatchOutcome {
 /// touched; only the IDE's `out/main.js` is.
 fn targets(inst: &Path) -> Vec<PathBuf> {
     let mut list = patch_binary::binary_targets(inst);
-    let ide_js = inst
-        .join("resources")
-        .join("app")
-        .join("out")
-        .join("main.js");
+    let ide_js = patch_ide::js_targets(inst).ide_main;
     if ide_js.exists() {
         list.push(ide_js);
     }
@@ -407,17 +410,29 @@ fn targets(inst: &Path) -> Vec<PathBuf> {
 
 /// Patches every file of one install now, the way the watcher does once a file
 /// has settled: both renames in one write per native binary, the IDE's
-/// `main.js`, and a process holding a binary closed only if the write actually
-/// meets its lock (D22 - Desktop restarts its language server by itself and
-/// reloads the window). An already-patched file is read and left alone.
+/// `main.js`. An already-patched file is read and left alone; a busy Windows
+/// binary returns its failure without terminating a process.
 ///
 /// The window's half of auto-patch (D27). The watcher runs inside the relay,
 /// which a user without admin rights never installed and which may still be an
 /// older build after an upgrade; the window is running either way.
 pub fn patch_now(inst: &Path) -> Vec<(PathBuf, RepatchOutcome)> {
-    targets(inst)
-        .into_iter()
-        .map(|target| {
+    patch_now_batch(inst, None)
+}
+
+/// The selected GUI operation shares the writer but stops before another
+/// target after failure or its actual owner cancellation.
+pub(crate) fn patch_now_received(inst: &Path, cancelled: &std::sync::atomic::AtomicBool) -> Vec<(PathBuf, RepatchOutcome)> {
+    patch_now_batch(inst, Some(cancelled))
+}
+
+fn patch_now_batch(inst: &Path, cancelled: Option<&std::sync::atomic::AtomicBool>) -> Vec<(PathBuf, RepatchOutcome)> {
+    let mut received = Vec::new();
+    for target in targets(inst) {
+            if cancelled.is_some_and(|token| token.load(std::sync::atomic::Ordering::SeqCst)) {
+                received.push((target, RepatchOutcome::Failed("Патч отменён перед следующим файлом.".into())));
+                break;
+            }
             let outcome = repatch(&target);
             if let RepatchOutcome::Repatched(n) = &outcome {
                 log(&format!(
@@ -426,9 +441,11 @@ pub fn patch_now(inst: &Path) -> Vec<(PathBuf, RepatchOutcome)> {
                     n
                 ));
             }
-            (target, outcome)
-        })
-        .collect()
+            let failed = matches!(outcome, RepatchOutcome::Failed(_));
+            received.push((target, outcome));
+            if cancelled.is_some() && failed { break; }
+    }
+    received
 }
 
 /// The standard locations plus every path the user pointed the window at: an

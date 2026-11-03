@@ -12,6 +12,8 @@ use crate::routes;
 use crate::upstream;
 use crate::utils::no_window;
 
+pub(crate) mod route_session;
+
 // The fallback route: unblock the traffic instead of the name.
 //
 // The DNS layer can only help with a name some provider still substitutes, and
@@ -193,7 +195,7 @@ const RESP_NOT_ALLOWED: &[u8] = b"HTTP/1.1 405 Method Not Allowed\r\n\r\n";
 /// its exe: the relay runs unelevated and cannot write into the directory an
 /// administrator installed it into (the same reason the log is there).
 pub fn ca_dir() -> PathBuf {
-    PathBuf::from(std::env::var("LOCALAPPDATA").unwrap_or_default()).join("AGUnlocker")
+    PathBuf::from(std::env::var("LOCALAPPDATA").unwrap_or_default()).join(crate::user_state_location::WINDOWS_STATE_LEAF)
 }
 
 pub fn ca_cert_path() -> PathBuf {
@@ -225,31 +227,31 @@ pub fn url_at(port: u16) -> String {
 /// because somebody else's program on the default port answers too and naming it
 /// would route Antigravity into it. Linux has no table to ask, and there the
 /// proxy never moves.
-pub fn wait_for_our_listener(budget: Duration) -> Option<u16> {
+pub fn wait_for_our_listener(budget: Duration) -> Result<Option<u16>, String> {
     let deadline = Instant::now() + budget;
     loop {
         let p = port();
-        if ours_answers(p) {
-            return Some(p);
+        if ours_answers(p)? {
+            return Ok(Some(p));
         }
         if Instant::now() >= deadline {
-            return None;
+            return Ok(None);
         }
         thread::sleep(POLL_FOR_LISTENER);
     }
 }
 
-fn ours_answers(port: u16) -> bool {
+fn ours_answers(port: u16) -> Result<bool, String> {
     if bound() {
         // The relay asking about itself: `PORT` is set before `PROXY_BOUND`.
-        return PORT.load(std::sync::atomic::Ordering::Relaxed) == port;
+        return Ok(PORT.load(std::sync::atomic::Ordering::Relaxed) == port);
     }
     if !answers_at(addr_at(port)) {
-        return false;
+        return Ok(false);
     }
     #[cfg(windows)]
     {
-        let relay = crate::background::installed_exe();
+        let relay = crate::background::installed_exe()?;
         let mine = std::env::current_exe().ok();
         let names: Vec<String> = [Some(relay), mine]
             .into_iter()
@@ -262,11 +264,11 @@ fn ours_answers(port: u16) -> bool {
         // A name that cannot be read is given the benefit of the doubt: the
         // relay writes the variable itself anyway, and a refusal here would
         // only keep the window from doing it too.
-        return crate::portcheck::listener_image(addr_at(port))
-            .is_none_or(|n| names.contains(&n.to_ascii_lowercase()));
+        return Ok(crate::portcheck::listener_image(addr_at(port))
+            .is_none_or(|n| names.contains(&n.to_ascii_lowercase())));
     }
     #[cfg(not(windows))]
-    true
+    Ok(true)
 }
 
 /// The address the listener holds, as a `SocketAddr`. The IP is a literal in
@@ -367,10 +369,18 @@ fn upstream_config() -> Arc<ClientConfig> {
 /// back into us (a loop with no end). It gets genuine Google's address instead
 /// (`resolvers::genuine_a`), or the name when none is known.
 pub fn connect_target(proxy_host: &str, host: &str) -> String {
-    if !is_gate_host(host) || !crate::loopback::active() || !is_local_host(proxy_host) {
+    connect_target_with(proxy_host, host, crate::loopback::active, crate::resolvers::genuine_a)
+}
+
+fn connect_target_with<A, R>(proxy_host: &str, host: &str, active: A, genuine_a: R) -> String
+where
+    A: FnOnce() -> bool,
+    R: FnOnce(&str) -> Vec<std::net::Ipv4Addr>,
+{
+    if !is_gate_host(host) || !active() || !is_local_host(proxy_host) {
         return host.to_string();
     }
-    crate::resolvers::genuine_a(host)
+    genuine_a(host)
         .first()
         .map_or_else(|| host.to_string(), |ip| ip.to_string())
 }
@@ -398,12 +408,61 @@ fn is_local_host(host: &str) -> bool {
 /// route other than a plain direct tunnel. Everything else reaches genuine
 /// Google unaided, so it is never sent through anybody's proxy.
 ///
-/// Lives here rather than in the private relay module because it is policy, not
-/// method: every route has to agree on which hosts it applies to, and a second
-/// copy of a list like this drifts.
+/// Every route shares the same gate-host policy.
 pub fn is_gate_host(host: &str) -> bool {
-    let h = host.trim_end_matches('.').to_ascii_lowercase();
-    h == "cloudcode-pa.googleapis.com" || h == "daily-cloudcode-pa.googleapis.com"
+    crate::gate_hosts::is_gate_host(host)
+}
+
+/// A credential-bearing route may only be opened for this target class.
+pub(crate) struct GateTarget443<'a> {
+    host: &'a str,
+}
+
+impl<'a> GateTarget443<'a> {
+    pub(crate) fn new(host: &'a str, port: u16) -> Option<Self> {
+        (port == 443 && is_gate_host(host)).then_some(Self { host })
+    }
+
+    pub(crate) fn host(&self) -> &str {
+        self.host
+    }
+}
+
+/// The settings and separately owned credentials captured for one gate request.
+/// Health remains live; configuration is not reread during this request.
+struct DesiredRouteProfile {
+    settings: crate::settings::Settings,
+    own: Option<upstream::Upstream>,
+    group: Option<crate::group_key::GroupKey>,
+}
+
+impl DesiredRouteProfile {
+    fn capture(_target: &GateTarget443<'_>) -> Self {
+        let (settings, group) = crate::group::capture_route_profile();
+        let own = upstream::configured();
+        Self { settings, own, group }
+    }
+
+    fn usable(&self, kind: routes::Kind, host: &str) -> bool {
+        match kind {
+            routes::Kind::Own => self.settings.own_proxy_enabled
+                && self.own.is_some() && upstream::OWN.usable(),
+            routes::Kind::Group => self.settings.group_proxy
+                && crate::group::bound_key_usable(self.group.as_ref()),
+            routes::Kind::Exits => self.settings.builtin_exits && exits_available(),
+            routes::Kind::Relay => relay_usable(),
+            routes::Kind::Direct => direct_usable(host),
+            routes::Kind::Vpn => vpn_usable(),
+        }
+    }
+
+    fn order(&self, host: &str) -> Vec<routes::Kind> {
+        routes::order_for_profile(
+            &self.settings.debug_route,
+            self.settings.own_proxy_at > self.settings.group_key_at,
+            |kind| self.usable(kind, host),
+        )
+    }
 }
 
 /// Sends a gate host through the user's own proxy, when they gave us one and it
@@ -537,9 +596,19 @@ fn connect_bounded(host: &str, port: u16, budget: Duration) -> Result<TcpStream,
 /// Walks `addrs` inside `budget`, a slice each, leaving through `pin` when it is
 /// not 0.
 fn connect_addrs(
+    addrs: Vec<std::net::SocketAddr>,
+    budget: Duration,
+    pin: u32,
+) -> Result<TcpStream, String> {
+    connect_addrs_checked(addrs, budget, pin, |_| true, |_, _| true)
+}
+
+fn connect_addrs_checked(
     mut addrs: Vec<std::net::SocketAddr>,
     budget: Duration,
     pin: u32,
+    allow: impl Fn(std::net::SocketAddr) -> bool,
+    peer_allowed: impl Fn(std::net::SocketAddr, &TcpStream) -> bool,
 ) -> Result<TcpStream, String> {
     let deadline = Instant::now() + budget;
     if addrs.is_empty() {
@@ -555,12 +624,20 @@ fn connect_addrs(
     let slice = (budget / addrs.len().max(1) as u32).max(Duration::from_secs(1));
     let mut last = "время вышло".to_string();
     for addr in addrs {
+        if !allow(addr) {
+            continue;
+        }
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
             break;
         }
         match crate::net::connect(addr, slice.min(left), pin) {
-            Ok(sock) => return Ok(sock),
+            Ok(sock) => {
+                if peer_allowed(addr, &sock) {
+                    return Ok(sock);
+                }
+                last = "адрес соединения не прошёл проверку".to_string();
+            }
             Err(e) => last = e.to_string(),
         }
     }
@@ -811,19 +888,7 @@ enum Request {
 }
 
 fn parse_connect(head: &str) -> Option<(String, u16)> {
-    let line = head.lines().next()?;
-    let mut parts = line.split_whitespace();
-    if !parts.next()?.eq_ignore_ascii_case("CONNECT") {
-        return None;
-    }
-    let target = parts.next()?;
-    let (host, port) = target.rsplit_once(':')?;
-    // An IPv6 literal is bracketed; strip them so the name is usable as an SNI.
-    let host = host.trim_start_matches('[').trim_end_matches(']');
-    if host.is_empty() {
-        return None;
-    }
-    Some((host.to_string(), port.parse().ok()?))
+    crate::connect_wire::decode_request(head).map(|request| (request.host, request.port))
 }
 
 #[cfg_attr(not(relay), allow(dead_code))]
@@ -836,6 +901,7 @@ pub(crate) fn would_block(e: &io::Error) -> bool {
 
 /// Raw byte tunnel, for everything this proxy has no business decrypting.
 fn tunnel(mut client: TcpStream, host: &str, port: u16) {
+    let deadline = Instant::now() + TUNNEL_OPEN_BUDGET;
     let Ok(upstream) = connect_bounded(host, port, TUNNEL_OPEN_BUDGET) else {
         // The client is still waiting for a status line; without one it sits
         // there until it gives up, which reads as "the proxy hung" rather than
@@ -843,10 +909,11 @@ fn tunnel(mut client: TcpStream, host: &str, port: u16) {
         client.write_all(RESP_BAD_GATEWAY).ok();
         return;
     };
-    if client.write_all(RESP_ESTABLISHED).is_err() {
-        return;
+    let opened = route_session::OpenedRoute::Tcp { socket: upstream, kind: None, direct_proof: None };
+    let cancelled = std::sync::atomic::AtomicBool::new(false);
+    if let Ok(committed) = route_session::commit(opened, client, Vec::new(), host, route_session::FrontendEof::NativeCompatible, deadline, &cancelled) {
+        let _ = committed.transfer_native();
     }
-    splice(client, upstream);
 }
 
 /// A writer that records what it actually handed on, for the tunnel's own
@@ -856,10 +923,10 @@ fn tunnel(mut client: TcpStream, host: &str, port: u16) {
 /// sitting in this process, and a tunnel is carrying only what the far end has
 /// taken. It costs `io::copy`'s fd-to-fd specialisation on Linux, which is a
 /// trade this tunnel can afford - it moves a token stream, not a file.
-struct Marked<'a, W: Write> {
-    inner: &'a mut W,
-    activity: Option<&'a routes::Activity>,
-    to_client: bool,
+pub(crate) struct Marked<'a, W: Write> {
+    pub(crate) inner: &'a mut W,
+    pub(crate) activity: Option<&'a routes::Activity>,
+    pub(crate) to_client: bool,
 }
 
 impl<W: Write> Write for Marked<'_, W> {
@@ -1116,6 +1183,7 @@ fn serve(mut client: TcpStream, _if_index: u32) {
 const GATE_OPEN_BUDGET: Duration = Duration::from_secs(12);
 
 /// Walks the route table for one gate connection.
+#[cfg(any(relay, exits))]
 fn serve_gate(client: TcpStream, host: &str, port: u16) {
     let started = Instant::now();
     let mut client = client;
@@ -1162,6 +1230,27 @@ fn serve_gate(client: TcpStream, host: &str, port: u16) {
         }
     }
     client.write_all(RESP_BAD_GATEWAY).ok();
+}
+
+#[cfg(not(any(relay, exits)))]
+fn serve_gate(mut client: TcpStream, host: &str, port: u16) {
+    use std::sync::atomic::AtomicBool;
+    let Some(target) = GateTarget443::new(host, port) else {
+        let _ = client.write_all(RESP_BAD_GATEWAY);
+        return;
+    };
+    let deadline = Instant::now() + GATE_OPEN_BUDGET;
+    let cancelled = AtomicBool::new(false);
+    let opened = match route_session::open_selected_route(&target, deadline, &cancelled, None) {
+        Ok(opened) => opened,
+        Err(_) => {
+            let _ = client.write_all(RESP_BAD_GATEWAY);
+            return;
+        }
+    };
+    if let Ok(committed) = route_session::commit(opened, client, Vec::new(), host, route_session::FrontendEof::NativeCompatible, deadline, &cancelled) {
+        let _ = committed.transfer_native();
+    }
 }
 
 /// Whether the proxy's listener is bound. The loopback listener hands its
@@ -1317,6 +1406,90 @@ pub fn run(if_index: u32) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn non_gate_tunnel_keeps_response_and_raw_bidirectional_bytes() {
+        use super::*;
+        use std::net::Shutdown;
+
+        let origin_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        origin_listener.set_nonblocking(true).unwrap();
+        let origin_port = origin_listener.local_addr().unwrap().port();
+        let client_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let mut peer = TcpStream::connect(client_listener.local_addr().unwrap()).unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(4))).unwrap();
+        peer.set_write_timeout(Some(Duration::from_secs(4))).unwrap();
+        let (client, _) = client_listener.accept().unwrap();
+        let server = thread::spawn(move || -> io::Result<Vec<u8>> {
+            let deadline = Instant::now() + Duration::from_secs(4);
+            let mut stream = loop {
+                match origin_listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock && Instant::now() < deadline => thread::sleep(Duration::from_millis(2)),
+                    Err(e) => return Err(e),
+                }
+            };
+            stream.set_nonblocking(false)?;
+            stream.set_read_timeout(Some(Duration::from_secs(4)))?;
+            stream.set_write_timeout(Some(Duration::from_secs(4)))?;
+            let mut input = Vec::new();
+            stream.read_to_end(&mut input)?;
+            stream.write_all(b"answer")?;
+            stream.shutdown(Shutdown::Write)?;
+            Ok(input)
+        });
+        let proxy = match thread::Builder::new().spawn(move || tunnel(client, "127.0.0.1", origin_port)) {
+            Ok(handle) => handle,
+            Err(error) => { let _ = server.join(); panic!("proxy fixture spawn failed: {error}"); }
+        };
+        let mut response = vec![0; RESP_ESTABLISHED.len()];
+        let header = peer.read_exact(&mut response);
+        let sent = peer.write_all(b"request").and_then(|_| peer.shutdown(Shutdown::Write));
+        let mut body = Vec::new();
+        let read = peer.read_to_end(&mut body);
+        let origin = server.join();
+        let proxy = proxy.join();
+        header.unwrap(); sent.unwrap(); read.unwrap();
+        assert_eq!(response, RESP_ESTABLISHED);
+        assert_eq!(body, b"answer");
+        assert_eq!(origin.unwrap().unwrap(), b"request");
+        proxy.unwrap();
+    }
+
+    #[test]
+    fn credential_gate_requires_both_host_and_port() {
+        assert!(super::GateTarget443::new("cloudcode-pa.googleapis.com", 443).is_some());
+        assert!(super::GateTarget443::new("cloudcode-pa.googleapis.com", 80).is_none());
+        assert!(super::GateTarget443::new("example.com", 443).is_none());
+    }
+
+    #[test]
+    fn connect_target_lazy_rewrite_oracle() {
+        let host = "CLOUDCODE-PA.GOOGLEAPIS.COM.";
+        let trace = std::cell::RefCell::new(Vec::new());
+        let result = connect_target_with("127.0.0.1", host, || { trace.borrow_mut().push("active"); true }, |name| {
+            assert_eq!(name, host);
+            trace.borrow_mut().push("resolve");
+            vec![std::net::Ipv4Addr::new(203, 0, 113, 9), std::net::Ipv4Addr::new(192, 0, 2, 1)]
+        });
+        assert_eq!(result, "203.0.113.9");
+        assert_eq!(*trace.borrow(), ["active", "resolve"]);
+        assert_eq!(connect_target_with("localhost", host, || true, |_| vec![]), host);
+        assert_eq!(connect_target_with("localhost", "example.com", || panic!("active on non-gate"), |_| panic!("resolve on non-gate")), "example.com");
+        assert_eq!(connect_target_with("localhost", host, || false, |_| panic!("resolve while inactive")), host);
+        assert_eq!(connect_target_with("203.0.113.1", host, || true, |_| panic!("resolve for nonlocal proxy")), host);
+    }
+    #[test]
+    fn marked_writer_counts_both_directions() {
+        use super::*;
+
+        let activity = routes::Activity::default();
+        let mut written = Vec::new();
+        Marked { inner: &mut written, activity: Some(&activity), to_client: true }.write_all(b"answer").unwrap();
+        Marked { inner: &mut written, activity: Some(&activity), to_client: false }.write_all(b"ask").unwrap();
+        assert_eq!(activity.bytes(), (6, 3));
+        assert!(activity.idle().is_some());
+
+    }
     use super::*;
 
     /// Live: what the direct route would dial for each gate host - on Linux the

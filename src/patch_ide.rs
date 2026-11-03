@@ -14,6 +14,26 @@ use crate::patch_binary::RepatchOutcome;
 /// edit, and the revert restores from it.
 const JS_BAK: &str = ".ag_backup";
 
+/// The scripts owned by the existing IDE/Desktop JS patch and restore paths.
+/// Construction performs no observation; callers receive each optional file
+/// with their own checked I/O contract.
+pub(crate) struct JsTargets {
+    pub(crate) ide_main: PathBuf,
+    pub(crate) desktop_main: PathBuf,
+    pub(crate) extension: PathBuf,
+}
+impl JsTargets {
+    pub(crate) fn into_paths(self) -> [PathBuf; 3] {
+        [self.ide_main, self.desktop_main, self.extension]
+    }
+}
+pub(crate) fn js_targets(inst: &Path) -> JsTargets {
+    let app = inst.join("resources").join("app");
+    JsTargets { ide_main: app.join("out").join("main.js"),
+        desktop_main: app.join("dist").join("main.js"),
+        extension: app.join("extensions").join("antigravity").join("dist").join("extension.js") }
+}
+
 fn backup_path(target: &Path) -> PathBuf {
     let mut s = target.as_os_str().to_os_string();
     s.push(JS_BAK);
@@ -65,29 +85,47 @@ fn write_atomic(path: &Path, content: &str) -> std::io::Result<()> {
 /// the marker as a last resort and says so - the auth body then stays rewritten,
 /// which still lets Antigravity run; a clean restore needs a reinstall.
 fn restore_js(target: &Path) -> Result<bool, String> {
+    let outcome = restore_js_result(target)?;
+    if outcome == JsRestore::MarkerOnly {
+        eprintln!("  [WARN] {}: бэкап отсутствует — снят только маркер, тело патча осталось (для чистого возврата переустановите Antigravity)", target.display());
+    }
+    Ok(outcome != JsRestore::Unchanged)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum JsRestore { Unchanged, BackupRestored, MarkerOnly }
+
+fn restore_js_result(target: &Path) -> Result<JsRestore, String> {
+    match fs::metadata(target) {
+        Ok(_) => {},
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(JsRestore::Unchanged),
+        Err(error) => return Err(format!("не проверить JS для восстановления: {error}")),
+    }
     let bak = backup_path(target);
-    if bak.exists() {
+    let backup_present = match fs::metadata(&bak) {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(format!("не проверить бэкап: {error}")),
+    };
+    if backup_present {
         let data = fs::read(&bak).map_err(|e| format!("не прочитать бэкап: {}", e))?;
-        let text = String::from_utf8_lossy(&data).into_owned();
+        let text = String::from_utf8(data).map_err(|_| "бэкап JS повреждён: недопустимая кодировка")?;
         write_atomic(target, &text)
             .map_err(|e| format!("не записать {}: {}", target.display(), e))?;
-        fs::remove_file(&bak).ok();
-        return Ok(true);
+        fs::remove_file(&bak).map_err(|error| format!("JS восстановлен, но бэкап не удалён: {error}"))?;
+        return Ok(JsRestore::BackupRestored);
     }
-    let Ok(content) = fs::read_to_string(target) else {
-        return Ok(false);
+    let content = match fs::read_to_string(target) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(JsRestore::Unchanged),
+        Err(error) => return Err(format!("не прочитать JS для восстановления: {error}")),
     };
     if let Some(stripped) = strip_marker(&content) {
         write_atomic(target, &stripped)
             .map_err(|e| format!("не записать {}: {}", target.display(), e))?;
-        eprintln!(
-            "  [WARN] {}: бэкап отсутствует — снят только маркер, тело патча осталось \
-             (для чистого возврата переустановите Antigravity)",
-            target.display()
-        );
-        return Ok(true);
+        return Ok(JsRestore::MarkerOnly);
     }
-    Ok(false)
+    Ok(JsRestore::Unchanged)
 }
 
 /// Reverts our IDE JS edits (`main.js` and the extension) for one install.
@@ -98,24 +136,34 @@ fn restore_js(target: &Path) -> Result<bool, String> {
 /// failed restore into a silent success, and the messages went to a console the
 /// window does not have.
 pub fn unpatch_ide_js(inst: &Path) -> Vec<(String, Result<bool, String>)> {
-    let mut out = Vec::new();
-    let main_js = inst
-        .join("resources")
-        .join("app")
-        .join("out")
-        .join("main.js");
-    if main_js.exists() {
-        out.push(("main.js".to_string(), restore_js(&main_js)));
+    unpatch_js_batch(inst, false).into_iter().map(|(name, result)| {
+        if matches!(result, Ok(JsRestore::MarkerOnly)) { eprintln!("[WARN] {name}: бэкап отсутствует — снят только маркер, тело патча осталось"); }
+        (name, result.map(|outcome| outcome != JsRestore::Unchanged))
+    }).collect()
+}
+
+#[derive(Debug)]
+pub(crate) struct JsUndoFailure { pub(crate) completed: Vec<(String, JsRestore)>, pub(crate) cause: String }
+
+pub(crate) fn unpatch_ide_js_checked(inst: &Path) -> Result<Vec<(String, JsRestore)>, JsUndoFailure> {
+    let mut received = Vec::new();
+    for (name, result) in unpatch_js_batch(inst, true) {
+        match result {
+            Ok(outcome) => received.push((name, outcome)),
+            Err(error) => return Err(JsUndoFailure { completed: received, cause: format!("{name}: {error}") }),
+        }
     }
-    let ext = inst
-        .join("resources")
-        .join("app")
-        .join("extensions")
-        .join("antigravity")
-        .join("dist")
-        .join("extension.js");
-    if ext.exists() {
-        out.push(("extension.js".to_string(), restore_js(&ext)));
+    Ok(received)
+}
+
+fn unpatch_js_batch(inst: &Path, stop_on_failure: bool) -> Vec<(String, Result<JsRestore, String>)> {
+    let mut out = Vec::new();
+    let scripts = js_targets(inst);
+    for (name, target) in [("main.js", scripts.ide_main), ("extension.js", scripts.extension)] {
+        let result = restore_js_result(&target);
+        let failed = result.is_err();
+        if !matches!(result, Ok(JsRestore::Unchanged)) { out.push((name.to_owned(), result)); }
+        if stop_on_failure && failed { break; }
     }
     out
 }
@@ -514,6 +562,30 @@ mod tests {
     use super::*;
     use std::env;
 
+    #[cfg(windows)]
+    #[test]
+    fn checked_js_restore_failure_blocks_the_second_mutation() {
+        let root = crate::wsl_discovery_contract_cases::fixture_dir("js-first-failure");
+        let main = root.join("resources/app/out/main.js");
+        let extension = root.join("resources/app/extensions/antigravity/dist/extension.js");
+        fs::create_dir_all(main.parent().unwrap()).unwrap();
+        fs::create_dir_all(extension.parent().unwrap()).unwrap();
+        fs::write(&main, b"main rewritten\n// UNLOCKED").unwrap();
+        fs::create_dir(backup_path(&main)).unwrap();
+        fs::write(&extension, b"extension rewritten\n// UNLOCKED").unwrap();
+        fs::write(backup_path(&extension), b"extension pristine").unwrap();
+        let before = fs::read(&extension).unwrap();
+        let failure = unpatch_ide_js_checked(&root).unwrap_err();
+        assert!(failure.completed.is_empty());
+        assert_eq!(fs::read(&extension).unwrap(), before);
+        assert_eq!(fs::read(backup_path(&extension)).unwrap(), b"extension pristine");
+        assert_eq!(fs::read(&main).unwrap(), b"main rewritten\n// UNLOCKED");
+        let absent = root.join("deleted.js");
+        fs::write(backup_path(&absent), b"not resurrected").unwrap();
+        assert_eq!(restore_js_result(&absent).unwrap(), JsRestore::Unchanged);
+        assert!(!absent.exists());
+    }
+
     #[test]
     fn detects_a_marker_written_by_this_build() {
         let js = format!("code();\n{}", crate::canary::file_marker());
@@ -640,13 +712,7 @@ mod tests {
 }
 
 pub fn patch_extension_js(inst: &Path) -> Result<bool, String> {
-    let ext_path = inst
-        .join("resources")
-        .join("app")
-        .join("extensions")
-        .join("antigravity")
-        .join("dist")
-        .join("extension.js");
+    let ext_path = js_targets(inst).extension;
     if !ext_path.exists() {
         return Ok(false);
     }
