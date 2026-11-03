@@ -231,7 +231,10 @@ impl Facts {
             net_ok: gate.net_ok,
             relay_exe: relay.map(|r| r.exe.clone()).unwrap_or_default(),
             verify: gate.verify.as_ref().map(|v| (aged(v.ago), v.url.clone())),
-            overloaded: gate.overloaded.as_ref().map(|o| (aged(o.ago), o.model.clone())),
+            overloaded: gate
+                .overloaded
+                .as_ref()
+                .map(|o| (aged(o.ago), o.model.clone())),
             unauthorized: gate.unauthorized.map(|u| (aged(u.ago), u.count)),
         }
     }
@@ -378,8 +381,9 @@ fn blocked(b: &crate::gate::Blocker, exe: &str) -> Headline {
             format!("Порт {port} недоступен"),
             format!(
                 "Служба обхода не может открыть порт {port} ({}), поэтому {effect}. Нажмите \
-                 «Починить»; не помогло — «Сохранить отчёт» и пришлите файл с рабочего стола в группу.",
-                b.error
+                 «Починить»; не помогло — {}",
+                b.error,
+                super::report::when_stuck()
             ),
         ),
     };
@@ -477,9 +481,7 @@ pub fn headline(f: &Facts) -> Headline {
     }
     // A refusal newer than the 503 is the news; the 503 was an earlier turn.
     let overloaded = f.overloaded.as_ref().filter(|(ago, _)| {
-        *ago <= crate::gate::RECENT
-            && unanswered(*ago)
-            && f.refusal.is_none_or(|(r, _)| r > *ago)
+        *ago <= crate::gate::RECENT && unanswered(*ago) && f.refusal.is_none_or(|(r, _)| r > *ago)
     });
     if let Some((ago, model)) = overloaded {
         let which = if model.is_empty() {
@@ -625,9 +627,9 @@ pub fn headline(f: &Facts) -> Headline {
                 detail: format!(
                     "Последняя — {}. Обход перебирает пути сам, но ни один пока не сработал. \
                      Если у вас включён VPN или прокси, попробуйте выключить его или сменить сервер, \
-                     и отправьте сообщение ещё раз. Не помогло — нажмите «Сохранить отчёт» и \
-                     пришлите файл с рабочего стола в группу.",
-                    ago_text(ago)
+                     и отправьте сообщение ещё раз. Не помогло — {}",
+                    ago_text(ago),
+                    super::report::when_stuck()
                 ),
                 action: None,
             };
@@ -862,7 +864,12 @@ mod tests {
         };
         let h = headline(&f);
         assert_eq!(h.tone, Tone::Action);
-        assert!(h.detail.contains("Сохранить отчёт"), "{}", h.detail);
+        assert_eq!(
+            h.detail.contains("Сохранить отчёт"),
+            super::super::report::ENABLED,
+            "{}",
+            h.detail
+        );
     }
 
     #[test]

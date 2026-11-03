@@ -16,6 +16,22 @@ use crate::gate::{Report, View};
 use crate::ops::{State, Status};
 use crate::utils::mask_path;
 
+/// The report exists in development builds only (owner, 2026-11-03: «создавать
+/// отчёты больше не надо»). Release builds show no button, no TUI row and no
+/// `o` key, and no message sends a user to «Сохранить отчёт»; the relay's logs
+/// are untouched.
+pub const ENABLED: bool = cfg!(debug_assertions);
+
+/// The tail of a «what to try» message: the report when it can be made, the
+/// group otherwise.
+pub fn when_stuck() -> &'static str {
+    if ENABLED {
+        "нажмите «Сохранить отчёт» и пришлите файл с рабочего стола в группу."
+    } else {
+        "напишите об этом в группу."
+    }
+}
+
 /// How much of the relay's own log goes in: enough to cover the last few
 /// minutes of a busy session, short enough to paste into a chat.
 const LOG_LINES: usize = 60;
@@ -168,7 +184,11 @@ fn status_part(out: &mut String, s: &Status) {
     let _ = writeln!(out, "Обход через DNS: {}", onoff(&s.dns));
     let _ = writeln!(out, "Локальный прокси: {}", onoff(&s.local_proxy));
     let _ = writeln!(out, "Встроенные выходы: {}", onoff(&s.builtin_exits));
-    let key_present = if crate::settings::group_key().is_empty() { "нет" } else { "есть" };
+    let key_present = if crate::settings::group_key().is_empty() {
+        "нет"
+    } else {
+        "есть"
+    };
     let _ = writeln!(
         out,
         "Прокси из группы: {}, ключ: {}, код ПК: {}",
@@ -312,10 +332,7 @@ fn relay_part(out: &mut String, r: &Report) {
         // of ten and for one that answers once in fifty, and three field
         // reports (2026-09-21) turned on telling those apart.
         if row.answers > 0 || row.refusals > 0 {
-            parts.push(format!(
-                "ответов {}, отказов {}",
-                row.answers, row.refusals
-            ));
+            parts.push(format!("ответов {}, отказов {}", row.answers, row.refusals));
         }
         if let Some(b) = row.bench_left.filter(|_| !row.usable) {
             parts.push(format!("отложен ещё на {} мин", b / 60 + 1));
