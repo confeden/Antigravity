@@ -1,5 +1,8 @@
 use regex::Regex;
 use std::fs;
+use std::io::Write;
+#[cfg(not(windows))]
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use crate::patch_binary::RepatchOutcome;
@@ -40,19 +43,222 @@ fn backup_path(target: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
-/// Copies `target` to its `.ag_backup` once - never overwriting an existing one,
-/// which is by construction the pristine copy from before we ever touched it.
-/// Best-effort: a failed backup must not stop a patch (the same-marker check
-/// still prevents double-patching), but it is logged so a missing backup is not
-/// silent.
-fn backup_once(target: &Path) {
-    let bak = backup_path(target);
-    if bak.exists() {
-        return;
+struct PinnedJs {
+    path: PathBuf,
+    #[cfg(windows)]
+    file: crate::windows_coordinator::windows_installation::CheckedPath,
+    #[cfg(not(windows))]
+    file: fs::File,
+}
+impl PinnedJs {
+    fn open(path: &Path) -> Result<Self, String> {
+        #[cfg(windows)]
+        let file = {
+            use crate::windows_coordinator::windows_installation::{CheckedPath, PathKind, PathPurpose};
+            CheckedPath::open(path, PathKind::File, PathPurpose::ReplaceSource)?
+        };
+        #[cfg(unix)]
+        let file = {
+            let metadata = fs::symlink_metadata(path).map_err(|e| format!("JS metadata: {e}"))?;
+            if !metadata.file_type().is_file() { return Err("JS target is not a regular file".into()); }
+            use rustix::fs::{Mode, OFlags};
+            let file = fs::File::from(rustix::fs::open(path,
+                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC, Mode::empty())
+                .map_err(|e| format!("JS open: {e}"))?);
+            if !file.metadata().map_err(|e| format!("JS handle metadata: {e}"))?.is_file() { return Err("JS target is not a regular file".into()); }
+            file
+        };
+        #[cfg(not(any(windows, unix)))]
+        return Err("JS checked receiving is unsupported on this platform".into());
+        let pin = Self { path: path.to_owned(), file };
+        pin.recheck()?;
+        Ok(pin)
     }
-    if let Err(e) = fs::copy(target, &bak) {
-        eprintln!("  [WARN] бэкап {} не создан: {}", target.display(), e);
+    fn read(&self) -> Result<Vec<u8>, String> {
+        #[cfg(windows)]
+        { self.file.read_snapshot() }
+        #[cfg(not(windows))]
+        {
+            let mut file = self.file.try_clone().map_err(|e| format!("JS read handle: {e}"))?;
+            file.seek(SeekFrom::Start(0)).map_err(|e| format!("JS seek: {e}"))?;
+            let mut bytes = Vec::new(); file.read_to_end(&mut bytes).map_err(|e| format!("JS read: {e}"))?; Ok(bytes)
+        }
     }
+    fn recheck(&self) -> Result<(), String> {
+        #[cfg(windows)]
+        { self.file.recheck() }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let held = self.file.metadata().map_err(|e| format!("JS held metadata: {e}"))?;
+            let entry = fs::symlink_metadata(&self.path).map_err(|e| format!("JS path metadata: {e}"))?;
+            if !entry.file_type().is_file() || held.dev() != entry.dev() || held.ino() != entry.ino() {
+                return Err("JS target identity changed".into());
+            }
+            Ok(())
+        }
+        #[cfg(not(any(windows, unix)))]
+        { Err("JS checked receiving is unsupported on this platform".into()) }
+    }
+}
+
+fn create_exclusive(path: &Path) -> Result<Option<fs::File>, String> {
+    #[cfg(unix)]
+    {
+        use rustix::fs::{Mode, OFlags};
+        match rustix::fs::open(path, OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o600)) {
+            Ok(file) => Ok(Some(fs::File::from(file))),
+            Err(rustix::io::Errno::EXIST) => Ok(None),
+            Err(error) => Err(format!("JS exclusive creation failed: {error}")),
+        }
+    }
+    #[cfg(windows)]
+    {
+        match fs::OpenOptions::new().write(true).create_new(true).open(path) {
+            Ok(file) => Ok(Some(file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
+            Err(error) => Err(format!("JS exclusive creation failed: {error}")),
+        }
+    }
+    #[cfg(not(any(windows, unix)))]
+    { Err("JS checked receiving is unsupported on this platform".into()) }
+}
+
+fn receive_backup(path: &Path, expected: &[u8]) -> Result<PinnedJs, String> {
+    let pin = PinnedJs::open(path).map_err(|e| format!("JS backup unavailable: {e}"))?;
+    let actual = pin.read()?;
+    pin.recheck()?;
+    if actual != expected { return Err("JS backup conflicts with the exact current preimage".into()); }
+    Ok(pin)
+}
+
+#[cfg(windows)]
+fn publish_backup(stage: &Path, backup: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_WRITE_THROUGH};
+    let from: Vec<u16> = stage.as_os_str().encode_wide().chain(Some(0)).collect();
+    let to: Vec<u16> = backup.as_os_str().encode_wide().chain(Some(0)).collect();
+    if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), MOVEFILE_WRITE_THROUGH) } == 0 {
+        Err(std::io::Error::last_os_error())
+    } else { Ok(()) }
+}
+#[cfg(unix)]
+fn publish_backup(stage: &Path, backup: &Path) -> std::io::Result<()> { fs::hard_link(stage, backup) }
+
+/// Only a complete, synced and independently received stage may be published
+/// to the restore-authority path. Partial stages are retained, never adopted.
+fn backup_once(target: &Path, expected: &[u8]) -> Result<(), String> {
+    let backup = backup_path(target);
+    match fs::symlink_metadata(&backup) {
+        Ok(_) => { receive_backup(&backup, expected)?; return Ok(()); }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+        Err(error) => return Err(format!("JS backup observation failed: {error}")),
+    }
+    let stage = crate::patch_binary::temp_path(&backup);
+    let mut file = create_exclusive(&stage)?.ok_or_else(|| format!("JS backup staging path occupied: {}", stage.display()))?;
+            #[cfg(test)]
+            if TEST_BACKUP_FAILURE.with(|value| value.get() == 1) {
+                return Err(format!("JS backup stage incomplete; entry retained at {}: synthetic write failure", stage.display()));
+            }
+            file.write_all(expected).map_err(|e|
+                format!("JS backup stage incomplete; entry retained at {}: {e}", stage.display()))?;
+            #[cfg(test)]
+            if TEST_BACKUP_FAILURE.with(|value| value.get() == 2) {
+                return Err(format!("JS backup stage incomplete; entry retained at {}: synthetic flush failure", stage.display()));
+            }
+            file.sync_all().map_err(|e|
+                format!("JS backup stage incomplete; entry retained at {}: {e}", stage.display()))?;
+            drop(file);
+    #[cfg(test)]
+    if TEST_BACKUP_FAILURE.with(|value| value.get() == 3) {
+        return Err(format!("JS backup stage readback unavailable; entry retained at {}: synthetic read failure", stage.display()));
+    }
+    let stage_pin = PinnedJs::open(&stage).map_err(|e| format!("JS backup stage unavailable; retained at {}: {e}", stage.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if stage_pin.file.metadata().map_err(|e| format!("JS backup stage metadata unavailable at {}: {e}", stage.display()))?.nlink() != 1 {
+            return Err(format!("JS backup stage link count differs; retained at {}", stage.display()));
+        }
+    }
+    if stage_pin.read().map_err(|e| format!("JS backup stage read failed at {}: {e}", stage.display()))? != expected {
+        return Err(format!("JS backup stage readback differs; retained at {}", stage.display()));
+    }
+    stage_pin.recheck().map_err(|e| format!("JS backup stage identity unavailable at {}: {e}", stage.display()))?;
+    #[cfg(test)]
+    match TEST_BACKUP_FAILURE.with(|value| value.get()) {
+        4 | 5 | 7 => {
+            let mut competitor = create_exclusive(&backup)?.ok_or("synthetic competing backup already exists")?;
+            let same = TEST_BACKUP_FAILURE.with(|value| value.get()) != 5;
+            competitor.write_all(if same { expected } else { b"different competitor" }).map_err(|e| e.to_string())?;
+            competitor.sync_all().map_err(|e| e.to_string())?;
+        }
+        _ => {},
+    }
+    let published = match publish_backup(&stage, &backup) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
+        Err(error) => return Err(format!("JS backup publication failed; stage retained at {}: {error}", stage.display())),
+    };
+    #[cfg(unix)]
+    {
+        #[cfg(test)]
+        if TEST_BACKUP_FAILURE.with(|value| value.get() == 8) {
+            let displaced = stage.with_extension("test-displaced");
+            fs::rename(&stage, &displaced).map_err(|e| e.to_string())?;
+            fs::write(&stage, b"synthetic substitute").map_err(|e| e.to_string())?;
+        }
+        #[cfg(test)]
+        if TEST_BACKUP_FAILURE.with(|value| matches!(value.get(), 6 | 7)) {
+            return Err(format!("JS backup stage cleanup failed; entry state unconfirmed at {}: synthetic failure", stage.display()));
+        }
+        stage_pin.recheck().map_err(|e| format!("JS backup stage cleanup identity unconfirmed at {}: {e}", stage.display()))?;
+        fs::remove_file(&stage).map_err(|e| format!("JS backup stage cleanup failed; entry state unconfirmed at {}: {e}", stage.display()))?;
+    }
+    #[cfg(windows)]
+    if !published {
+        #[cfg(test)]
+        if TEST_BACKUP_FAILURE.with(|value| value.get() == 7) {
+            return Err(format!("JS backup stage cleanup failed; entry state unconfirmed at {}: synthetic failure", stage.display()));
+        }
+        stage_pin.recheck().map_err(|e| format!("JS backup stage cleanup identity unconfirmed at {}: {e}", stage.display()))?;
+        fs::remove_file(&stage).map_err(|e| format!("JS backup stage cleanup failed; entry state unconfirmed at {}: {e}", stage.display()))?;
+    }
+    let final_pin = receive_backup(&backup, expected).map_err(|e| format!("JS backup final receiving failed; stage settlement completed: {e}"))?;
+    #[cfg(windows)]
+    if published && stage_pin.file.native_id() != final_pin.file.native_id() {
+        return Err("JS backup published identity differs from verified stage".into());
+    }
+    #[cfg(unix)]
+    let _ = published;
+    drop(final_pin);
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_READBACK_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static TEST_BACKUP_FAILURE: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+fn replace_checked(pin: &PinnedJs, original: &[u8], prepared: &str) -> Result<(), String> {
+    pin.recheck()?;
+    if pin.read()? != original { return Err("JS preimage changed before backup".into()); }
+    backup_once(&pin.path, original)?;
+    pin.recheck()?;
+    if pin.read()? != original { return Err("JS preimage changed before replacement; backup retained".into()); }
+    pin.recheck()?;
+    write_atomic(&pin.path, prepared).map_err(|e| format!("JS replacement failed; outcome unconfirmed; backup retained: {e}"))?;
+    #[cfg(test)]
+    if TEST_READBACK_FAILURE.with(|value| value.replace(false)) {
+        return Err("JS replaced; readback unavailable; backup retained: synthetic failure".into());
+    }
+    let result = PinnedJs::open(&pin.path).map_err(|e| format!("JS replaced; readback unavailable; backup retained: {e}"))?;
+    let actual = result.read().map_err(|e| format!("JS replaced; readback failed; backup retained: {e}"))?;
+    result.recheck().map_err(|e| format!("JS replaced; readback identity changed; backup retained: {e}"))?;
+    if actual != prepared.as_bytes() { return Err("JS replaced; readback differs; backup retained".into()); }
+    Ok(())
 }
 
 /// Writes `content` to `path` without a torn intermediate state: a sibling temp
@@ -60,19 +266,19 @@ fn backup_once(target: &Path) {
 /// Windows and POSIX). A crash or power loss leaves either the old file or the
 /// new one, never a half-written 15 MB `main.js`.
 fn write_atomic(path: &Path, content: &str) -> std::io::Result<()> {
-    // Per process, for the reason `patch_binary::temp_path` gives.
-    crate::patch_binary::sweep_stale_temps(path);
+    // Per-process naming remains the existing owner; an occupied stage is not
+    // deleted or considered ours solely because of its age.
     let tmp = crate::patch_binary::temp_path(path);
-    if let Err(e) = fs::write(&tmp, content) {
-        let _ = fs::remove_file(&tmp);
-        return Err(e);
+    let mut file = create_exclusive(&tmp).map_err(std::io::Error::other)?
+        .ok_or_else(|| std::io::Error::other("JS staging path already exists"))?;
+    if let Err(e) = file.write_all(content.as_bytes()).and_then(|_| file.sync_all()) {
+        drop(file);
+        return Err(std::io::Error::other(format!("JS stage state unconfirmed at {}: {e}", tmp.display())));
     }
+    drop(file);
     match fs::rename(&tmp, path) {
         Ok(()) => Ok(()),
-        Err(e) => {
-            let _ = fs::remove_file(&tmp);
-            Err(e)
-        }
+        Err(e) => Err(std::io::Error::other(format!("JS stage state unconfirmed at {}: {e}", tmp.display()))),
     }
 }
 
@@ -200,31 +406,134 @@ fn strip_marker(content: &str) -> Option<String> {
     }
 }
 
-pub fn patch_ide(_inst: &Path, main_js: &Path) -> Result<(), String> {
-    let content = fs::read_to_string(main_js).map_err(|e| e.to_string())?;
+fn unsupported_ide(detail: &str) -> String {
+    format!("Сигнатура не найдена ({}); исходный файл сохранён", detail)
+}
 
-    if has_marker(&content) && !detect_stacked_ide(&content) {
-        return Ok(());
+// A token-aware delimiter walk: strings, comments and regex tokens never own
+// braces; template interpolation owns an explicit stack entry in the scanner.
+fn closing_token(tokens: &[ress::Item<&str>], start: usize) -> Option<usize> {
+    use ress::tokens::{Punct, Template, Token};
+    let mut stack = Vec::new();
+    for (index, item) in tokens.iter().enumerate().skip(start) {
+        match &item.token {
+            Token::Punct(Punct::OpenBrace) => stack.push(0),
+            Token::Punct(Punct::OpenParen) => stack.push(1),
+            Token::Punct(Punct::OpenBracket) => stack.push(2),
+            Token::Template(Template::Head(_)) => stack.push(3),
+            Token::Template(Template::Middle(_)) if stack.last() == Some(&3) => {},
+            Token::Template(Template::Tail(_)) if stack.pop() == Some(3) => {},
+            Token::Punct(Punct::CloseBrace) if stack.pop() == Some(0) => {},
+            Token::Punct(Punct::CloseParen) if stack.pop() == Some(1) => {},
+            Token::Punct(Punct::CloseBracket) if stack.pop() == Some(2) => {},
+            Token::Punct(Punct::CloseBrace | Punct::CloseParen | Punct::CloseBracket)
+                | Token::Template(Template::Middle(_) | Template::Tail(_)) => return None,
+            _ => {},
+        }
+        if stack.is_empty() { return Some(index); }
     }
+    None
+}
 
-    if detect_stacked_ide(&content) || has_marker(&content) {
+struct IdeCandidate<'a> {
+    start: usize, method: usize, branch: usize, tryopen: usize, tryclose: usize, catchopen: usize,
+    fname: &'a str, arg: &'a str, sender: &'a str, reset: &'a str,
+    func: &'a str, mapped: &'a str, push: &'a str, fire: &'a str, valid_roles: bool,
+}
+struct IdeTokens<'a, 'b> { source: &'a str, tokens: &'b [ress::Item<&'a str>], at: usize }
+impl<'a> IdeTokens<'a, '_> {
+    fn literal(&mut self, value: &str) -> Option<()> {
+        let token = self.tokens.get(self.at)?;
+        if token.token.is_string() || token.token.is_regex() || token.token.is_template() || token.token != value { return None; }
+        self.at += 1; Some(())
+    }
+    fn string(&mut self, value: &str) -> Option<()> {
+        let token = self.tokens.get(self.at)?;
+        if !token.token.is_string() || token.token != value { return None; }
+        self.at += 1; Some(())
+    }
+    fn ident(&mut self) -> Option<&'a str> {
+        let token = self.tokens.get(self.at)?;
+        if !token.token.is_ident() { return None; }
+        self.at += 1; Some(&self.source[token.span.start..token.span.end])
+    }
+    fn literals(&mut self, values: &[&str]) -> Option<()> {
+        for value in values { self.literal(value)?; } Some(())
+    }
+}
+fn ide_candidate<'a>(source: &'a str, tokens: &[ress::Item<&'a str>], start: usize, anchor: &mut bool) -> Option<IdeCandidate<'a>> {
+    let mut p = IdeTokens { source, tokens, at: start };
+    p.literal("async")?; let fname = p.ident()?; p.literal("(")?; let arg = p.ident()?;
+    p.literal(")")?; let method = p.at; p.literals(&["{", "if", "(", "this", "."])?;
+    let sender = p.ident()?; p.literals(&[".", "send", "(", "{", "type", ":"])?;
+    let signarg = p.ident()?; p.literals(&[".", "isGcpTos", "?"])?;
+    p.string("GCP_SIGN_IN")?; p.literal(":")?; p.string("SIGN_IN")?;
+    p.literals(&["}", ")", ",", "this", "."])?; let reset = p.ident()?;
+    p.literals(&[".", "resetIsTierGCPTos", "(", ")", ","])?;
+    *anchor = true;
+    if p.tokens.get(p.at)?.token.is_boolean_true() { p.at += 1; }
+    else { p.literals(&["this", "."])?; p.ident()?; p.literals(&[".", "isGoogleInternal"])?; }
+    p.literal(")")?; let branch = p.at; p.literals(&["{", "try"])?; let tryopen = p.at;
+    p.literals(&["{", "await", "this", "."])?; let load = p.ident()?;
+    p.literals(&[".", "loadCodeAssist", "("])?; let loadarg = p.ident()?;
+    p.literals(&[")", ";", "const", "{", "settings", ":"])?; let settings = p.ident()?;
+    p.literals(&[",", "userTier", ":"])?; let tier = p.ident()?;
+    p.literals(&["}", "=", "await", "this", ".", "refreshUserStatus", "("])?;
+    let refresharg = p.ident()?; p.literals(&[")", ","])?; let mapped = p.ident()?;
+    p.literal("=")?; let func = p.ident()?; p.literal("(")?; let maparg = p.ident()?;
+    p.literals(&[")", ";", "this", "."])?; let push = p.ident()?;
+    p.literals(&[".", "pushUpdate", "("])?; let pusharg = p.ident()?;
+    p.literals(&[")", ",", "this", "."])?; let success_sender = p.ident()?;
+    p.literals(&[".", "send", "(", "{", "type", ":"])?; p.string("AUTH_SUCCESS")?;
+    p.literals(&[",", "tokenInfo", ":"])?; let successarg = p.ident()?;
+    p.literals(&["}", ")", ",", "this", "."])?; let fire = p.ident()?;
+    p.literals(&[".", "fire", "(", "{", "settings", ":"])?; let event_settings = p.ident()?;
+    p.literals(&[",", "userTier", ":"])?; let event_tier = p.ident()?;
+    p.literals(&["}", ")"])?; let tryclose = p.at;
+    p.literals(&["}", "catch", "("])?; p.ident()?; p.literal(")")?; let catchopen = p.at; p.literal("{")?;
+    let valid_roles = arg == signarg && reset == load && arg == loadarg && arg == refresharg
+        && arg == maparg && mapped == pusharg && sender == success_sender && arg == successarg
+        && settings == event_settings && tier == event_tier;
+    Some(IdeCandidate { start, method, branch, tryopen, tryclose, catchopen,
+        fname, arg, sender, reset, func, mapped, push, fire, valid_roles })
+}
+
+fn transform_ide(content: &str) -> Result<Option<String>, String> {
+    if has_marker(content) && !detect_stacked_ide(content) { return Ok(None); }
+    if detect_stacked_ide(content) || has_marker(content) {
         return Err("Обнаружена старая версия патча. Пожалуйста, выполните чистую переустановку Antigravity IDE перед повторным патчем.".into());
     }
-
-    obfstr::obfstr! {
-        let pattern_str = r#"async\s+([A-Za-z_$0-9]+)\(([A-Za-z_$0-9]+)\)\s*\{\s*if\(this\.([A-Za-z_$0-9]+)\.send\(\{type:[A-Za-z_$0-9]+\.isGcpTos\?"GCP_SIGN_IN":"SIGN_IN"\}\),this\.([A-Za-z_$0-9]+)\.resetIsTierGCPTos\(\),this\.[A-Za-z_$0-9]+\.isGoogleInternal\)\{try\{await this\.([A-Za-z_$0-9]+)\.loadCodeAssist\([A-Za-z_$0-9]+\);const\{settings:([A-Za-z_$0-9]+),userTier:([A-Za-z_$0-9]+)\}=await this\.refreshUserStatus\([A-Za-z_$0-9]+\),([A-Za-z_$0-9]+)=([A-Za-z_$0-9]+)\([A-Za-z_$0-9]+\);this\.([A-Za-z_$0-9]+)\.pushUpdate\([A-Za-z_$0-9]+\),this\.[A-Za-z_$0-9]+\.send\(\{type:"AUTH_SUCCESS",tokenInfo:[A-Za-z_$0-9]+\}\),this\.([A-Za-z_$0-9]+)\.fire\(\{settings:[A-Za-z_$0-9]+,userTier:[A-Za-z_$0-9]+\}\)\}catch\(([A-Za-z_$0-9]+)\)\{.*?(?:return\}|return;\s*\})"#;
+    let tokens: Vec<_> = ress::Scanner::new(content).filter_map(|item| match item {
+        Ok(item) if matches!(item.token, ress::tokens::Token::Comment(_)) => None,
+        other => Some(other),
+    }).collect::<Result<_, _>>().map_err(|_| unsupported_ide("ошибка разбора JavaScript"))?;
+    let mut anchors = 0usize;
+    let mut candidates = Vec::new();
+    for start in 0..tokens.len() {
+        let mut anchor = false;
+        if let Some(candidate) = ide_candidate(content, &tokens, start, &mut anchor) { candidates.push(candidate); }
+        if anchor { anchors += 1; }
     }
-
-    let re = Regex::new(pattern_str).unwrap();
-    if let Some(caps) = re.captures(&content) {
-        let fname = caps.get(1).unwrap().as_str();
-        let var_t = caps.get(2).unwrap().as_str();
-        let var_t_send = caps.get(3).unwrap().as_str();
-        let var_y = caps.get(4).unwrap().as_str();
-        let var_func = caps.get(9).unwrap().as_str();
-        let var_f = caps.get(10).unwrap().as_str();
-        let var_h = caps.get(11).unwrap().as_str();
-        let var_i = caps.get(8).unwrap().as_str();
+    if anchors != 1 || candidates.len() != 1 { return Err(unsupported_ide("нет единственной структуры IDE")); }
+    let candidate = &candidates[0];
+    if !candidate.valid_roles { return Err(unsupported_ide("несогласованные связи метода")); }
+    let Some(tryclose) = closing_token(&tokens, candidate.tryopen) else { return Err(unsupported_ide("незакрытый try")); };
+    if tryclose != candidate.tryclose { return Err(unsupported_ide("неоднозначная граница try")); }
+    let Some(catchclose) = closing_token(&tokens, candidate.catchopen) else { return Err(unsupported_ide("незакрытый catch")); };
+    let Some(branchclose) = closing_token(&tokens, candidate.branch) else { return Err(unsupported_ide("незакрытая ветвь")); };
+    let Some(methodclose) = closing_token(&tokens, candidate.method) else { return Err(unsupported_ide("незакрытый метод")); };
+    let mut next = catchclose + 1;
+    let mut exit = IdeTokens { source: content, tokens: &tokens, at: next };
+    if !matches!(tokens.get(exit.at).map(|item| &item.token), Some(ress::tokens::Token::Keyword(ress::tokens::Keyword::Return(_))))
+        || exit.literal("return").is_none() { return Err(unsupported_ide("неизвестный выход ветви")); }
+    if matches!(tokens.get(exit.at).map(|item| &item.token), Some(ress::tokens::Token::Punct(ress::tokens::Punct::SemiColon))) {
+        let _ = exit.literal(";");
+    }
+    next = exit.at;
+    if next != branchclose || branchclose >= methodclose { return Err(unsupported_ide("неоднозначная граница ветви")); }
+    let fname = candidate.fname; let var_t = candidate.arg; let var_t_send = candidate.sender;
+    let var_y = candidate.reset; let var_func = candidate.func; let var_f = candidate.push;
+    let var_h = candidate.fire; let var_i = candidate.mapped;
 
         let payload = format!(
             r#"async {fname}({var_t}){{
@@ -248,19 +557,27 @@ pub fn patch_ide(_inst: &Path, main_js: &Path) -> Result<(), String> {
 
         let new_content = format!(
             "{}\n{}",
-            content[..caps.get(0).unwrap().start()].to_string()
+            content[..tokens[candidate.start].span.start].to_string()
                 + &payload
-                + &content[caps.get(0).unwrap().end()..],
+                + &content[tokens[branchclose].span.end..],
             crate::canary::file_marker()
         );
-        // Pristine copy before the first edit, so the revert can restore it (G25),
-        // then an atomic write so a crash cannot leave a half-written main.js.
-        backup_once(main_js);
-        write_atomic(main_js, &new_content).map_err(|e| e.to_string())?;
-        Ok(())
-    } else {
-        Err("Сигнатура не найдена (возможно, установлена другая версия)".to_string())
+        Ok(Some(new_content))
+}
+
+enum IdeFailure { Structural(String), Effect(String) }
+impl IdeFailure { fn message(self) -> String { match self { Self::Structural(value) | Self::Effect(value) => value } } }
+fn patch_ide_received(main_js: &Path) -> Result<(), IdeFailure> {
+    let pin = PinnedJs::open(main_js).map_err(IdeFailure::Effect)?;
+    let original = pin.read().map_err(IdeFailure::Effect)?;
+    let content = std::str::from_utf8(&original).map_err(|e| IdeFailure::Effect(format!("JS encoding: {e}")))?;
+    match transform_ide(content).map_err(IdeFailure::Structural)? {
+        Some(prepared) => replace_checked(&pin, &original, &prepared).map_err(IdeFailure::Effect),
+        None => Ok(()),
     }
+}
+pub fn patch_ide(_inst: &Path, main_js: &Path) -> Result<(), String> {
+    patch_ide_received(main_js).map_err(IdeFailure::message)
 }
 
 /// Re-applies the IDE `main.js` patch after an update reverted it, classified
@@ -280,15 +597,13 @@ pub fn repatch_ide_js(main_js: &Path) -> RepatchOutcome {
     if has_marker(&content) && !detect_stacked_ide(&content) {
         return RepatchOutcome::AlreadyPatched;
     }
-    match patch_ide(Path::new(""), main_js) {
+    match patch_ide_received(main_js) {
         Ok(()) => RepatchOutcome::Repatched(1),
         // "Signature not found" and "old patch, reinstall" are both give-up
         // conditions - a human has to act, so surface the app's own error
         // instead of guessing. Anything else is an I/O problem worth retrying.
-        Err(e) if e.contains("Сигнатура") || e.contains("старая версия") => {
-            RepatchOutcome::SignatureMissing
-        }
-        Err(e) => RepatchOutcome::Failed(e),
+        Err(IdeFailure::Structural(_)) => RepatchOutcome::SignatureMissing,
+        Err(IdeFailure::Effect(e)) => RepatchOutcome::Failed(e),
     }
 }
 
@@ -562,6 +877,371 @@ mod tests {
     use super::*;
     use std::env;
 
+    fn ide_fixture(condition: &str) -> String {
+        format!(r#"const before=1;class Synthetic{{async authenticate(token){{if(this.sender.send({{type:token.isGcpTos?"GCP_SIGN_IN":"SIGN_IN"}}),this.service.resetIsTierGCPTos(),{condition}){{try{{await this.service.loadCodeAssist(token);const{{settings:state,userTier:tier}}=await this.refreshUserStatus(token),mapped=convert(token);this.updater.pushUpdate(mapped),this.sender.send({{type:"AUTH_SUCCESS",tokenInfo:token}}),this.event.fire({{settings:state,userTier:tier}})}}catch(err){{let text="return}}";let r=/return}}/;let t=`return}}`;function nested(){{return}};this.log(err)}}return}}let untouched="tail";return untouched}}}}const after=2;"#)
+    }
+
+    #[test]
+    fn ide_transform_recognizes_both_conditions_and_preserves_tail() {
+        for condition in ["true", "this.policy.isGoogleInternal"] {
+            let input = ide_fixture(condition);
+            let output = transform_ide(&input).unwrap().unwrap();
+            assert!(output.starts_with("const before=1;class Synthetic{"));
+            assert!(output.contains("let untouched=\"tail\";return untouched}}const after=2;"));
+            assert!(output.contains("onboardUser(\"standard-tier\""));
+            assert!(has_marker(&output));
+            assert!(transform_ide(&output).unwrap().is_none());
+        }
+        let renamed = Regex::new(r"\btoken\b").unwrap().replace_all(&ide_fixture("true"), "аргумент").into_owned();
+        assert!(transform_ide(&renamed).unwrap().is_some());
+        let explicit_semicolon = ide_fixture("true").replace("}return}let untouched", "}return;}let untouched");
+        assert!(transform_ide(&explicit_semicolon).unwrap().is_some());
+    }
+
+    #[test]
+    fn ide_transform_rejects_ambiguous_mismatched_and_unbalanced_inputs() {
+        let valid = ide_fixture("true");
+        let second = ide_fixture("this.policy.isGoogleInternal");
+        assert!(transform_ide(&(valid.clone() + &second)).is_err());
+        let malformed = ide_fixture("false");
+        assert!(transform_ide(&malformed).is_err());
+        assert!(transform_ide(&(valid.clone() + &malformed)).is_err());
+        for (from, to) in [
+            ("type:token.isGcpTos", "type:other.isGcpTos"),
+            ("this.service.loadCodeAssist(token)", "this.other.loadCodeAssist(token)"),
+            ("loadCodeAssist(token)", "loadCodeAssist(other)"),
+            ("refreshUserStatus(token)", "refreshUserStatus(other)"),
+            ("mapped=convert(token)", "mapped=convert(other)"),
+            ("pushUpdate(mapped)", "pushUpdate(other)"),
+            ("this.sender.send({type:\"AUTH_SUCCESS\"", "this.other.send({type:\"AUTH_SUCCESS\""),
+            ("tokenInfo:token", "tokenInfo:other"),
+            ("fire({settings:state,userTier:tier})", "fire({settings:other,userTier:tier})"),
+            ("fire({settings:state,userTier:tier})", "fire({settings:state,userTier:other})"),
+        ] {
+            let inconsistent = valid.replace(from, to);
+            assert_ne!(inconsistent, valid);
+            assert!(transform_ide(&inconsistent).is_err());
+            assert!(transform_ide(&(valid.clone() + &inconsistent)).is_err());
+        }
+        assert!(transform_ide(&valid.replace("}return}let untouched", "}return let untouched")).is_err());
+        assert!(transform_ide("async broken( {").is_err());
+        let decoy = serde_json::to_string(&valid).unwrap();
+        assert!(transform_ide(&format!("const fake={decoy};")).is_err());
+        let input = format!("const fake={decoy};{valid}");
+        assert!(transform_ide(&input).unwrap().is_some());
+        let code_shaped = valid.replace("`return}`", "\"template-safe\"");
+        for decoy in [format!("const fake='{code_shaped}';"), format!("/*{code_shaped}*/"),
+            format!("const fake=`{code_shaped}`;")] {
+            assert!(transform_ide(&decoy).is_err());
+            assert!(transform_ide(&(decoy + &valid)).unwrap().is_some());
+        }
+    }
+
+    #[test]
+    fn string_return_cannot_close_branch() {
+        let input = ide_fixture("true");
+        assert!(transform_ide(&input.replace("}return}let untouched", "}'return'}let untouched")).is_err());
+    }
+    #[test]
+    fn string_semicolon_cannot_close_branch() {
+        let input = ide_fixture("true");
+        assert!(transform_ide(&input.replace("}return}let untouched", "}return ';'}let untouched")).is_err());
+    }
+
+    #[test]
+    fn backup_error_path_text_does_not_change_failure_category() {
+        let dir = env::temp_dir().join(format!("ag-Сигнатура-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("main.js"); fs::write(&target, ide_fixture("true")).unwrap();
+        TEST_BACKUP_FAILURE.with(|value| value.set(1));
+        let result = repatch_ide_js(&target);
+        TEST_BACKUP_FAILURE.with(|value| value.set(0));
+        assert!(matches!(result, RepatchOutcome::Failed(_)));
+        assert!(!backup_path(&target).exists());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn incomplete_stage_cannot_be_consumed_by_restore() {
+        let dir = env::temp_dir().join(format!("ag-partial-restore-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("main.js"); let input = ide_fixture("true");
+        fs::write(&target, &input).unwrap();
+        TEST_BACKUP_FAILURE.with(|value| value.set(1));
+        let failure = patch_ide(&dir, &target);
+        TEST_BACKUP_FAILURE.with(|value| value.set(0));
+        assert!(failure.is_err());
+        assert!(!backup_path(&target).exists());
+        let stage = crate::patch_binary::temp_path(&backup_path(&target));
+        assert_eq!(fs::read(&stage).unwrap(), b"");
+        assert_eq!(restore_js_result(&target).unwrap(), JsRestore::Unchanged);
+        assert_eq!(fs::read(&target).unwrap(), input.as_bytes());
+        assert!(!backup_path(&target).exists());
+        assert_eq!(fs::read(&stage).unwrap(), b"");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn occupied_backup_stage_is_not_overwritten() {
+        let dir = env::temp_dir().join(format!("ag-stage-conflict-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("main.js"); let input = ide_fixture("true");
+        fs::write(&target, &input).unwrap();
+        let stage = crate::patch_binary::temp_path(&backup_path(&target));
+        fs::write(&stage, b"foreign stage").unwrap();
+        assert!(patch_ide(&dir, &target).is_err());
+        assert_eq!(fs::read(&stage).unwrap(), b"foreign stage");
+        assert!(!backup_path(&target).exists());
+        assert_eq!(fs::read(&target).unwrap(), input.as_bytes());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn competing_final_backup_is_received_without_overwrite() {
+        for same in [true, false] {
+            let dir = env::temp_dir().join(format!("ag-backup-race-{}-{same}", std::process::id()));
+            fs::create_dir_all(&dir).unwrap();
+            let target = dir.join("main.js"); let input = ide_fixture("true");
+            fs::write(&target, &input).unwrap();
+            TEST_BACKUP_FAILURE.with(|value| value.set(if same { 4 } else { 5 }));
+            let result = patch_ide(&dir, &target);
+            TEST_BACKUP_FAILURE.with(|value| value.set(0));
+            let backup = backup_path(&target);
+            assert!(!crate::patch_binary::temp_path(&backup).exists());
+            if same {
+                assert!(result.is_ok());
+                assert_eq!(fs::read(&backup).unwrap(), input.as_bytes());
+                assert!(has_marker(&fs::read_to_string(&target).unwrap()));
+            } else {
+                assert!(result.is_err());
+                assert_eq!(fs::read(&backup).unwrap(), b"different competitor");
+                assert_eq!(fs::read(&target).unwrap(), input.as_bytes());
+            }
+            fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn competing_final_with_failed_cleanup_stops_target_write() {
+        let dir = env::temp_dir().join(format!("ag-existing-cleanup-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("main.js"); let input = ide_fixture("true");
+        fs::write(&target, &input).unwrap();
+        TEST_BACKUP_FAILURE.with(|value| value.set(7));
+        let result = patch_ide(&dir, &target);
+        TEST_BACKUP_FAILURE.with(|value| value.set(0));
+        assert!(result.is_err());
+        let backup = backup_path(&target);
+        assert_eq!(fs::read(&backup).unwrap(), input.as_bytes());
+        assert_eq!(fs::read(crate::patch_binary::temp_path(&backup)).unwrap(), input.as_bytes());
+        assert_eq!(fs::read(&target).unwrap(), input.as_bytes());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_stage_cleanup_retains_final_and_stops_target_write() {
+        let dir = env::temp_dir().join(format!("ag-backup-cleanup-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("main.js"); let input = ide_fixture("true");
+        fs::write(&target, &input).unwrap();
+        TEST_BACKUP_FAILURE.with(|value| value.set(6));
+        let result = patch_ide(&dir, &target);
+        TEST_BACKUP_FAILURE.with(|value| value.set(0));
+        assert!(result.is_err());
+        let backup = backup_path(&target);
+        assert_eq!(fs::read(&backup).unwrap(), input.as_bytes());
+        assert_eq!(fs::read(crate::patch_binary::temp_path(&backup)).unwrap(), input.as_bytes());
+        assert_eq!(fs::read(&target).unwrap(), input.as_bytes());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn substituted_stage_is_preserved_and_target_write_stops() {
+        let dir = env::temp_dir().join(format!("ag-stage-substituted-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("main.js"); let input = ide_fixture("true");
+        fs::write(&target, &input).unwrap();
+        TEST_BACKUP_FAILURE.with(|value| value.set(8));
+        let result = patch_ide(&dir, &target);
+        TEST_BACKUP_FAILURE.with(|value| value.set(0));
+        assert!(result.is_err());
+        let backup = backup_path(&target);
+        let stage = crate::patch_binary::temp_path(&backup);
+        assert_eq!(fs::read(&backup).unwrap(), input.as_bytes());
+        assert_eq!(fs::read(&stage).unwrap(), b"synthetic substitute");
+        assert_eq!(fs::read(stage.with_extension("test-displaced")).unwrap(), input.as_bytes());
+        assert_eq!(fs::read(&target).unwrap(), input.as_bytes());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn ide_backup_rejects_conflicts_and_preserves_other_backup() {
+        let dir = env::temp_dir().join(format!("ag-ide-checked-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("main.js");
+        let input = ide_fixture("true").replace(";class", ";\r\nclass");
+        fs::write(&target, &input).unwrap();
+        let unrelated = dir.join("main.js.bak"); fs::write(&unrelated, b"foreign").unwrap();
+        patch_ide(&dir, &target).unwrap();
+        let output = fs::read(&target).unwrap();
+        assert_eq!(fs::read(backup_path(&target)).unwrap(), input.as_bytes());
+        assert_eq!(fs::read(&unrelated).unwrap(), b"foreign");
+        patch_ide(&dir, &target).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), output);
+        assert_eq!(fs::read(backup_path(&target)).unwrap(), input.as_bytes());
+        restore_js(&target).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), input.as_bytes());
+        fs::write(backup_path(&target), b"different").unwrap();
+        assert!(patch_ide(&dir, &target).is_err());
+        assert_eq!(fs::read(&target).unwrap(), input.as_bytes());
+        assert_eq!(fs::read(backup_path(&target)).unwrap(), b"different");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn extension_rewrite_uses_exact_backup_and_marked_retry_is_inert() {
+        let dir = env::temp_dir().join(format!("ag-extension-checked-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        assert_eq!(patch_extension_js(&dir).unwrap(), false);
+        let target = js_targets(&dir).extension;
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        let input = "const t=await svc.UserStatus.getUserStatus();if(!t)return[];const n=(0,parse)(t,decoder),{email:e,name:q}=n;return\"\"===e?[]:result;\r\n";
+        fs::write(&target, input).unwrap();
+        fs::write(backup_path(&target), b"other").unwrap();
+        assert!(patch_extension_js(&dir).is_err());
+        assert_eq!(fs::read(&target).unwrap(), input.as_bytes());
+        assert_eq!(fs::read(backup_path(&target)).unwrap(), b"other");
+        fs::remove_file(backup_path(&target)).unwrap();
+        assert!(patch_extension_js(&dir).unwrap());
+        let output = fs::read(&target).unwrap();
+        assert_eq!(fs::read(backup_path(&target)).unwrap(), input.as_bytes());
+        assert!(patch_extension_js(&dir).unwrap());
+        assert_eq!(fs::read(&target).unwrap(), output);
+        assert_eq!(fs::read(backup_path(&target)).unwrap(), input.as_bytes());
+        restore_js(&target).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), input.as_bytes());
+        TEST_READBACK_FAILURE.with(|value| value.set(true));
+        let error = patch_extension_js(&dir).unwrap_err();
+        assert!(error.contains("JS replaced; readback unavailable"));
+        assert_eq!(fs::read(backup_path(&target)).unwrap(), input.as_bytes());
+        restore_js(&target).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), input.as_bytes());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn changed_input_fails_before_backup() {
+        let dir = env::temp_dir().join(format!("ag-preimage-checked-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("main.js"); fs::write(&target, b"current").unwrap();
+        let pin = PinnedJs::open(&target).unwrap();
+        assert!(replace_checked(&pin, b"different", "replacement").is_err());
+        assert!(!backup_path(&target).exists());
+        assert_eq!(fs::read(&target).unwrap(), b"current");
+        drop(pin);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_backup_symlink_is_not_followed() {
+        use std::os::unix::fs::symlink;
+        let dir = env::temp_dir().join(format!("ag-symlink-checked-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("main.js"); let other = dir.join("other");
+        fs::write(&target, b"current").unwrap(); fs::write(&other, b"foreign").unwrap();
+        symlink(&other, backup_path(&target)).unwrap();
+        assert!(backup_once(&target, b"current").is_err());
+        assert_eq!(fs::read(&other).unwrap(), b"foreign");
+        assert_eq!(fs::read(&target).unwrap(), b"current");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn checked_replace_reports_attempt_and_retains_verified_backup_on_failures() {
+        let dir = env::temp_dir().join(format!("ag-failure-checked-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("main.js"); let input = ide_fixture("true");
+        fs::write(&target, &input).unwrap();
+        let temporary = crate::patch_binary::temp_path(&target);
+        fs::create_dir(&temporary).unwrap();
+        let error = patch_ide(&dir, &target).unwrap_err();
+        assert!(error.contains("outcome unconfirmed"));
+        assert_eq!(fs::read(&target).unwrap(), input.as_bytes());
+        assert_eq!(fs::read(backup_path(&target)).unwrap(), input.as_bytes());
+        fs::remove_dir(&temporary).unwrap();
+        TEST_READBACK_FAILURE.with(|value| value.set(true));
+        let error = patch_ide(&dir, &target).unwrap_err();
+        assert!(error.contains("JS replaced; readback unavailable"));
+        assert!(has_marker(&fs::read_to_string(&target).unwrap()));
+        assert_eq!(fs::read(backup_path(&target)).unwrap(), input.as_bytes());
+        restore_js(&target).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), input.as_bytes());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn backup_write_flush_and_receiving_failures_stop_both_callers() {
+        for extension in [false, true] {
+            for stage in 1..=3 {
+                let dir = env::temp_dir().join(format!("ag-backup-failure-{}-{extension}-{stage}", std::process::id()));
+                fs::create_dir_all(&dir).unwrap();
+                let target = if extension { js_targets(&dir).extension } else { dir.join("main.js") };
+                fs::create_dir_all(target.parent().unwrap()).unwrap();
+                let input = if extension {
+                    "const t=await svc.UserStatus.getUserStatus();if(!t)return[];const n=(0,parse)(t,decoder),{email:e,name:q}=n;return\"\"===e?[]:result;".to_owned()
+                } else { ide_fixture("true") };
+                fs::write(&target, &input).unwrap();
+                TEST_BACKUP_FAILURE.with(|value| value.set(stage));
+                let result = if extension { patch_extension_js(&dir).map(|_| ()) } else { patch_ide(&dir, &target) };
+                TEST_BACKUP_FAILURE.with(|value| value.set(0));
+                let error = result.unwrap_err();
+                assert!(error.contains("entry retained"));
+                assert_eq!(fs::read(&target).unwrap(), input.as_bytes());
+                let backup = backup_path(&target);
+                assert!(!backup.exists());
+                let actual = fs::read(crate::patch_binary::temp_path(&backup)).unwrap();
+                if stage == 1 { assert!(actual.is_empty()); } else { assert_eq!(actual, input.as_bytes()); }
+                fs::remove_dir_all(&dir).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "Root-owned explicit JavaScript engine; synthetic stubs only"]
+    fn synthetic_transformed_method_parses_and_preserves_producer_behavior() {
+        use std::process::{Command, Stdio};
+        let node = env::var_os("AG_IDE_TEST_NODE").expect("explicit JavaScript engine required");
+        for condition in ["true", "this.policy.isGoogleInternal"] {
+            let output = transform_ide(&ide_fixture(condition)).unwrap().unwrap();
+            let run = |args: &[&str], script: &str| {
+                let mut child = Command::new(&node).args(args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+                child.stdin.take().unwrap().write_all(script.as_bytes()).unwrap();
+                child.wait_with_output().unwrap()
+            };
+            let parsed = run(&["--check"], &output);
+            assert!(parsed.status.success(), "{}", String::from_utf8_lossy(&parsed.stderr));
+            let harness = r#"
+function convert(token){return token}
+async function exercise(fail){
+ let calls=[], x=new Synthetic(), token={isGcpTos:false};
+ x.sender={send:v=>calls.push(v.type)};
+ x.service={resetIsTierGCPTos:()=>calls.push('reset'),loadCodeAssist:async()=>{calls.push('load');if(fail)throw Error('load')},onboardUser:async(t)=>{calls.push(t);if(fail)throw Error('onboard')}};
+ x.refreshUserStatus=async()=>{calls.push('refresh');if(fail)throw Error('refresh');return {settings:{},userTier:{id:'actual'}}};
+ x.updater={pushUpdate:()=>calls.push('push')};x.event={fire:v=>calls.push(v.userTier.id)};
+ await x.authenticate(token);
+ if(!calls.includes('AUTH_SUCCESS') || !calls.includes('standard-tier') || !calls.includes(fail?'pro':'actual'))throw Error('producer behavior differs');
+ if(fail && !calls.includes('free-tier'))throw Error('fallback onboarding missing');
+}
+(async()=>{await exercise(false);await exercise(true)})().catch(e=>{console.error(e);process.exitCode=1});
+"#;
+            let result = run(&[], &(output + "\n" + harness));
+            assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+        }
+    }
+
     #[cfg(windows)]
     #[test]
     fn checked_js_restore_failure_blocks_the_second_mutation() {
@@ -619,12 +1299,13 @@ mod tests {
         fs::write(&target, original).unwrap();
 
         // First backup captures the pristine file.
-        backup_once(&target);
+        backup_once(&target, original.as_bytes()).unwrap();
+        backup_once(&target, original.as_bytes()).unwrap();
         assert!(backup_path(&target).exists());
         // A "patch": rewrite the body and append a marker.
         write_atomic(&target, "REWRITTEN BODY\n// UNLOCKED").unwrap();
         // A second backup must NOT overwrite the pristine one.
-        backup_once(&target);
+        assert!(backup_once(&target, b"REWRITTEN BODY\n// UNLOCKED").is_err());
 
         assert_eq!(restore_js(&target).unwrap(), true);
         assert_eq!(fs::read_to_string(&target).unwrap(), original, "byte-exact");
@@ -717,7 +1398,9 @@ pub fn patch_extension_js(inst: &Path) -> Result<bool, String> {
         return Ok(false);
     }
 
-    let content = fs::read_to_string(&ext_path).map_err(|e| e.to_string())?;
+    let pin = PinnedJs::open(&ext_path)?;
+    let original = pin.read()?;
+    let content = std::str::from_utf8(&original).map_err(|e| format!("JS encoding: {e}"))?;
     if content.contains("/*[AG_EXT_PATCHED]*/") {
         return Ok(true);
     }
@@ -726,7 +1409,7 @@ pub fn patch_extension_js(inst: &Path) -> Result<bool, String> {
         let p1_str = r#"const t=await ([A-Za-z_$][A-Za-z_$0-9.]*)\.UserStatus\.getUserStatus\(\);if\(!t\)return\[\];const n=\(0,([A-Za-z_$][A-Za-z_$0-9.]*)\)\(t,([A-Za-z_$][A-Za-z_$0-9.]*)\),\{email:([A-Za-z_$][A-Za-z_$0-9]*),name:([A-Za-z_$][A-Za-z_$0-9]*)\}=n;return""===([A-Za-z_$][A-Za-z_$0-9]*)\?\[\]:"#;
     }
     let p1 = Regex::new(p1_str).unwrap();
-    let new_content = p1.replace(&content, |caps: &regex::Captures| {
+    let new_content = p1.replace(content, |caps: &regex::Captures| {
         let ns = &caps[1];
         let p2 = &caps[2];
         let dz7 = &caps[3];
@@ -748,7 +1431,6 @@ pub fn patch_extension_js(inst: &Path) -> Result<bool, String> {
         new_content,
         crate::canary::file_marker()
     );
-    backup_once(&ext_path);
-    write_atomic(&ext_path, &marked).map_err(|e| e.to_string())?;
+    replace_checked(&pin, &original, &marked)?;
     Ok(true)
 }
