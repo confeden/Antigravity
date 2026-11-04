@@ -2061,6 +2061,9 @@ pub(crate) struct ApplyInstallation {
 impl ApplyInstallation {
     pub(crate) fn root(&self) -> &std::path::Path { self.root.as_path() }
     pub(crate) fn anchor(&self) -> &std::path::Path { self.anchor.as_path() }
+    pub(crate) fn is_vendor_update(&self) -> bool {
+        matches!(&self.expectation.current, crate::instances::GuiCurrentExpectation::VendorUpdate { .. })
+    }
     fn recheck(&self) -> Result<(), String> {
         self.root.recheck()?;
         self.anchor.recheck()?;
@@ -2108,6 +2111,7 @@ impl AllTargetApplyPlan {
     pub(crate) fn wsl_desktops(&self) -> impl Iterator<Item = &ApplyInstallation> {
         self.targets.iter().filter(|target| target.kind == crate::InstallationKind::Desktop)
     }
+    fn has_vendor_update(&self) -> bool { self.targets.iter().any(ApplyInstallation::is_vendor_update) }
     fn expectations(&self) -> Vec<crate::instances::GuiTargetExpectation> {
         self.targets.iter().map(|target| target.expectation.clone()).collect()
     }
@@ -2129,9 +2133,22 @@ impl AllTargetApplyPlan {
 #[cfg(windows)]
 fn receive_desktop_current(bound: &crate::windows_coordinator::windows_installation::BoundInstallation)
     -> Result<crate::instances::GuiCurrentExpectation, String> {
-    Ok(match crate::windows_coordinator::windows_installation::capture_current_expectation(bound)? {
-        None => crate::instances::GuiCurrentExpectation::Absent {},
-        Some((slot_id, current_sha256)) => crate::instances::GuiCurrentExpectation::Present { slot_id, current_sha256 },
+    gui_current_expectation(crate::windows_coordinator::windows_installation::observe_apply_current(bound)?)
+}
+
+#[cfg(windows)]
+fn gui_current_expectation(observation: crate::windows_coordinator::windows_installation::ApplyCurrentObservation)
+    -> Result<crate::instances::GuiCurrentExpectation, String> {
+    use crate::{instances::GuiCurrentExpectation as Gui, windows_coordinator::windows_installation::ApplyCurrentObservation as Current};
+    Ok(match observation {
+        Current::Absent => Gui::Absent {},
+        Current::Settled { slot_id, current_sha256 } => Gui::Present { slot_id, current_sha256 },
+        Current::GatewayPending(_) => return Err("RecoveryRequired: continuation target has unresolved Current".into()),
+        Current::VendorReplacement(value) => Gui::VendorUpdate { slot_id: value.slot_id,
+            prior_current_sha256: value.prior_current_sha256, new_parent_id: value.new_parent_id,
+            new_resources_id: value.new_resources_id, new_archive_id: value.new_archive_id,
+            new_executable_sha256: value.new_executable_sha256, new_archive_sha256: value.new_archive_sha256,
+            new_binding_sha256: value.new_binding_sha256 },
     })
 }
 
@@ -2172,10 +2189,9 @@ pub(crate) fn receive_all_target_apply_plan(wanted: Settings, cancel: &AtomicBoo
             let mut bound = owner::BoundInstallation::open(anchor.as_path())?;
             if let Some(context) = coordinator::receive_saved_context(&bound)? { bound.attach_ancestor_context(context)?; }
             match owner::observe_apply_current(&bound)? {
-                owner::ApplyCurrentObservation::Absent => GuiCurrentExpectation::Absent {},
-                owner::ApplyCurrentObservation::Settled { slot_id, current_sha256 } => GuiCurrentExpectation::Present { slot_id, current_sha256 },
                 owner::ApplyCurrentObservation::GatewayPending(observation) => return Err(ApplyPlanError::GatewayRecoveryRequired(
                     GatewayApplyRecovery { observation, target, bound })),
+                observation => gui_current_expectation(observation)?,
             }
         } else { GuiCurrentExpectation::NotApplicable {} };
         let expectation = GuiTargetExpectation { target, current };
@@ -2222,7 +2238,7 @@ fn receive_apply_continuation(intent: &crate::instances::GuiApplyContinuation, c
             return Err("Apply target kind/anchor binding changed".into());
         }
         if !matches!((kind, &expectation.current),
-            (GuiTargetKind::Desktop, GuiCurrentExpectation::Absent {} | GuiCurrentExpectation::Present { .. })
+            (GuiTargetKind::Desktop, GuiCurrentExpectation::Absent {} | GuiCurrentExpectation::Present { .. } | GuiCurrentExpectation::VendorUpdate { .. })
             | (GuiTargetKind::Ide | GuiTargetKind::Cli, GuiCurrentExpectation::NotApplicable {})) {
             return Err("Apply target Current applicability differs from its kind".into());
         }
@@ -2234,6 +2250,39 @@ fn receive_apply_continuation(intent: &crate::instances::GuiApplyContinuation, c
     }
     plan.recheck()?;
     Ok(plan)
+}
+
+#[cfg(windows)]
+fn receive_settled_vendor_plan(before: &AllTargetApplyPlan, after: &AllTargetApplyPlan,
+    received: &[(String, [u8; 32])]) -> Result<(), String> {
+    use crate::instances::GuiCurrentExpectation;
+    if before.saved_sha256 != after.saved_sha256 || before.targets.len() != after.targets.len() {
+        return Err("Apply target domain or saved intent changed after vendor update".into());
+    }
+    let mut matched = 0usize;
+    for (old, new) in before.targets.iter().zip(&after.targets) {
+        if old.expectation.target != new.expectation.target {
+            return Err("Apply selected target changed after vendor update".into());
+        }
+        match (&old.expectation.current, &new.expectation.current) {
+            (GuiCurrentExpectation::VendorUpdate { slot_id: old_slot, .. },
+             GuiCurrentExpectation::Present { slot_id: new_slot, current_sha256 }) if old_slot == new_slot => {
+                if !vendor_result_received(received, new_slot, current_sha256) {
+                    return Err("Apply Current differs from the actual vendor owner result".into());
+                }
+                matched += 1;
+            },
+            (old, new) if !matches!(old, GuiCurrentExpectation::VendorUpdate { .. }) && old == new => {},
+            _ => return Err("Apply Current changed outside the received vendor update".into()),
+        }
+    }
+    if matched != received.len() { return Err("Apply vendor result count differs from the selected targets".into()); }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn vendor_result_received(received: &[(String, [u8; 32])], slot: &str, digest: &[u8; 32]) -> bool {
+    received.iter().filter(|(actual_slot, actual_digest)| actual_slot == slot && actual_digest == digest).count() == 1
 }
 
 #[cfg(windows)]
@@ -2359,8 +2408,8 @@ fn apply_acknowledged(ctx: &mut Ctx, wanted: Settings, cancellation: &AtomicBool
                     }
                 },
             };
-            let plan = match received {
-                Ok(plan) => Arc::new(plan),
+            let mut plan = match received {
+                Ok(plan) => plan,
                 Err(error) => {
                     let error = apply_receiving_failure(&error, &recovery_results);
                     if !cancellation.load(Ordering::SeqCst) { hold_apply(ctx, error.clone()); }
@@ -2370,6 +2419,18 @@ fn apply_acknowledged(ctx: &mut Ctx, wanted: Settings, cancellation: &AtomicBool
             if (plan.native.requires_elevation() && !is_admin()) || plan.wsl()?.requires_elevation() {
                 return Ok(NativeCompletion::NeedsElevation(plan.continuation()?));
             }
+            if plan.has_vendor_update() {
+                plan.recheck()?;
+                let vendor_results = crate::wsl_runtime::apply_vendor_prerequisites(&plan, cancellation)?;
+                let next = receive_all_target_apply_plan(wanted.clone(), cancellation).map_err(|error| error.to_string())?;
+                receive_settled_vendor_plan(&plan, &next, &vendor_results)?;
+                if (next.native.requires_elevation() && !is_admin()) || next.wsl()?.requires_elevation() {
+                    return Err("UpdatePending: Apply requirements changed after vendor update".into());
+                }
+                ctx.log(Level::Ok, "Обновление WSL Desktop получено; остальные настройки проверены повторно.");
+                plan = next;
+            }
+            let plan = Arc::new(plan);
             reconcile_native(ctx, &wanted, cancellation, &plan)?;
             if !cancellation.load(Ordering::SeqCst) { ctx.wsl.request_apply(plan)?; }
             return Ok(NativeCompletion::Retired);
@@ -2621,7 +2682,27 @@ fn auto_patch_found(ctx: &mut Ctx) -> bool {
                 .collect()
         })
         .unwrap_or_default();
-    patch_found(ctx, found)
+    let patched = patch_found(ctx, found);
+    #[cfg(windows)]
+    let vendor_updated = {
+        let mut updated = false;
+        if crate::wsl_runtime::automatic_vendor_update_wanted(&ctx.settings) {
+            let roots: Vec<_> = ctx.last.as_ref().map(|status| status.installs.iter()
+                .filter_map(|row| row.path.clone()).collect()).unwrap_or_default();
+            for root in roots {
+                if ctx.native_cancel.load(Ordering::SeqCst) { break; }
+                match crate::wsl_runtime::automatic_vendor_update(&root, &ctx.settings, &ctx.native_cancel) {
+                    Ok(true) => { updated = true; ctx.log(Level::Ok, "Обновлён WSL-хук Desktop."); },
+                    Ok(false) => {},
+                    Err(error) => ctx.log(Level::Warn, format!("Автообновление WSL отложено: {error}")),
+                }
+            }
+        }
+        updated
+    };
+    #[cfg(not(windows))]
+    let vendor_updated = false;
+    patched || vendor_updated
 }
 
 /// Patches the given installs without closing anything. The shared body of
@@ -3395,6 +3476,15 @@ pub fn resolve_manual_path(raw: &Path) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[cfg(windows)]
+    fn vendor_current_requires_exact_unique_owner_result() {
+        let values = vec![("slot".to_owned(), [7; 32])];
+        assert!(super::vendor_result_received(&values, "slot", &[7; 32]));
+        assert!(!super::vendor_result_received(&values, "slot", &[8; 32]));
+        assert!(!super::vendor_result_received(&values, "other", &[7; 32]));
+        assert!(!super::vendor_result_received(&[values[0].clone(), values[0].clone()], "slot", &[7; 32]));
+    }
     #[test]
     #[cfg(windows)]
     fn later_plan_failure_or_cancel_preserves_recovery_results_including_error_after_publish() {

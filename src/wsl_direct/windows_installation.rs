@@ -39,7 +39,7 @@ use runtime_deployment::{DeploymentField, RuntimeDeployment};
 pub(crate) mod gateway_rules;
 #[path = "windows_installation/runtime_upgrade.rs"]
 mod runtime_upgrade;
-pub(crate) use runtime_upgrade::{upgrade_runtime, rollback_runtime};
+pub(crate) use runtime_upgrade::{prepare_vendor_update, upgrade_runtime, rollback_runtime, VendorRuntimeInput, VendorUpdateCompletion};
 #[path = "windows_installation/runtime_assets.rs"]
 mod runtime_assets;
 pub(crate) use runtime_assets::PackageAssets;
@@ -430,7 +430,6 @@ impl BoundInstallation {
         )?;
         let bytes = archive.read()?;
         let executable_digest = hash(&exe.read()?);
-        require_producer(&executable_digest)?;
         Ok(Self {
             executable,
             exe,
@@ -601,20 +600,6 @@ pub(crate) fn context_fixture_directory(parent: &Path) -> Result<PathBuf> {
     create_private_dir(&path)?;
     Ok(path)
 }
-const REVIEWED_DESKTOP_SHA256: &str =
-    "274f58814e19e695a87ab8a6eb52f9763243baaeb2e2ee435aee8b205e6e85d8";
-fn require_producer(digest: &str) -> Result<()> {
-    #[cfg(test)]
-    if TEST_PRODUCER.with(|v| v.get()) {
-        return Ok(());
-    }
-    if digest != REVIEWED_DESKTOP_SHA256 {
-        Err("MaintenanceRequired: Desktop executable integrity/producer is unreviewed".into())
-    } else {
-        Ok(())
-    }
-}
-
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ReviewManifest {
@@ -910,6 +895,7 @@ enum OperationKind {
     RollbackRuntime,
     ConfigureGatewayRules,
     RetireGatewayRules,
+    VendorUpdate,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -1031,6 +1017,7 @@ enum Settlement {
     Resolution(Resolution),
     RuntimeUpgrade(runtime_upgrade::UpgradeOutcome),
     GatewayRules(gateway_rules::GatewayOutcome),
+    VendorUpdate(runtime_upgrade::VendorUpdateOutcome),
 }
 
 fn json<T: Serialize>(value: &T) -> Result<Vec<u8>> {
@@ -1209,7 +1196,9 @@ fn receive_current(slot: &CheckedPath) -> Result<(Current, String)> {
         }
     }
     if let Some(op) = &c.active_operation {
-        if matches!(op.kind, OperationKind::UpgradeRuntime | OperationKind::RollbackRuntime) {
+        if matches!(op.kind, OperationKind::VendorUpdate) {
+            runtime_upgrade::receive_vendor_pending(slot, &c, op)?;
+        } else if matches!(op.kind, OperationKind::UpgradeRuntime | OperationKind::RollbackRuntime) {
             runtime_upgrade::receive_pending(slot, &c, op)?;
         } else if matches!(op.kind, OperationKind::ConfigureGatewayRules | OperationKind::RetireGatewayRules) {
             gateway_rules::receive_pending(slot, &c, op)?;
@@ -1270,6 +1259,7 @@ fn receive_settlement(slot: &CheckedPath, c: &Current) -> Result<(TargetState, O
         }
         Settlement::RuntimeUpgrade(outcome) => runtime_upgrade::receive_settled(slot, c, &outcome)?,
         Settlement::GatewayRules(outcome) => gateway_rules::receive_settled(slot, c, &outcome)?,
+        Settlement::VendorUpdate(outcome) => runtime_upgrade::receive_vendor_settled(slot, c, &outcome)?,
         _ => return Err("settlement evidence kind conflict".into()),
     };
     if target != settled.target || json(&applied)? != json(&settled.applied)? {
@@ -1351,6 +1341,12 @@ fn lookup(
 }
 impl Authority {
     fn open(bound: &BoundInstallation, enroll: bool, recover: bool) -> Result<Self> {
+        Self::open_inner(bound, enroll, recover, None)
+    }
+    fn open_vendor_update(bound: &BoundInstallation, expected: &str) -> Result<Self> {
+        Self::open_inner(bound, false, false, Some(expected))
+    }
+    fn open_inner(bound: &BoundInstallation, enroll: bool, recover: bool, vendor_expected: Option<&str>) -> Result<Self> {
         let (known, product_path, namespace_path) = namespace_paths(bound)?;
         let namespace_lock = Lease::acquire(&known, "wsl_namespace_v2")?;
         if !enroll && !namespace_path.exists() {
@@ -1478,7 +1474,16 @@ impl Authority {
             a.publish(c)?;
         }
         if !recover {
-            a.check_bound(bound)?;
+            if let Some(expected) = vendor_expected {
+                if a.digest != expected || a.current.mode != Mode::SettledApplied
+                    || !ordinal(&a.current.locator, &bound.root.locator)?
+                    || a.current.binding == bound.binding()? {
+                    return Err("UpdatePending: selected vendor update does not bind the expected settled prior incarnation".into());
+                }
+                a.current.runtime_deployment.received()?.receive_receipt(&a.slot)?;
+            } else {
+                a.check_bound(bound)?;
+            }
         }
         Ok(a)
     }
@@ -1921,6 +1926,56 @@ pub(crate) enum ApplyCurrentObservation {
     Absent,
     Settled { slot_id: String, current_sha256: [u8; 32] },
     GatewayPending(GatewayPendingObservation),
+    VendorReplacement(VendorUpdateObservation),
+}
+
+/// A changed, positively selected incarnation still tied to one settled slot.
+/// This is a prerequisite observation, never permission to execute maintenance.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct VendorUpdateObservation {
+    pub(crate) slot_id: String,
+    pub(crate) prior_current_sha256: [u8; 32],
+    pub(crate) new_parent_id: ObjectId,
+    pub(crate) new_resources_id: ObjectId,
+    pub(crate) new_archive_id: ObjectId,
+    pub(crate) new_executable_sha256: [u8; 32],
+    pub(crate) new_archive_sha256: [u8; 32],
+    pub(crate) new_binding_sha256: [u8; 32],
+}
+
+fn vendor_update_observation(bound: &BoundInstallation, slot: &CheckedPath, current: &Current,
+    digest: &str) -> Result<VendorUpdateObservation> {
+    let binding = bound.binding()?;
+    if current.mode != Mode::SettledApplied || !ordinal(&current.locator, &bound.root.locator)?
+        || current.binding == binding {
+        return Err("UpdatePending: no distinct settled vendor incarnation".into());
+    }
+    let deployment = current.runtime_deployment.received()?;
+    deployment.receive_receipt(slot)?;
+    let _host = deployment.receive_host(slot)?;
+    bound.exe.recheck()?;
+    if hash(&bound.exe.read_snapshot()?) != bound.executable_digest || bound.archive.read_snapshot()? != bound.bytes {
+        return Err("UpdatePending: selected vendor bytes changed".into());
+    }
+    let host = deployment.host.path.to_str().ok_or("runtime host encoding")?;
+    if desktop_hook::prepare_gui_archive(&bound.bytes, host).map_err(|e| e.to_string())?.hook_status
+        != desktop_hook::HookStatus::Prepared {
+        return Err("UpdatePending: vendor update requires a supported pristine archive".into());
+    }
+    let decode_hash = |value: &str| -> Result<[u8; 32]> {
+        hex::decode(value).map_err(|_| "digest encoding")?.try_into().map_err(|_| "digest length".into())
+    };
+    Ok(VendorUpdateObservation { slot_id: current.slot_id.clone(), prior_current_sha256: decode_hash(digest)?,
+        new_parent_id: binding.parent.clone(), new_resources_id: binding.resources.clone(), new_archive_id: binding.archive.clone(),
+        new_executable_sha256: decode_hash(&binding.executable_digest)?, new_archive_sha256: decode_hash(&binding.archive_digest)?,
+        new_binding_sha256: decode_hash(&hash(&json(&binding)?))? })
+}
+
+pub(crate) fn observe_vendor_update(bound: &BoundInstallation) -> Result<VendorUpdateObservation> {
+    match observe_apply_current(bound)? {
+        ApplyCurrentObservation::VendorReplacement(value) => Ok(value),
+        _ => Err("UpdatePending: no distinct settled vendor incarnation".into()),
+    }
 }
 /// Read-only observation for positive Apply. This data grants no mutation;
 /// recovery re-receives the same exact operation/digest/native binding.
@@ -1942,7 +1997,9 @@ pub(crate) fn observe_apply_current(bound: &BoundInstallation) -> Result<ApplyCu
     if matches!(current.mode, Mode::Bootstrap | Mode::Pending) && !gateway_pending {
         return Err("RecoveryRequired: continuation target has unresolved Current".into());
     }
-    if current.binding != bound.binding()? { return Err("UpdatePending: continuation target incarnation differs".into()); }
+    if current.binding != bound.binding()? {
+        return Ok(ApplyCurrentObservation::VendorReplacement(vendor_update_observation(bound, &slot, &current, &digest)?));
+    }
     let digest: [u8; 32] = hex::decode(digest).map_err(|_| "current digest encoding")?
         .try_into().map_err(|_| "current digest length")?;
     if gateway_pending {
@@ -1958,6 +2015,7 @@ fn strict_current_expectation(observation: ApplyCurrentObservation) -> Result<Op
         ApplyCurrentObservation::Absent => Ok(None),
         ApplyCurrentObservation::Settled { slot_id, current_sha256 } => Ok(Some((slot_id, current_sha256))),
         ApplyCurrentObservation::GatewayPending(_) => Err("RecoveryRequired: continuation target has unresolved Current".into()),
+        ApplyCurrentObservation::VendorReplacement(_) => Err("UpdatePending: continuation target incarnation differs".into()),
     }
 }
 /// Continuation/startup readers remain strictly settled and never recover.
@@ -1973,6 +2031,11 @@ mod apply_current_projection_tests {
         assert_eq!(strict_current_expectation(ApplyCurrentObservation::Settled { slot_id: "a".repeat(32), current_sha256: [7;32] }).unwrap(), Some(("a".repeat(32), [7;32])));
         let pending = GatewayPendingObservation { slot_id: "a".repeat(32), operation_id: "b".repeat(32), current_sha256: [8;32] };
         assert!(strict_current_expectation(ApplyCurrentObservation::GatewayPending(pending)).unwrap_err().contains("unresolved Current"));
+        let id = ObjectId { volume: 1, file: [2; 16] };
+        let vendor = VendorUpdateObservation { slot_id: "a".repeat(32), prior_current_sha256: [3; 32],
+            new_parent_id: id.clone(), new_resources_id: id.clone(), new_archive_id: id,
+            new_executable_sha256: [4; 32], new_archive_sha256: [5; 32], new_binding_sha256: [6; 32] };
+        assert!(strict_current_expectation(ApplyCurrentObservation::VendorReplacement(vendor)).unwrap_err().contains("incarnation differs"));
     }
 }
 
@@ -2286,6 +2349,9 @@ pub(crate) fn recover<W: MaintenanceWindow>(
         gateway_rules::recover_gateway_rules(&bound, id, expected, context.runner, window, context.cancel)
             .map_err(|error| error.to_string())?;
         return Ok("RecoverySettled: exact Pending gateway operation received without native replay".into());
+    }
+    if matches!(op.kind, OperationKind::VendorUpdate) {
+        return runtime_upgrade::recover_vendor_update(bound, authority, op, gateway, window);
     }
     if matches!(op.kind, OperationKind::UpgradeRuntime | OperationKind::RollbackRuntime) {
         return runtime_upgrade::recover(bound, authority, op, window);
@@ -2620,7 +2686,7 @@ fn verify_failure_observations(
     Ok(())
 }
 #[cfg(test)]
-thread_local! { static TEST_FIXTURE_PARENT:std::cell::RefCell<Option<PathBuf>>=const{std::cell::RefCell::new(None)};static TEST_BASE:std::cell::RefCell<Option<PathBuf>>=const{std::cell::RefCell::new(None)};static TEST_PRODUCER:std::cell::Cell<bool>=const{std::cell::Cell::new(false)};static TEST_BOOTSTRAP_SLOT_FAILURE:std::cell::Cell<bool>=const{std::cell::Cell::new(false)};static TEST_BOOTSTRAP_FAILURE:std::cell::Cell<bool>=const{std::cell::Cell::new(false)};static TEST_DACL_STATUSES:std::cell::RefCell<Vec<u32>>=const{std::cell::RefCell::new(Vec::new())};static TEST_NATIVE_CALLS:std::cell::Cell<usize>=const{std::cell::Cell::new(0)};static TEST_OUTCOME_FAILURE:std::cell::Cell<bool>=const{std::cell::Cell::new(false)}; }
+thread_local! { static TEST_FIXTURE_PARENT:std::cell::RefCell<Option<PathBuf>>=const{std::cell::RefCell::new(None)};static TEST_BASE:std::cell::RefCell<Option<PathBuf>>=const{std::cell::RefCell::new(None)};static TEST_BOOTSTRAP_SLOT_FAILURE:std::cell::Cell<bool>=const{std::cell::Cell::new(false)};static TEST_BOOTSTRAP_FAILURE:std::cell::Cell<bool>=const{std::cell::Cell::new(false)};static TEST_DACL_STATUSES:std::cell::RefCell<Vec<u32>>=const{std::cell::RefCell::new(Vec::new())};static TEST_NATIVE_CALLS:std::cell::Cell<usize>=const{std::cell::Cell::new(0)};static TEST_OUTCOME_FAILURE:std::cell::Cell<bool>=const{std::cell::Cell::new(false)}; }
 #[cfg(test)]
 #[path = "windows_installation/tests.rs"]
 mod tests;

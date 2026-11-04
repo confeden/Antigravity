@@ -80,6 +80,108 @@ fn wants_transport(settings: &Settings) -> bool {
 }
 
 #[cfg(windows)]
+fn vendor_background_lease() -> Result<crate::windows_coordinator::windows_installation::BackgroundLease, String> {
+    use crate::windows_coordinator::{self as coordinator, windows_installation as owner};
+    let locations = owner::background_locations()?;
+    let inputs = owner::background_inputs(locations.managed_root(), locations.managed_directory(), None,
+        &crate::dns_forwarder::log_dir())?;
+    let context = coordinator::receive_for_background(&inputs)?;
+    owner::background_lease(inputs, context)
+}
+
+/// One owner route for both a GUI-qualified package and automatic reuse.
+#[cfg(windows)]
+pub(crate) fn apply_vendor_update(
+    bound: crate::windows_coordinator::windows_installation::BoundInstallation,
+    expected: &crate::windows_coordinator::windows_installation::VendorUpdateObservation,
+    input: crate::windows_coordinator::windows_installation::VendorRuntimeInput<'_>,
+    settings: &Settings,
+    automatic: bool,
+    cancellation: &AtomicBool,
+) -> std::result::Result<crate::windows_coordinator::windows_installation::VendorUpdateCompletion,
+    crate::windows_coordinator::windows_installation::gateway_rules::GatewayRuleError> {
+    use crate::windows_coordinator::{self as coordinator, windows_installation as owner};
+    use owner::gateway_rules::{GatewayRuleError, GatewayRuleRunner};
+    if automatic && !automatic_vendor_update_wanted(settings) {
+        return Err(GatewayRuleError::Invalid("automatic WSL update is not positively requested".into()));
+    }
+    if selection_without_effects(settings).map_err(GatewayRuleError::from)?.is_some() {
+        return Err(GatewayRuleError::Invalid("WSL update has no selected effect".into()));
+    }
+    let saved = crate::settings::saved_intent_sha256(settings).map_err(GatewayRuleError::from)?;
+    let preferences = settings.wsl.as_ref().ok_or_else(|| GatewayRuleError::Invalid("WSL selection missing".into()))?;
+    let registered = coordinator::registered_distributions_with_cancel(cancellation).map_err(GatewayRuleError::from)?;
+    if !preferences.distros.iter().all(|name| registered.iter().any(|row| row.name == *name)) {
+        return Err(GatewayRuleError::Invalid("selected WSL distribution is no longer registered".into()));
+    }
+    let _background = vendor_background_lease().map_err(GatewayRuleError::from)?;
+    if owner::observe_vendor_update(&bound)? != *expected {
+        return Err(GatewayRuleError::RecoveryRequired("vendor prerequisite changed before maintenance".into()));
+    }
+    let desktop = bound.executable().as_path().to_owned();
+    let powershell = coordinator::system_powershell_program().map_err(GatewayRuleError::from)?;
+    let mut window = VendorMaintenance { inner: GuiMaintenance { desktop: &desktop, powershell, cancellation },
+        settings, saved };
+    let qualified = matches!(&input, owner::VendorRuntimeInput::QualifiedPackage { .. });
+    let mut runner = if qualified { Some(coordinator::gateway_native::WindowsGatewayRuleRunner::new(owner::new_request_id)?) } else { None };
+    let prepared = owner::prepare_vendor_update(&hex::encode(expected.prior_current_sha256), bound, None, input,
+        runner.as_mut().map(|value| value as &mut dyn GatewayRuleRunner), cancellation, &mut window)?;
+    prepared.execute(runner.as_mut().map(|value| value as &mut dyn GatewayRuleRunner), cancellation).map_err(GatewayRuleError::from)
+}
+
+#[cfg(windows)]
+struct VendorMaintenance<'a> {
+    inner: GuiMaintenance<'a>,
+    settings: &'a Settings,
+    saved: [u8; 32],
+}
+#[cfg(windows)]
+impl crate::windows_coordinator::windows_installation::MaintenanceWindow for VendorMaintenance<'_> {
+    fn ensure_held(&mut self) -> Result<(), String> {
+        if crate::settings::saved_intent_sha256(self.settings)? != self.saved {
+            return Err("Cancelled: saved WSL intent changed".into());
+        }
+        let selected = self.settings.wsl.as_ref().ok_or("WSL selection missing")?;
+        let registered = crate::windows_coordinator::registered_distributions_with_cancel(self.inner.cancellation)?;
+        if !selected.enabled || selected.distros.is_empty()
+            || !selected.distros.iter().all(|name| registered.iter().any(|row| row.name == *name)) {
+            return Err("Cancelled: selected WSL registration changed".into());
+        }
+        crate::windows_coordinator::windows_installation::MaintenanceWindow::ensure_held(&mut self.inner)
+    }
+}
+
+/// Automatic callers never invent a package; only a previously received host
+/// can be reused, and every real mutation still goes through the same owner.
+#[cfg(windows)]
+pub(crate) fn automatic_vendor_update(root: &std::path::Path, settings: &Settings,
+    cancellation: &AtomicBool) -> Result<bool, String> {
+    use crate::windows_coordinator::{self as coordinator, windows_installation as owner};
+    if !automatic_vendor_update_wanted(settings) { return Ok(false); }
+    let layout = crate::receive_installation_layout(root)?;
+    if layout.kind != crate::InstallationKind::Desktop { return Ok(false); }
+    let mut bound = owner::BoundInstallation::open(&layout.anchor)?;
+    if let Some(context) = coordinator::receive_saved_context(&bound)? { bound.attach_ancestor_context(context)?; }
+    match owner::observe_apply_current(&bound)? {
+        owner::ApplyCurrentObservation::VendorReplacement(expected) => {
+            apply_vendor_update(bound, &expected, owner::VendorRuntimeInput::ReuseReceivedRuntime,
+                settings, true, cancellation).map_err(|error| error.to_string())?;
+            Ok(true)
+        }
+        owner::ApplyCurrentObservation::Absent | owner::ApplyCurrentObservation::Settled { .. } => Ok(false),
+        owner::ApplyCurrentObservation::GatewayPending(_) => Err("RecoveryRequired: gateway operation is Pending".into()),
+    }
+}
+
+/// Intent only: actual registration, target identity and the maintenance gate
+/// are received independently before the automatic writer may run.
+pub(crate) fn automatic_vendor_update_wanted(settings: &Settings) -> bool {
+    settings.auto_patch_wanted()
+        && settings.wsl.as_ref().is_some_and(|wsl| wsl.enabled && !wsl.distros.is_empty())
+        && (settings.client_patch || wants_transport(settings))
+}
+
+#[cfg(windows)]
 pub(crate) enum WslApplyPreparation {
     NotSelected(Vec<TargetApplyResult>),
     Selected(WslSelectedPreparation),
@@ -96,6 +198,39 @@ impl WslApplyPreparation {
     pub(crate) fn requires_elevation(&self) -> bool {
         matches!(self, Self::Selected(selected) if selected.needs_elevation)
     }
+}
+
+/// Settle the acknowledged vendor prerequisites before ordinary native Apply.
+#[cfg(windows)]
+pub(crate) fn apply_vendor_prerequisites(plan: &crate::ops::AllTargetApplyPlan, cancellation: &AtomicBool)
+    -> Result<Vec<(String, [u8; 32])>, String> {
+    use crate::windows_coordinator::windows_installation as owner;
+    let selected = match plan.wsl()? {
+        WslApplyPreparation::Selected(value) => value,
+        WslApplyPreparation::NotSelected(_) => return Err("UpdatePending: WSL vendor update is not selected".into()),
+    };
+    let mut completed = Vec::new();
+    for target in plan.wsl_desktops().filter(|target| target.is_vendor_update()) {
+        let operation = (|| -> Result<(String, [u8; 32]), String> {
+            if cancellation.load(Ordering::SeqCst) { return Err("Cancelled: vendor update not started".into()); }
+            target.recheck_desktop_current()?;
+            let bound = target.desktop_binding()?;
+            let expected = match owner::observe_apply_current(&bound)? {
+                owner::ApplyCurrentObservation::VendorReplacement(value) => value,
+                _ => return Err("UpdatePending: vendor prerequisite changed".into()),
+            };
+            let received = apply_vendor_update(bound, &expected, owner::VendorRuntimeInput::QualifiedPackage {
+                source: &selected.source, expected_host_sha256: &selected.source_sha256, assets: &selected.assets,
+            }, plan.wanted(), false, cancellation).map_err(|error| error.to_string())?;
+            if received.slot_id != expected.slot_id { return Err("vendor result slot differs".into()); }
+            Ok((received.slot_id, received.current_sha256))
+        })();
+        match operation {
+            Ok(slot) => completed.push(slot),
+            Err(error) => return Err(format!("{error}; completed vendor slots: {completed:?}")),
+        }
+    }
+    Ok(completed)
 }
 
 #[cfg(windows)]
@@ -137,7 +272,13 @@ pub(crate) fn inspect_selection(plan: &crate::ops::AllTargetApplyPlan, cancellat
         desktops += 1;
         if cancellation.load(Ordering::SeqCst) { return Err("WSL requirement collection cancelled".into()); }
         let bound = target.desktop_binding()?;
-        let host = GatewayHostInput::receive(&bound, &source, &source_sha256).map_err(|error| error.to_string())?;
+        let observation = owner::observe_apply_current(&bound)?;
+        let vendor = matches!(&observation, owner::ApplyCurrentObservation::VendorReplacement(_));
+        let host = match observation {
+            owner::ApplyCurrentObservation::VendorReplacement(ref expected) =>
+                GatewayHostInput::vendor_prerequisite(&bound, &source, &source_sha256, expected),
+            _ => GatewayHostInput::receive(&bound, &source, &source_sha256),
+        }.map_err(|error| error.to_string())?;
         let wanted = match active_profiles {
             Some(active_profiles) => GatewayRequirementNamespaces::TransportWanted { namespaces: &namespaces,
                 active_profiles, administrator: crate::utils::is_admin() },
@@ -149,7 +290,7 @@ pub(crate) fn inspect_selection(plan: &crate::ops::AllTargetApplyPlan, cancellat
         needs_elevation |= matches!(requirements.rules, GatewayRuleEffect::NativeWriteRequired { administrator: false });
         // A new host's transport demand does not discharge old-host custody.
         // Retirement preparation is read-only and also covers transport off.
-        if owner::runtime_installed(&bound)? {
+        if !vendor && owner::runtime_installed(&bound)? {
             let read = owner::admit_runtime_read(target.desktop_binding()?, "wsl-gui-v2")?;
             if read.host_sha256() != source_sha256 {
                 let old_host = checked_runtime_host(&read)?;
@@ -249,6 +390,9 @@ fn prepare_windows_selection(plan: Arc<crate::ops::AllTargetApplyPlan>, cancella
             let operation = (|| -> Result<(), String> {
                 if !begun[index] { target.recheck_desktop_current()?; }
                 let mut bound = target.desktop_binding()?;
+                if matches!(owner::observe_apply_current(&bound)?, owner::ApplyCurrentObservation::VendorReplacement(_)) {
+                    return Err("UpdatePending: Desktop changed after the acknowledged Apply plan".into());
+                }
                 if !owner::runtime_installed(&bound)? {
                     let ps = coordinator::system_powershell_program()?;
                     let mut window = GuiMaintenance { desktop, powershell: ps, cancellation: &cancellation };
@@ -542,6 +686,33 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn automatic_vendor_update_requires_positive_wsl_and_effect_intent() {
+        let mut settings = Settings::default();
+        settings.auto_patch = true;
+        settings.patch_declined = false;
+        settings.client_patch = false;
+        settings.dns = false;
+        settings.local_proxy = false;
+        settings.own_proxy_enabled = false;
+        settings.group_proxy = false;
+        settings.builtin_exits = false;
+        settings.wsl = None;
+        assert!(!automatic_vendor_update_wanted(&settings));
+        settings.wsl = Some(crate::wsl_api::WslPreferences { enabled: true, distros: vec!["fixture".into()] });
+        assert!(!automatic_vendor_update_wanted(&settings));
+        settings.client_patch = true;
+        assert!(automatic_vendor_update_wanted(&settings));
+        settings.patch_declined = true;
+        assert!(!automatic_vendor_update_wanted(&settings));
+        settings.patch_declined = false;
+        settings.wsl.as_mut().unwrap().distros.clear();
+        assert!(!automatic_vendor_update_wanted(&settings));
+        settings.wsl.as_mut().unwrap().distros.push("fixture".into());
+        settings.wsl.as_mut().unwrap().enabled = false;
+        assert!(!automatic_vendor_update_wanted(&settings));
+    }
 
     #[test]
     fn private_copy_receiving_rejects_missing_or_changed_profile_identity() {

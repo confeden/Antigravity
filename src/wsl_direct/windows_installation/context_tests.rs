@@ -248,8 +248,8 @@ fn prospective_reserved_product_and_namespace_aliases_have_zero_effect() {
     .unwrap();
     write_private(&install.join("resources/app.asar"), &bytes).unwrap();
     TEST_BASE.with(|v| *v.borrow_mut() = Some(state.clone()));
-    TEST_PRODUCER.with(|v| v.set(true));
     let bound = BoundInstallation::open(&install.join("Desktop.exe")).unwrap();
+    assert_eq!(bound.executable_digest(), hash(b"MZ synthetic, never executed"));
     let before = fs::read_dir(&state).unwrap().count();
     for leaf in [
         user_state_location::WINDOWS_STATE_LEAF.to_string(),

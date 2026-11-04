@@ -36,6 +36,18 @@ impl MaintenanceWindow for Window {
     }
 }
 
+#[test]
+fn vendor_runtime_choice_never_defaults_to_a_new_package() {
+    #[derive(Deserialize)]
+    struct LegacyChoice {
+        #[serde(default)]
+        runtime_input: VendorRuntimeRecord,
+    }
+    let legacy: LegacyChoice = serde_json::from_str("{}").unwrap();
+    assert!(legacy.runtime_input.is_reuse());
+    assert!(serde_json::from_str::<VendorRuntimeRecord>(r#"{"kind":"qualifiedPackage"}"#).is_err());
+}
+
 struct Fixture {
     root: PathBuf,
     desktop: PathBuf,
@@ -82,6 +94,105 @@ impl Fixture {
     fn rollback(&self) -> Result<()> {
         rollback_runtime(self.bound(), &self.current().1, None, &mut Window)
     }
+}
+
+fn replace_with_vendor_update(f: &Fixture) -> Vec<u8> {
+    let input = PathBuf::from(std::env::var_os("AG_VENDOR_UPDATE_ARCHIVE_FIXTURE")
+        .expect("explicit received new pristine archive fixture"));
+    let bytes = CheckedPath::open(&input, PathKind::File, PathPurpose::Source).unwrap().read_snapshot().unwrap();
+    assert_eq!(desktop_hook::inspect_archive(&bytes).unwrap().hook_status, desktop_hook::HookStatus::Prepared);
+    fs::write(NativeFsPath::from_path(&f.desktop).unwrap().as_path(), b"MZ synthetic updated producer; never executed").unwrap();
+    let archive = f.desktop.parent().unwrap().join("resources/app.asar");
+    fs::write(NativeFsPath::from_path(&archive).unwrap().as_path(), &bytes).unwrap();
+    bytes
+}
+
+#[test]
+#[ignore = "owned qualified fixture, genuine context and explicit new pristine archive; real file replacements"]
+fn vendor_update_receives_new_original_and_retains_runtime_custody() {
+    let f = fixture("vendor-update");
+    f.upgrade().unwrap();
+    let (prior, prior_digest) = f.current();
+    let prior_runtime = prior.runtime_deployment.received().unwrap().clone();
+    let new_original = replace_with_vendor_update(&f);
+    let observed = observe_vendor_update(&f.bound()).unwrap();
+    assert_eq!(observed.slot_id, prior.slot_id);
+    assert_eq!(hex::encode(observed.prior_current_sha256), prior_digest);
+    let before = TEST_NATIVE_CALLS.with(|value| value.get());
+    assert!(prepare_vendor_update(&"0".repeat(64), f.bound(), None, VendorRuntimeInput::ReuseReceivedRuntime,
+        None, &AtomicBool::new(false), &mut Window).is_err());
+    assert_eq!(TEST_NATIVE_CALLS.with(|value| value.get()), before);
+    let mut window = Window;
+    prepare_vendor_update(&prior_digest, f.bound(), None, VendorRuntimeInput::ReuseReceivedRuntime,
+        None, &AtomicBool::new(false), &mut window).unwrap().execute(None, &AtomicBool::new(false)).unwrap();
+    let (current, _) = f.current();
+    let actual = current.runtime_deployment.received().unwrap();
+    assert_eq!(actual.host, prior_runtime.host);
+    assert_eq!(actual.gate, prior_runtime.gate);
+    assert_eq!(actual.gateway_rules, prior_runtime.gateway_rules);
+    assert_ne!(actual.receipt, prior_runtime.receipt);
+    assert_eq!(current.settled.as_ref().unwrap().applied.as_ref().unwrap().pre_digest, hash(&new_original));
+    prepare_revert(f.bound(), None, &mut Window).unwrap().execute().unwrap();
+    assert_eq!(f.archive().bytes, new_original);
+}
+
+#[test]
+#[ignore = "owned qualified fixture, genuine context and explicit new pristine archive; real file replacements"]
+fn vendor_update_qualified_package_stages_new_host_without_rules() {
+    let f = fixture("vendor-update-package");
+    f.upgrade().unwrap();
+    let (prior, prior_digest) = f.current();
+    let old = prior.runtime_deployment.received().unwrap().clone();
+    let new_original = replace_with_vendor_update(&f);
+    let source_hash = hash(&f.host.read_snapshot().unwrap());
+    let mut window = Window;
+    prepare_vendor_update(&prior_digest, f.bound(), None,
+        VendorRuntimeInput::QualifiedPackage { source: &f.host, expected_host_sha256: &source_hash, assets: &f.assets },
+        None, &AtomicBool::new(false), &mut window).unwrap().execute(None, &AtomicBool::new(false)).unwrap();
+    let (current, _) = f.current();
+    let received = current.runtime_deployment.received().unwrap();
+    assert_ne!(received.host.native_id, old.host.native_id);
+    assert_eq!(received.host.sha256, source_hash);
+    assert_eq!(received.gate, old.gate);
+    assert_eq!(received.version, 1);
+    assert!(received.gateway_rules.is_none());
+    assert_eq!(current.settled.as_ref().unwrap().applied.as_ref().unwrap().pre_digest, hash(&new_original));
+    prepare_revert(f.bound(), None, &mut Window).unwrap().execute().unwrap();
+    assert_eq!(f.archive().bytes, new_original);
+}
+
+#[test]
+#[ignore = "owned qualified fixture, genuine context and explicit new pristine archive; real file replacements"]
+fn vendor_update_received_success_recovers_without_native_replay() {
+    let f = fixture("vendor-update-recovery");
+    f.upgrade().unwrap();
+    let (_, prior_digest) = f.current();
+    replace_with_vendor_update(&f);
+    TEST_STOP_AFTER_RECEIPT.with(|value| value.set(Some("apply-v2")));
+    let mut window = Window;
+    assert!(prepare_vendor_update(&prior_digest, f.bound(), None, VendorRuntimeInput::ReuseReceivedRuntime,
+        None, &AtomicBool::new(false), &mut window).unwrap().execute(None, &AtomicBool::new(false)).is_err());
+    let calls = TEST_NATIVE_CALLS.with(|value| value.get());
+    f.recover().unwrap();
+    assert_eq!(TEST_NATIVE_CALLS.with(|value| value.get()), calls);
+    assert_eq!(f.current().0.mode, Mode::SettledApplied);
+}
+
+#[test]
+#[ignore = "owned qualified fixture, genuine context and explicit new pristine archive; real file replacements"]
+fn vendor_update_lost_receipt_stays_pending_without_replay() {
+    let f = fixture("vendor-update-lost-receipt");
+    f.upgrade().unwrap();
+    let (_, prior_digest) = f.current();
+    replace_with_vendor_update(&f);
+    TEST_LOSE_RECEIPT.with(|value| value.set(Some("apply-v2")));
+    let mut window = Window;
+    assert!(prepare_vendor_update(&prior_digest, f.bound(), None, VendorRuntimeInput::ReuseReceivedRuntime,
+        None, &AtomicBool::new(false), &mut window).unwrap().execute(None, &AtomicBool::new(false)).is_err());
+    let calls = TEST_NATIVE_CALLS.with(|value| value.get());
+    assert!(f.recover().is_err());
+    assert_eq!(TEST_NATIVE_CALLS.with(|value| value.get()), calls);
+    assert_eq!(f.current().0.mode, Mode::Pending);
 }
 
 /// Test composition only. The fixture state root is intentionally injected, so
@@ -245,7 +356,6 @@ fn fixture(name: &str) -> Fixture {
     let state = root.join("state");
     create_private_dir(&state).unwrap();
     TEST_BASE.with(|value| *value.borrow_mut() = Some(state));
-    TEST_PRODUCER.with(|value| value.set(true));
     TEST_NATIVE_CALLS.with(|value| value.set(0));
     TEST_STOP_AFTER_RECEIPT.with(|value| value.set(None));
     TEST_LOSE_RECEIPT.with(|value| value.set(None));

@@ -38,6 +38,13 @@ pub(crate) enum GatewayRequirementNamespaces<'a> {
 pub(crate) enum GatewayHostInput {
     Bound(GatewayBoundHost),
     NewDeployment(GatewayNewDeployment),
+    VendorPrerequisite(GatewayVendorPrerequisite),
+}
+pub(crate) struct GatewayVendorPrerequisite {
+    source: CheckedPath,
+    source_sha256: String,
+    state: RequirementState,
+    prior: RuntimeDeployment,
 }
 pub(crate) struct GatewayBoundHost {
     host: CheckedPath,
@@ -56,6 +63,7 @@ struct RequirementState {
     _namespace: Option<CheckedPath>,
     _slot_lease: Option<Lease>,
     received: Option<(CheckedPath, Current, String)>,
+    vendor: Option<VendorUpdateObservation>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -360,6 +368,9 @@ impl From<String> for GatewayRuleError {
         Self::RecoveryRequired(value)
     }
 }
+impl From<&str> for GatewayRuleError {
+    fn from(value: &str) -> Self { Self::RecoveryRequired(value.into()) }
+}
 type GatewayResult<T> = std::result::Result<T, GatewayRuleError>;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -404,6 +415,74 @@ struct RulePlan {
     receipt: Option<EvidenceRef>,
     #[serde(deserialize_with = "required_option")]
     observation: Option<GatewayRuleInspection>,
+}
+
+/// The existing rule owner retains all evidence for rules retired as part of
+/// a vendor-update operation. Observed external rules are not removal plans.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct VendorRetirementPlan {
+    plans: Vec<RulePlan>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct VendorRetirementStep {
+    mutation: EvidenceRef,
+    readback: EvidenceRef,
+}
+
+pub(super) fn plan_vendor_retirement(
+    authority: &Authority,
+    mut runner: Option<&mut dyn GatewayRuleRunner>,
+    cancel: &AtomicBool,
+) -> GatewayResult<VendorRetirementPlan> {
+    let deployment = authority.current.runtime_deployment.received()?;
+    let mut plans = Vec::new();
+    for value in deployment.gateway_rules.as_deref().unwrap_or(&[]) {
+        let receipt = receive_receipt(&authority.slot, &deployment.host, value)?;
+        if receipt.ownership != RuleCustody::CreatedByOperation { continue; }
+        if cancel.load(Ordering::SeqCst) { return Err(GatewayRuleError::CancelledBeforeMutation); }
+        let active_runner = runner.as_deref_mut().ok_or_else(|| GatewayRuleError::MissingConfiguration(
+            "gateway runner required to retire owned prior-host rules".into()))?;
+        let inspection = inspect(active_runner, &receipt.scope, Some(&receipt.actual_name), cancel)?;
+        let (persistent, active) = receive_pair(&receipt.scope, &receipt.actual_name, &inspection)?;
+        if persistent != &receipt.persistent || active != &receipt.active {
+            return Err(GatewayRuleError::MissingConfiguration("changed owned gateway rule preserved".into()));
+        }
+        if !inspection.administrator { return Err(GatewayRuleError::NeedsElevation); }
+        plans.push(RulePlan { scope: receipt.scope, name: receipt.actual_name, action: RuleAction::Remove,
+            receipt: Some(value.clone()), observation: Some(inspection) });
+    }
+    let plan = VendorRetirementPlan { plans };
+    validate_vendor_retirement(&authority.slot, deployment, &plan)?;
+    Ok(plan)
+}
+
+pub(super) fn validate_vendor_retirement(slot: &CheckedPath, old: &RuntimeDeployment,
+    plan: &VendorRetirementPlan) -> Result<()> {
+    let mut required = Vec::new();
+    for value in old.gateway_rules.as_deref().unwrap_or(&[]) {
+        let receipt = receive_receipt(slot, &old.host, value)?;
+        if receipt.ownership == RuleCustody::CreatedByOperation { required.push(value.clone()); }
+    }
+    let mut seen = Vec::new();
+    for item in &plan.plans {
+        let value = item.receipt.as_ref().ok_or("vendor retirement receipt absent")?;
+        if item.action != RuleAction::Remove || !required.contains(value) || seen.contains(value) {
+            return Err("RecoveryRequired: vendor retirement custody conflict".into());
+        }
+        let receipt = receive_receipt(slot, &old.host, value)?;
+        let observation = item.observation.as_ref().ok_or("vendor retirement observation absent")?;
+        let (persistent, active) = receive_pair(&item.scope, &item.name, observation).map_err(|e| e.to_string())?;
+        if !observation.administrator || item.scope != receipt.scope || item.name != receipt.actual_name
+            || persistent != &receipt.persistent || active != &receipt.active {
+            return Err("RecoveryRequired: vendor retirement preimage conflict".into());
+        }
+        seen.push(value.clone());
+    }
+    if seen.len() != required.len() { return Err("RecoveryRequired: vendor retirement omitted owned rule".into()); }
+    Ok(())
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -762,6 +841,9 @@ fn receive_host_binding(
 }
 
 fn receive_requirement_state(bound: &BoundInstallation) -> GatewayResult<RequirementState> {
+    receive_requirement_state_inner(bound, None)
+}
+fn receive_requirement_state_inner(bound: &BoundInstallation, expected_vendor: Option<&VendorUpdateObservation>) -> GatewayResult<RequirementState> {
     bound.exe.recheck()?;
     bound.root.recheck()?;
     bound.resources.recheck()?;
@@ -782,6 +864,7 @@ fn receive_requirement_state(bound: &BoundInstallation) -> GatewayResult<Require
                 _namespace: None,
                 _slot_lease: None,
                 received: None,
+                vendor: None,
             });
         }
         Err(error) => return Err(io("requirement namespace observation", error).into()),
@@ -796,6 +879,7 @@ fn receive_requirement_state(bound: &BoundInstallation) -> GatewayResult<Require
             _namespace: Some(namespace),
             _slot_lease: None,
             received: None,
+            vendor: None,
         });
     };
     let slot_lease = Lease::acquire(&slot, "wsl_slot_v2")?;
@@ -806,9 +890,12 @@ fn receive_requirement_state(bound: &BoundInstallation) -> GatewayResult<Require
         ));
     }
     if current.binding != binding {
-        return Err(GatewayRuleError::RecoveryRequired(
-            "UpdatePending: requirement target incarnation differs".into(),
-        ));
+        let expected = expected_vendor.ok_or_else(|| GatewayRuleError::RecoveryRequired(
+            "UpdatePending: requirement target incarnation differs".into()))?;
+        let actual = vendor_update_observation(bound, &slot, &current, &digest)?;
+        if &actual != expected { return Err(GatewayRuleError::RecoveryRequired("vendor prerequisite changed".into())); }
+    } else if expected_vendor.is_some() {
+        return Err(GatewayRuleError::RecoveryRequired("vendor prerequisite no longer distinct".into()));
     }
     Ok(RequirementState {
         binding,
@@ -816,6 +903,7 @@ fn receive_requirement_state(bound: &BoundInstallation) -> GatewayResult<Require
         _namespace: Some(namespace),
         _slot_lease: Some(slot_lease),
         received: Some((slot, current, digest)),
+        vendor: expected_vendor.cloned(),
     })
 }
 impl RequirementState {
@@ -827,7 +915,7 @@ impl RequirementState {
                 "requirement installation binding changed".into(),
             ));
         }
-        let fresh = receive_requirement_state(bound)?;
+        let fresh = receive_requirement_state_inner(bound, self.vendor.as_ref())?;
         let fingerprint = |state: &RequirementState| {
             state
                 .received
@@ -892,6 +980,21 @@ fn validate_new_deployment_state(
     Ok(())
 }
 impl GatewayHostInput {
+    pub(crate) fn vendor_prerequisite(bound: &BoundInstallation, source: &CheckedPath,
+        expected_source_sha256: &str, expected: &VendorUpdateObservation) -> GatewayResult<Self> {
+        source.recheck()?;
+        let pin = CheckedPath::open(source.as_path(), PathKind::File, PathPurpose::Executable)?;
+        if pin.native_id() != source.native_id() || hash(&pin.read_snapshot()?) != expected_source_sha256 {
+            return Err(GatewayRuleError::Invalid("vendor source executable pin/hash differs".into()));
+        }
+        let state = receive_requirement_state_inner(bound, Some(expected))?;
+        let prior = state.deployment()?.cloned().ok_or_else(|| GatewayRuleError::RecoveryRequired("vendor prior runtime absent".into()))?;
+        let (slot, _, _) = state.received.as_ref().ok_or_else(|| GatewayRuleError::RecoveryRequired("vendor prior slot absent".into()))?;
+        prior.receive_host(slot)?;
+        prior.receive_receipt(slot)?;
+        Ok(Self::VendorPrerequisite(GatewayVendorPrerequisite { source: pin,
+            source_sha256: expected_source_sha256.into(), state, prior }))
+    }
     /// Preferred all-target input receiving. Absence/schema2 is observed by the
     /// installation owner; an error never falls through to NewDeployment.
     pub(crate) fn receive(
@@ -946,7 +1049,7 @@ impl GatewayHostInput {
     ) -> GatewayResult<Self> {
         match Self::receive(bound, source, expected_source_sha256)? {
             input @ Self::NewDeployment(_) => Ok(input),
-            Self::Bound(_) => Err(GatewayRuleError::Invalid(
+            Self::Bound(_) | Self::VendorPrerequisite(_) => Err(GatewayRuleError::Invalid(
                 "already received current host requires Bound input".into(),
             )),
         }
@@ -1100,6 +1203,33 @@ pub(crate) fn inspect_requirements<R: GatewayRuleRunner>(
     }
     let (namespaces, administrator) = receive_requirement_namespaces(namespaces)?;
     match host {
+        GatewayHostInput::VendorPrerequisite(input) => {
+            input.state.recheck(bound)?;
+            input.source.recheck()?;
+            if hash(&input.source.read_snapshot()?) != input.source_sha256 {
+                return Err(GatewayRuleError::Invalid("vendor source executable changed".into()));
+            }
+            let (slot, _, _) = input.state.received.as_ref().ok_or_else(|| GatewayRuleError::RecoveryRequired("vendor prior slot absent".into()))?;
+            input.prior.receive_host(slot)?;
+            input.prior.receive_receipt(slot)?;
+            let mut removal_admin = None;
+            for value in input.prior.gateway_rules.as_deref().unwrap_or(&[]) {
+                let receipt = receive_receipt(slot, &input.prior.host, value)?;
+                if receipt.ownership != RuleCustody::CreatedByOperation { continue; }
+                let actual = inspect(runner, &receipt.scope, Some(&receipt.actual_name), cancel)?;
+                let (persistent, active) = receive_pair(&receipt.scope, &receipt.actual_name, &actual)?;
+                if persistent != &receipt.persistent || active != &receipt.active {
+                    return Err(GatewayRuleError::MissingConfiguration("changed owned gateway rule preserved".into()));
+                }
+                removal_admin = Some(removal_admin.unwrap_or(true) && actual.administrator);
+            }
+            input.state.recheck(bound)?;
+            let required = administrator.is_some() || removal_admin.is_some();
+            Ok(GatewayRuleRequirements { canonical_install_needed: true,
+                rules: if required { GatewayRuleEffect::NativeWriteRequired {
+                    administrator: administrator.unwrap_or(true) && removal_admin.unwrap_or(true) } }
+                    else { GatewayRuleEffect::VerifiedNoop } })
+        }
         GatewayHostInput::NewDeployment(input) => {
             input.state.recheck(bound)?;
             validate_new_deployment_state(bound, &input.state)?;
@@ -1588,6 +1718,131 @@ fn receive_inspection(
         return Err("gateway exact-name readback contains a different rule".into());
     }
     Ok(observation)
+}
+
+pub(super) fn execute_vendor_retirement<W: MaintenanceWindow>(
+    bound: &BoundInstallation, authority: &Authority, dir: &Path, plan: &VendorRetirementPlan,
+    runner: &mut Option<&mut dyn GatewayRuleRunner>, window: &mut W, cancel: &AtomicBool,
+) -> GatewayResult<Vec<EvidenceRef>> {
+    let old = authority.current.runtime_deployment.received()?;
+    validate_vendor_retirement(&authority.slot, old, plan)?;
+    let _host = old.receive_host(&authority.slot)?;
+    let mut steps = Vec::new();
+    for (index, item) in plan.plans.iter().enumerate() {
+        if cancel.load(Ordering::SeqCst) { return Err(GatewayRuleError::RecoveryRequired("vendor retirement cancelled after Pending".into())); }
+        let active_runner = runner.as_deref_mut().ok_or_else(|| GatewayRuleError::RecoveryRequired("vendor retirement runner absent".into()))?;
+        bound.revalidate_context()?;
+        window.ensure_held()?;
+        let actual = inspect(active_runner, &item.scope, Some(&item.name), cancel)?;
+        let before = item.observation.as_ref().ok_or("vendor retirement preimage absent")?;
+        let (persistent, active) = receive_pair(&item.scope, &item.name, &actual)?;
+        if !actual.administrator || before.persistent != actual.persistent || before.active != actual.active {
+            return Err(GatewayRuleError::MissingConfiguration("vendor retirement preimage changed".into()));
+        }
+        let request = GatewayRuleRequest::Remove { scope: item.scope.clone(), persistent: persistent.clone(), active: active.clone() };
+        let mutation = journal_run(authority, dir, &format!("vendor-rule-native-{index}"), &request, active_runner, cancel)?;
+        // Preserve the actual native result before another external call.
+        authority.save(dir, &format!("vendor-rule-native-received-{index}.json"), &json(&mutation)?)?;
+        let readback = journal_run(authority, dir, &format!("vendor-rule-readback-{index}"),
+            &GatewayRuleRequest::Inspect { scope: item.scope.clone(), name: Some(item.name.clone()) }, active_runner, cancel)?;
+        let observed = receive_inspection(&authority.slot, &readback, &item.scope, &item.name)?;
+        if !observed.persistent.is_empty() || !observed.active.is_empty() {
+            return Err(GatewayRuleError::RecoveryRequired("vendor retired rule remains present".into()));
+        }
+        let step = VendorRetirementStep { mutation, readback };
+        steps.push(authority.save(dir, &format!("vendor-rule-complete-{index}.json"), &json(&step)?)?);
+    }
+    Ok(steps)
+}
+
+pub(super) fn receive_vendor_retirement(slot: &CheckedPath, dir: &Path,
+    plan: &VendorRetirementPlan, steps: &[EvidenceRef]) -> Result<()> {
+    if steps.len() != plan.plans.len() { return Err("RecoveryRequired: vendor retirement results missing".into()); }
+    for (index, (item, value)) in plan.plans.iter().zip(steps).enumerate() {
+        let expected = dir.join(format!("vendor-rule-complete-{index}.json"));
+        let bytes = read_private(&expected)?;
+        if hash(&bytes) != value.digest || slot.path.join(&value.path) != expected {
+            return Err("RecoveryRequired: vendor retirement fixed result conflict".into());
+        }
+        let step: VendorRetirementStep = decode(&reference(slot, value)?)?;
+        let received: EvidenceRef = decode(&read_private(&dir.join(format!("vendor-rule-native-received-{index}.json")))?)?;
+        let belongs = |reference: &EvidenceRef, prefix: &str| {
+            let path = slot.path.join(&reference.path);
+            path.parent() == Some(dir) && path.file_name().and_then(OsStr::to_str)
+                .and_then(|name| name.strip_prefix(prefix)).and_then(|tail| tail.strip_suffix(".json"))
+                .is_some_and(|serial| !serial.is_empty() && serial.bytes().all(|b| b.is_ascii_digit()))
+        };
+        if received != step.mutation || !belongs(&step.mutation, &format!("vendor-rule-native-{index}-"))
+            || !belongs(&step.readback, &format!("vendor-rule-readback-{index}-")) {
+            return Err("RecoveryRequired: vendor retirement journal association conflict".into());
+        }
+        receive_mutation(slot, &step.mutation, item)?;
+        let readback = receive_inspection(slot, &step.readback, &item.scope, &item.name)?;
+        if !readback.persistent.is_empty() || !readback.active.is_empty() {
+            return Err("RecoveryRequired: vendor retirement readback not empty".into());
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn retained_vendor_retirement(slot: &CheckedPath, dir: &Path,
+    plan: &VendorRetirementPlan) -> Result<Vec<EvidenceRef>> {
+    let mut steps = Vec::new();
+    for index in 0..plan.plans.len() {
+        let path = dir.join(format!("vendor-rule-complete-{index}.json"));
+        let bytes = read_private(&path)?;
+        let relative = path.strip_prefix(&slot.path).map_err(|_| "vendor retirement outside slot")?
+            .to_str().ok_or("vendor retirement path encoding")?.replace('\\', "/");
+        steps.push(EvidenceRef { path: relative, digest: hash(&bytes) });
+    }
+    receive_vendor_retirement(slot, dir, plan, &steps)?;
+    Ok(steps)
+}
+
+pub(super) fn recheck_vendor_retirement(authority: &Authority, operation_dir: &Path, plan: &VendorRetirementPlan,
+    runner: &mut Option<&mut dyn GatewayRuleRunner>, cancel: &AtomicBool) -> GatewayResult<Vec<EvidenceRef>> {
+    if plan.plans.is_empty() { return Ok(Vec::new()); }
+    if runner.is_none() { return Err(GatewayRuleError::RecoveryRequired("vendor retirement runner absent".into())); }
+    let directory = operation_dir.join(format!("vendor-rule-final-{}", unique_id()?));
+    create_private_dir(&directory)?;
+    let mut checks = Vec::new();
+    for (index, item) in plan.plans.iter().enumerate() {
+        let active_runner = runner.as_deref_mut().ok_or_else(|| GatewayRuleError::RecoveryRequired("vendor retirement runner absent".into()))?;
+        let value = journal_run(authority, &directory, &format!("final-{index}"),
+            &GatewayRuleRequest::Inspect { scope: item.scope.clone(), name: Some(item.name.clone()) }, active_runner, cancel)?;
+        let actual = receive_inspection(&authority.slot, &value, &item.scope, &item.name)?;
+        if !actual.persistent.is_empty() || !actual.active.is_empty() {
+            return Err(GatewayRuleError::RecoveryRequired("retired prior-host rule became present".into()));
+        }
+        checks.push(value);
+    }
+    Ok(checks)
+}
+
+pub(super) fn receive_vendor_final_checks(slot: &CheckedPath, operation_dir: &Path,
+    plan: &VendorRetirementPlan, checks: &[EvidenceRef]) -> Result<()> {
+    if checks.len() != plan.plans.len() { return Err("RecoveryRequired: vendor final rule readbacks missing".into()); }
+    let mut selected_parent: Option<PathBuf> = None;
+    for (index, (item, value)) in plan.plans.iter().zip(checks).enumerate() {
+        let path = slot.path.join(&value.path);
+        let parent = path.parent().ok_or("vendor final rule directory absent")?;
+        let dir_id = parent.file_name().and_then(OsStr::to_str)
+            .and_then(|name| name.strip_prefix("vendor-rule-final-"));
+        let serial = path.file_name().and_then(OsStr::to_str)
+            .and_then(|name| name.strip_prefix(&format!("final-{index}-")))
+            .and_then(|name| name.strip_suffix(".json"));
+        if parent.parent() != Some(operation_dir) || !dir_id.is_some_and(id_valid)
+            || !serial.is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+            || selected_parent.as_ref().is_some_and(|selected| selected.as_path() != parent) {
+            return Err("RecoveryRequired: vendor final rule readback association conflict".into());
+        }
+        selected_parent.get_or_insert_with(|| parent.to_owned());
+        let actual = receive_inspection(slot, value, &item.scope, &item.name)?;
+        if !actual.persistent.is_empty() || !actual.active.is_empty() {
+            return Err("RecoveryRequired: vendor final rule readback not empty".into());
+        }
+    }
+    Ok(())
 }
 fn store_receipt(
     authority: &Authority,
@@ -2525,6 +2780,69 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "explicit owned requirement fixtures, packaged host and new pristine archive; synthetic rules only"]
+    fn vendor_package_retires_owned_old_rule_and_preserves_its_receipt() {
+        struct FixtureWindow;
+        impl MaintenanceWindow for FixtureWindow { fn ensure_held(&mut self) -> Result<()> { Ok(()) } }
+        let fixture = RequirementFixture::open();
+        let host_path = PathBuf::from(std::env::var_os("AG_GATEWAY_EFFECT_HOST").expect("packaged fixture host"));
+        let source = CheckedPath::open(&host_path, PathKind::File, PathPurpose::Executable).unwrap();
+        let assets = PackageAssets::receive(&source, option_env!("AG_WSL_EXPECTED_HELPER_SHA256")).unwrap();
+        let source_hash = hash(&source.read_snapshot().unwrap());
+        super::super::upgrade_runtime(fixture.bound, &source, &source_hash, &assets, None, &mut FixtureWindow).unwrap();
+        let desktop = fixture.source.path.clone();
+        let context_path = PathBuf::from(std::env::var_os("AG_GATEWAY_REQUIREMENT_CONTEXT").unwrap());
+        let mut bound = BoundInstallation::open(&desktop).unwrap();
+        let context = crate::windows_coordinator::windows_deployment::receive_for_installation(&bound, Some(&context_path)).unwrap().unwrap();
+        bound.attach_ancestor_context(context).unwrap();
+        let read = super::super::admit_runtime_read(bound, "wsl-gui-v2").unwrap();
+        let old_host = CheckedPath::open(read.host().as_path(), PathKind::File, PathPurpose::Executable).unwrap();
+        drop(read);
+        let mut bound = BoundInstallation::open(&desktop).unwrap();
+        let context = crate::windows_coordinator::windows_deployment::receive_for_installation(&bound, Some(&context_path)).unwrap().unwrap();
+        bound.attach_ancestor_context(context).unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut runner = EffectFixtureRunner { rule: None, healthy: true, creates: 0, removes: 0 };
+        let plan = prepare_gateway_rules(&bound, &old_host, &[namespace()], &mut runner, &cancel).unwrap();
+        ensure_gateway_rules(plan, &mut runner, &mut FixtureWindow, &cancel).unwrap();
+        let authority = Authority::open(&bound, false, false).unwrap();
+        let expected = authority.digest.clone();
+        let old = authority.current.runtime_deployment.received().unwrap().clone();
+        let old_ref = old.gateway_rules.as_ref().unwrap()[0].clone();
+        let old_bytes = reference(&authority.slot, &old_ref).unwrap();
+        drop(authority); drop(bound); drop(old_host); drop(fixture.source);
+        let new_archive = PathBuf::from(std::env::var_os("AG_VENDOR_UPDATE_ARCHIVE_FIXTURE").expect("new pristine fixture"));
+        let bytes = CheckedPath::open(&new_archive, PathKind::File, PathPurpose::Source).unwrap().read_snapshot().unwrap();
+        fs::write(NativeFsPath::from_path(&desktop).unwrap().as_path(), b"MZ updated fixture; never executed").unwrap();
+        fs::write(NativeFsPath::from_path(&desktop.parent().unwrap().join("resources/app.asar")).unwrap().as_path(), &bytes).unwrap();
+        let mut bound = BoundInstallation::open(&desktop).unwrap();
+        let context = crate::windows_coordinator::windows_deployment::receive_for_installation(&bound, Some(&context_path)).unwrap().unwrap();
+        bound.attach_ancestor_context(context).unwrap();
+        let mut window = FixtureWindow;
+        let denied = super::super::prepare_vendor_update(&expected, bound, None,
+            super::super::VendorRuntimeInput::QualifiedPackage { source: &source, expected_host_sha256: &source_hash, assets: &assets },
+            None, &cancel, &mut window);
+        assert!(matches!(denied, Err(GatewayRuleError::MissingConfiguration(_))));
+        assert_eq!(runner.removes, 0);
+        let mut bound = BoundInstallation::open(&desktop).unwrap();
+        let context = crate::windows_coordinator::windows_deployment::receive_for_installation(&bound, Some(&context_path)).unwrap().unwrap();
+        bound.attach_ancestor_context(context).unwrap();
+        let prepared = super::super::prepare_vendor_update(&expected, bound, None,
+            super::super::VendorRuntimeInput::QualifiedPackage { source: &source, expected_host_sha256: &source_hash, assets: &assets },
+            Some(&mut runner), &cancel, &mut window).unwrap();
+        prepared.execute(Some(&mut runner), &cancel).unwrap();
+        assert_eq!(runner.creates, 1); assert_eq!(runner.removes, 1); assert!(runner.rule.is_none());
+        let mut bound = BoundInstallation::open(&desktop).unwrap();
+        let context = crate::windows_coordinator::windows_deployment::receive_for_installation(&bound, Some(&context_path)).unwrap().unwrap();
+        bound.attach_ancestor_context(context).unwrap();
+        let authority = Authority::open(&bound, false, false).unwrap();
+        let received = authority.current.runtime_deployment.received().unwrap();
+        assert_eq!(received.version, 1); assert!(received.gateway_rules.is_none());
+        assert_ne!(received.host.native_id, old.host.native_id);
+        assert_eq!(reference(&authority.slot, &old_ref).unwrap(), old_bytes);
+    }
+
+    #[test]
     #[ignore = "explicit owned requirement fixture inputs plus AG_GATEWAY_EFFECT_HOST; synthetic files/rules only"]
     fn ineffective_create_publishes_custody_all_reuse_rechecks_and_inactive_owned_rule_retires() {
         struct FixtureWindow;
@@ -2859,14 +3177,12 @@ mod tests {
     }
     struct RequirementOverrides {
         prior_base: Option<PathBuf>,
-        prior_producer: bool,
     }
     impl Drop for RequirementOverrides {
         fn drop(&mut self) {
             TEST_BASE.with(|value| {
                 value.replace(self.prior_base.take());
             });
-            TEST_PRODUCER.with(|value| value.set(self.prior_producer));
         }
     }
     impl RequirementFixture {
@@ -2925,10 +3241,8 @@ mod tests {
             .unwrap();
             write_private(&install.join("resources/app.asar"), &archive).unwrap();
             let prior_base = TEST_BASE.with(|value| value.replace(Some(state.clone())));
-            let prior_producer = TEST_PRODUCER.with(|value| value.replace(true));
             let overrides = RequirementOverrides {
                 prior_base,
-                prior_producer,
             };
             let mut bound = BoundInstallation::open(&desktop).unwrap();
             // Explicit receiving is essential: TEST_BASE intentionally redirects

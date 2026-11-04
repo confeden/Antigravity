@@ -275,7 +275,6 @@ fn dacl_only_restorer_reports_actual_status_and_exact_unchanged_object() {
     assert_eq!(TEST_NATIVE_CALLS.with(|v| v.get()), 0);
 }
 fn fixture(name: &str) -> Fixture {
-    TEST_PRODUCER.with(|v| v.set(true));
     TEST_NATIVE_CALLS.with(|v| v.set(0));
     TEST_DACL_STATUSES.with(|v| v.borrow_mut().clear());
     let inputs = runtime_inputs();

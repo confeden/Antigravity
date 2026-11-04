@@ -155,7 +155,9 @@ pub const LISTEN_PORT: u16 = 53;
 ///     added, and an address that fails sits out of the DoH walk for a while
 ///     (`doh::plan`). An older relay still spends 2.5 s of every walk on two
 ///     dead addresses - the slow start of the 400 bypass.
-pub const RELAY_VERSION: u32 = 45;
+/// 46 = the Windows watchdog receives changed WSL Desktop archives through the
+///     installation owner; older background images do not contain this path.
+pub const RELAY_VERSION: u32 = 46;
 
 /// Written where an unelevated relay can write and an unelevated unlocker can
 /// read. Absent means a relay from before versioning, i.e. older than anything.

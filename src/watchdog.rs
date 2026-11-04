@@ -107,6 +107,8 @@ fn run() {
     let mut updaters = updater_dirs();
     let mut fast_until: Option<Instant> = None;
     let mut fast_polls: u32 = 0;
+    #[cfg(windows)]
+    let mut vendor_states: HashMap<PathBuf, VendorWatchState> = HashMap::new();
 
     loop {
         // An update being installed is the one moment a poll every two seconds
@@ -125,6 +127,8 @@ fn run() {
                 updaters = updater_dirs();
             }
             if crate::settings::auto_patch_wanted() {
+                #[cfg(windows)]
+                inspect_vendor_updates(&installs, &mut vendor_states);
                 for inst in &installs {
                     for target in targets(inst) {
                         inspect(&target, states.entry(target.clone()).or_default());
@@ -156,6 +160,8 @@ fn run() {
         // either - that is false on every machine that has not patched *yet*,
         // which is the fresh install this is also for (D27).
         if crate::settings::auto_patch_wanted() {
+            #[cfg(windows)]
+            inspect_vendor_updates(&installs, &mut vendor_states);
             for inst in &installs {
                 for target in targets(inst) {
                     inspect(&target, states.entry(target.clone()).or_default());
@@ -164,6 +170,50 @@ fn run() {
         }
 
         thread::sleep(POLL);
+    }
+}
+
+#[cfg(windows)]
+#[derive(Default)]
+struct VendorWatchState {
+    pending: Option<(u64, SystemTime)>,
+    handled: Option<(u64, SystemTime)>,
+    retry_after: Option<Instant>,
+}
+
+#[cfg(windows)]
+fn vendor_observation_ready(state: &mut VendorWatchState, current: (u64, SystemTime), now: Instant) -> bool {
+    if state.handled == Some(current) || state.retry_after.is_some_and(|until| now < until) { return false; }
+    if state.pending != Some(current) { state.pending = Some(current); return false; }
+    state.pending = None;
+    true
+}
+
+/// ASAR observation is independent from the native binary/IDE target list.
+/// File timestamps schedule receiving only; the installation owner checks bytes.
+#[cfg(windows)]
+fn inspect_vendor_updates(installs: &[PathBuf], states: &mut HashMap<PathBuf, VendorWatchState>) {
+    let settings = crate::settings::routing_snapshot();
+    if !crate::wsl_runtime::automatic_vendor_update_wanted(&settings) { return; }
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    for root in installs {
+        let archive = root.join("resources").join("app.asar");
+        let Some(current) = stat(&archive) else { continue; };
+        let state = states.entry(archive.clone()).or_default();
+        if !vendor_observation_ready(state, current, Instant::now()) { continue; }
+        match crate::wsl_runtime::automatic_vendor_update(root, &settings, &cancel) {
+            Ok(changed) => {
+                state.retry_after = None;
+                state.handled = stat(&archive);
+                if changed { log("WSL Desktop hook update received"); }
+            }
+            Err(error) => {
+                // Existing slow-poll cadence bounds repeated busy/hold probes;
+                // the same unchanged archive remains eligible for retry.
+                state.retry_after = Some(Instant::now() + POLL);
+                log(&format!("WSL Desktop update deferred: {error}"));
+            }
+        }
     }
 }
 
@@ -502,6 +552,24 @@ fn log(line: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn vendor_archive_observation_requires_settled_shape_and_retries_holds() {
+        let mut state = VendorWatchState::default();
+        let now = Instant::now();
+        let first = (10, SystemTime::UNIX_EPOCH);
+        let changed = (11, SystemTime::UNIX_EPOCH);
+        assert!(!vendor_observation_ready(&mut state, first, now));
+        assert!(!vendor_observation_ready(&mut state, changed, now));
+        assert!(vendor_observation_ready(&mut state, changed, now));
+        state.retry_after = Some(now + POLL);
+        assert!(!vendor_observation_ready(&mut state, changed, now));
+        assert!(!vendor_observation_ready(&mut state, changed, now + POLL));
+        assert!(vendor_observation_ready(&mut state, changed, now + POLL));
+        state.handled = Some(changed);
+        assert!(!vendor_observation_ready(&mut state, changed, now + POLL));
+    }
 
     /// The settle rule: a change is acted on only after the same (len, mtime)
     /// is seen twice, so a file still being written is never touched.
