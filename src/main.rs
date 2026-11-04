@@ -843,6 +843,12 @@ fn main() {
     canary::handle_cli_flags();
     }
 
+    #[cfg(windows)]
+    let (selected_image, replacement_action) = match replacement_action {
+        Some(received) => (Ok(std::sync::Arc::new(received.image)), Some(received.action)),
+        None => (windows_coordinator::process_identity::CurrentImage::capture().map(std::sync::Arc::new), None),
+    };
+
     // A window of an older release left open would keep re-applying its own
     // state under this one.
     #[cfg(windows)]
@@ -857,7 +863,7 @@ fn main() {
     instances::close_others();
 
     if !gui_replacement && tui::requested() {
-        run_tui(None, None);
+        run_tui(None, None, #[cfg(windows)] selected_image.clone());
         return;
     }
     // A server over SSH: a terminal, and nothing to draw a window into.
@@ -867,6 +873,9 @@ fn main() {
         return;
     }
 
+    #[cfg(windows)]
+    let lifetime = std::sync::Arc::new(ops::GuiLifetime::with_image(selected_image));
+    #[cfg(not(windows))]
     let lifetime = std::sync::Arc::new(ops::GuiLifetime::default());
     #[cfg(windows)]
     if let Some(input) = retirement_input {
@@ -884,7 +893,7 @@ fn main() {
         // double-clicked launcher has none, and gets the message instead).
         let note = format!("Окно не открылось ({e}) — работаю в терминале.");
         #[cfg(target_os = "windows")]
-        if lifetime.can_start_fallback() { run_tui(Some(note), None); return; }
+        if lifetime.can_start_fallback() { run_tui(Some(note), None, lifetime.retained_image()); return; }
         #[cfg(not(target_os = "windows"))]
         {
             use std::io::IsTerminal;
@@ -900,7 +909,11 @@ fn main() {
     if result.is_err() { std::process::exit(1); }
 }
 
-fn run_tui(note: Option<String>, hold: Option<String>) {
+fn run_tui(note: Option<String>, hold: Option<String>,
+    #[cfg(windows)] image: Result<std::sync::Arc<windows_coordinator::process_identity::CurrentImage>, String>) {
+    #[cfg(windows)]
+    let lifetime = std::sync::Arc::new(ops::GuiLifetime::with_image(image));
+    #[cfg(not(windows))]
     let lifetime = std::sync::Arc::new(ops::GuiLifetime::default());
     if let Some(reason) = hold {
         if let Err(error) = lifetime.hold_automatic_effects(reason) {

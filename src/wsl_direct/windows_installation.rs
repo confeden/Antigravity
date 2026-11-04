@@ -20,10 +20,12 @@ mod native;
 #[path = "windows_installation/background_program.rs"]
 mod background_program;
 pub(crate) use background_program::{BackgroundLocations, background_locations, background_process_name,
-    LegacyBackgroundInput, legacy_background_input, BackgroundInputs, background_inputs,
+    LegacyBackgroundInput, legacy_background_input, BackgroundInputs, background_inputs, background_inputs_selected,
     BackgroundLease, BackgroundReplacementReceiving,
     BackgroundReplacementFailure, background_lease, checked_background_path,
     create_background_directory, create_background_executable, background_replace_program};
+#[cfg(test)]
+pub(crate) use background_program::fail_next_source_capture_revalidation;
 pub(crate) use native::{DiagnosticInputs, diagnostic_inputs,
     MetadataFailure, NonsecretMetadataPlan, read_nonsecret_metadata_checked,
     write_nonsecret_metadata_checked,

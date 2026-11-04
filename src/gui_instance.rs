@@ -2,7 +2,7 @@
 #![cfg(windows)]
 
 use crate::windows_coordinator::{
-    process_identity::ProcessIdentity,
+    process_identity::{CurrentImage, ProcessIdentity},
     windows_installation::{CheckedPath, NativeObjectId, PathKind, PathPurpose},
     OWNER_OBSERVATION_CADENCE,
 };
@@ -349,6 +349,7 @@ fn require_elevated(process: &ProcessIdentity) -> Result<()> {
 }
 
 pub(crate) fn request_elevation(
+    selected: &CurrentImage,
     action: GuiReplacementAction,
     cancel: Arc<AtomicBool>,
     progress: Sender<ElevationProgress>,
@@ -356,13 +357,13 @@ pub(crate) fn request_elevation(
     if cancel.load(Ordering::Acquire) {
         return Err("GUI elevation cancelled".into());
     }
-    let creator = ProcessIdentity::current()?;
-    let image = checked_image(&creator)?;
-    let pipe = Rendezvous::create(&pipe_name(&creator), creator.sid())?;
+    selected.recheck()?;
+    let creator = selected.process();
+    let pipe = Rendezvous::create(&pipe_name(creator), creator.sid())?;
     let _com = Apartment::initialize()?;
     let verb = wide(OsStr::new("runas"));
-    let file = wide(image.as_path().as_os_str());
-    let parameters = wide(&ReplacementRequest::parameters(&creator, &action)?);
+    let file = wide(selected.path().as_os_str());
+    let parameters = wide(&ReplacementRequest::parameters(creator, &action)?);
     let mut launch = SHELLEXECUTEINFOW {
         cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
         fMask: SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC,
@@ -375,6 +376,7 @@ pub(crate) fn request_elevation(
     if cancel.load(Ordering::Acquire) {
         return Err("GUI elevation cancelled".into());
     }
+    selected.recheck()?;
     let _ = progress.send(ElevationProgress::WaitingForConsent);
     // This call may wait for the real manual UAC decision. Cancellation is
     // received immediately after it returns; consent is never automated.
@@ -410,7 +412,7 @@ pub(crate) fn request_elevation(
                 .try_clone()
                 .map_err(|e| format!("retain GUI identity: {e}"))?,
         )?;
-        let child_image = same_image_user(&creator, &image, &identity)?;
+        let child_image = same_image_user(creator, &selected.native_id(), &identity)?;
         require_elevated(&identity)?;
         loop {
             if cancel.load(Ordering::Acquire) {
@@ -428,7 +430,7 @@ pub(crate) fn request_elevation(
                         return Err("unexpected GUI replacement readiness record".into());
                     }
                     identity.recheck()?;
-                    image.recheck()?;
+                    selected.recheck()?;
                     child_image.recheck()?;
                     if !identity.alive()? {
                         return Err("GUI replacement exited during READY receiving".into());
@@ -457,16 +459,17 @@ pub(crate) fn request_elevation(
 
 /// Early role receiver: success permits only normal Main GUI lease admission.
 /// It constructs no Worker and touches no Settings before actual creator exit.
-pub(crate) fn receive_replacement(args: Vec<OsString>) -> Result<GuiReplacementAction> {
+pub(crate) struct ReceivedReplacement { pub(crate) action: GuiReplacementAction, pub(crate) image: CurrentImage }
+pub(crate) fn receive_replacement(args: Vec<OsString>) -> Result<ReceivedReplacement> {
     let request = ReplacementRequest::receive(args)?;
-    let current = ProcessIdentity::current()?;
-    require_elevated(&current)?;
-    let image = checked_image(&current)?;
+    let image = CurrentImage::capture()?;
+    let current = image.process();
+    require_elevated(current)?;
     let creator = ProcessIdentity::open(request.creator)?;
     if creator.creation() != request.creation || !creator.alive()? {
         return Err("GUI creator identity is stale".into());
     }
-    let _creator_image = same_image_user(&current, &image, &creator)?;
+    let _creator_image = same_image_user(current, &image.native_id(), &creator)?;
     let pipe = Rendezvous::open(&pipe_name(&creator))?;
     if pipe.peer(false)? != creator.pid() {
         return Err("GUI rendezvous server identity mismatch".into());
@@ -496,7 +499,7 @@ pub(crate) fn receive_replacement(args: Vec<OsString>) -> Result<GuiReplacementA
     }
     creator.recheck()?;
     image.recheck()?;
-    Ok(request.action)
+    Ok(ReceivedReplacement { action: request.action, image })
 }
 
 struct ReplacementRequest {
@@ -602,15 +605,14 @@ fn checked_image(process: &ProcessIdentity) -> Result<CheckedPath> {
 
 fn same_image_user(
     expected: &ProcessIdentity,
-    image: &CheckedPath,
+    image_id: &NativeObjectId,
     actual: &ProcessIdentity,
 ) -> Result<CheckedPath> {
     if expected.sid() != actual.sid() {
         return Err("GUI replacement belongs to a different user".into());
     }
-    image.recheck()?;
     let actual_image = checked_image(actual)?;
-    if actual_image.native_id() != image.native_id() {
+    if &actual_image.native_id() != image_id {
         return Err("GUI replacement executable identity mismatch".into());
     }
     Ok(actual_image)
@@ -896,6 +898,17 @@ impl Rendezvous {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn peer_image_check_rejects_a_different_native_object() {
+        let root = crate::wsl_discovery_contract_cases::fixture_dir("gui-image-mismatch");
+        let path = root.join("other.exe");
+        crate::wsl_discovery_contract_cases::fixture_file(&path, b"synthetic other image; never executed");
+        let fake = CheckedPath::open(&path, PathKind::File, PathPurpose::Source).unwrap();
+        let current = ProcessIdentity::current().unwrap();
+        assert!(same_image_user(&current, &fake.native_id(), &current).is_err());
+        drop(fake);
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn retirement_descriptor_is_optional_closed_and_digest_bound() {
         let mut action = serde_json::to_value(resume_action()).unwrap();

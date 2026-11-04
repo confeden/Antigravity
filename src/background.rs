@@ -193,6 +193,8 @@ mod windows_impl {
         restoring: bool,
         created_directory: Option<CheckedPath>,
         created_program: Option<CreatedManagedProgram>,
+        image: Option<Result<std::sync::Arc<windows_coordinator::process_identity::CurrentImage>, String>>,
+        source_leases: Vec<std::sync::Arc<windows_installation::BackgroundLease>>,
         #[cfg(test)]
         scheduler_fixture: Option<SchedulerFixture>,
     }
@@ -274,6 +276,7 @@ mod windows_impl {
         }
     }
     fn receiving(operation: &'static str, cancelled: &AtomicBool,
+        image: Option<Result<std::sync::Arc<windows_coordinator::process_identity::CurrentImage>, String>>,
         action: impl FnOnce(&mut BackgroundRun<'_>) -> Result<(), String>) -> BackgroundReceiving {
         let mut received = empty_receiving(operation);
         let locations = match windows_installation::background_locations() {
@@ -299,7 +302,7 @@ mod windows_impl {
             Err(error) => { received.persistence_errors.push(error.clone()); received.result = Err(error); return received; }
         };
         received.diagnostic_journal = Some(diagnostic.journal_reference());
-        let mut run = BackgroundRun { received, cancelled, diagnostic, lease: Some(&lease), program_directory: directory, selected_program, primary_unwind: None, restoring: false, created_directory: None, created_program: None,
+        let mut run = BackgroundRun { received, cancelled, diagnostic, lease: Some(&lease), program_directory: directory, selected_program, primary_unwind: None, restoring: false, created_directory: None, created_program: None, image, source_leases: Vec::new(),
             #[cfg(test)] scheduler_fixture: None };
         run.received.result = run.ready().and_then(|_| action(&mut run));
         if cancelled.load(Ordering::SeqCst) {
@@ -308,6 +311,11 @@ mod windows_impl {
                 run.received.result = Err("Cancelled: actual background transition is retained; stop subsequent independent actions".into());
             }
         }
+        finalize_receiving(&mut run);
+        if let Some(payload) = run.primary_unwind.take() { std::panic::resume_unwind(payload); }
+        run.received
+    }
+    fn finalize_receiving(run: &mut BackgroundRun<'_>) {
         match run.diagnostic.finish(&run.received, run.lease.as_ref().and_then(|lease| lease.context())) {
             Ok(reference) => run.received.diagnostic = Some(reference),
             Err(error) => {
@@ -318,12 +326,10 @@ mod windows_impl {
                 });
             }
         }
-        if let Some(payload) = run.primary_unwind.take() { std::panic::resume_unwind(payload); }
-        run.received
     }
 
     fn uncancelled_receiving(operation: &'static str, action: impl FnOnce(&mut BackgroundRun<'_>) -> Result<(), String>) -> BackgroundReceiving {
-        receiving(operation, &AtomicBool::new(false), action)
+        receiving(operation, &AtomicBool::new(false), None, action)
     }
 
     #[derive(Clone, Debug, serde::Serialize)]
@@ -955,9 +961,10 @@ mod windows_impl {
     /// The background owner retains the same typed value, its diagnostic form,
     /// and the independent restoration outcome; None means never invoked.
     pub(crate) fn with_suspended_background<T: serde::Serialize>(desired: BackgroundDesired,
-        cancelled: &AtomicBool, primary: impl FnOnce() -> T) -> SuspendedBackgroundReceiving<T> {
+        cancelled: &AtomicBool, image: Result<std::sync::Arc<windows_coordinator::process_identity::CurrentImage>, String>,
+        primary: impl FnOnce() -> T) -> SuspendedBackgroundReceiving<T> {
         let mut actual_primary = None;
-        let background = receiving("suspendForNativeClientWork", cancelled, |received| {
+        let background = receiving("suspendForNativeClientWork", cancelled, Some(image), |received| {
             received.ready()?;
             let before = received.task_state()?;
             if !before.relay_enabled && !before.watchdog_enabled {
@@ -1098,10 +1105,11 @@ mod windows_impl {
         Ok(())
     }
     fn apply_program_update(received: &mut BackgroundRun<'_>, program: &CheckedPath,
-        source_lease: &windows_installation::BackgroundLease, source: &CheckedPath, same_bytes: bool,
+        source_lease: &windows_installation::BackgroundLease, same_bytes: bool,
         version: dns_forwarder::VersionPlan<'_>, replacement: &mut Option<CheckedPath>) -> Result<(), String> {
+        source_lease.source_bytes()?;
         if !same_bytes {
-            match windows_installation::background_replace_program(source_lease, program, source) {
+            match windows_installation::background_replace_program(source_lease, program) {
                 Ok(actual) => {
                     received.replacements.push(actual.evidence);
                     *replacement = Some(actual.program);
@@ -1118,28 +1126,32 @@ mod windows_impl {
                 }
             }
         }
+        source_lease.source_bytes()?;
         record_generation(received, version)
     }
-    fn receive_copy_source(received: &mut BackgroundRun<'_>) -> Result<(windows_installation::BackgroundLease, CheckedPath), String> {
+    fn receive_copy_source(received: &mut BackgroundRun<'_>) -> Result<std::sync::Arc<windows_installation::BackgroundLease>, String> {
         received.ready()?;
-        let source_path = env::current_exe().map_err(|e| format!("background source executable: {e}"))?;
-        let inputs = windows_installation::background_inputs(
+        let image = received.image.as_ref().ok_or("source-selection hold: current image was not received")?
+            .clone().map_err(|error| format!("source-selection hold: {error}"))?;
+        let inputs = windows_installation::background_inputs_selected(
             received.program_directory.parent().ok_or("background ProgramData parent absent")?,
-            &received.program_directory, Some(&source_path), &received.diagnostic.directory)?;
-        let context = windows_coordinator::receive_for_background(&inputs)?;
+            &received.program_directory, image, &received.diagnostic.directory)?;
+        let observation = inputs.source_observation()?;
+        let context = windows_coordinator::receive_for_background(&inputs)
+            .map_err(|cause| format!("{cause}; rejected source observation: {observation}"))?;
         // Same worker/thread, existing reentrant native mutex. The outer
         // namespace lease and version plan remain held; no context is cloned.
-        let lease = windows_installation::background_lease(inputs, context)?;
-        let source = CheckedPath::open(&source_path, PathKind::File, PathPurpose::Executable)?;
-        Ok((lease, source))
+        let lease = std::sync::Arc::new(windows_installation::background_lease(inputs, context)
+            .map_err(|cause| format!("{cause}; rejected source observation: {observation}"))?);
+        received.source_leases.push(lease.clone());
+        Ok(lease)
     }
 
-    fn create_managed_image(received: &mut BackgroundRun<'_>, source_lease: &windows_installation::BackgroundLease,
-        source: &CheckedPath) -> Result<CheckedPath, String> {
+    fn create_managed_image(received: &mut BackgroundRun<'_>, source_lease: &windows_installation::BackgroundLease) -> Result<CheckedPath, String> {
         let destination = received.program_path();
-        let bytes = source.read_snapshot()?;
+        let (source_native_id, bytes) = source_lease.source_capture()?;
         use sha2::Digest;
-        let source_sha256 = hex::encode(sha2::Sha256::digest(&bytes));
+        let source_sha256 = hex::encode(sha2::Sha256::digest(bytes));
         match fs::symlink_metadata(&destination) {
             Ok(_) => {
                 let existing = windows_installation::checked_background_path(source_lease, &destination, PathKind::File)?;
@@ -1169,6 +1181,7 @@ mod windows_impl {
                 require_owned_occupancy(OccupancyOwnership::LiveCreator)?;
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                source_lease.source_bytes()?;
                 received.effect(BackgroundEffect::DirectoryCreateRequested)?;
                 received.ready()?;
                 windows_installation::create_background_directory(source_lease, &directory)?;
@@ -1178,22 +1191,24 @@ mod windows_impl {
             Err(error) => return Err(format!("managed directory observation: {error}")),
         }
         let parent = windows_installation::checked_background_path(source_lease, &directory, PathKind::Directory)?;
-        source.recheck()?;
+        source_lease.source_bytes()?;
         received.effect(BackgroundEffect::ProgramCreateRequested)?;
         received.ready()?;
         let mut output = windows_installation::create_background_executable(source_lease, &destination)?;
         received.effect(BackgroundEffect::ProgramCreateReturnedSuccess)?;
-        output.write_all(&bytes).and_then(|_| output.sync_all()).map_err(|error| format!("PreparationIncomplete: managed image write: {error}; preserve it"))?;
+        source_lease.source_bytes()?;
+        output.write_all(bytes).and_then(|_| output.sync_all()).map_err(|error| format!("PreparationIncomplete: managed image write: {error}; preserve it"))?;
         drop(output);
+        source_lease.source_bytes()?;
         let installed = windows_installation::checked_background_path(source_lease, &destination, PathKind::File)?;
-        if installed.read_snapshot()? != bytes { return Err("PreparationIncomplete: new managed image readback differs".into()); }
+        if installed.read_snapshot()?.as_slice() != bytes { return Err("PreparationIncomplete: new managed image readback differs".into()); }
         parent.recheck()?;
         received.created_program = Some(CreatedManagedProgram {
             guard: windows_installation::checked_background_path(source_lease, &destination, PathKind::File)?, source_sha256,
         });
         received.effect(BackgroundEffect::ProgramReadbackReceived { program: installed.as_path().to_path_buf(),
-            program_native_id: installed.native_id(), source_native_id: source.native_id(),
-            sha256: hex::encode(sha2::Sha256::digest(&bytes)), generation: dns_forwarder::RELAY_VERSION })?;
+            program_native_id: installed.native_id(), source_native_id,
+            sha256: hex::encode(sha2::Sha256::digest(bytes)), generation: dns_forwarder::RELAY_VERSION })?;
         Ok(installed)
     }
 
@@ -1217,20 +1232,22 @@ mod windows_impl {
             Some(managed) => match receive_current_image_decision(received, &managed, &selected, &metadata)? {
                 CurrentImageDecision::ReuseCurrent => (managed, None),
                 CurrentImageDecision::UpdateRequired => {
-                    let (lease, source) = receive_copy_source(received)?;
-                    let same_bytes = managed.read_snapshot()? == source.read_snapshot()?;
+                    let lease = receive_copy_source(received)?;
+                    let same_bytes = managed.read_snapshot()?.as_slice() == lease.source_bytes()?;
                     revalidate_generation(received, &version)?;
-                    (managed, Some((lease, source, same_bytes, version)))
+                    (managed, Some((lease, same_bytes, version)))
                 }
             },
             None => {
-                let (lease, source) = receive_copy_source(received)?;
-                let managed = create_managed_image(received, &lease, &source)?;
+                let lease = receive_copy_source(received)?;
+                let managed = create_managed_image(received, &lease)?;
+                lease.source_bytes()?;
                 record_generation(received, version)?;
                 (managed, None)
             }
         };
         let programs = task_scheduler::Programs { managed: Some(&managed), legacy: Some(&legacy) };
+        for lease in &received.source_leases { lease.source_bytes()?; }
         // All fallible definition updates/readbacks finish while OLD retained
         // instances continue. Neither a warning nor a path-only match is Ready.
         if let Err(error) = selected.update_paths(&programs, received) {
@@ -1238,13 +1255,13 @@ mod windows_impl {
             return Err(match observed { Ok(_) => error, Err(observation) => format!("{error}; current mixed-state receiving: {observation}") });
         }
         drop(programs);
-        if let Some((_, source, _, version)) = &update {
-            source.recheck()?;
+        if let Some((lease, _, version)) = &update {
+            lease.source_bytes()?;
             revalidate_generation(received, version)?;
         }
         let (primary, outcome) = owned_transition_selected(received, managed, desired, Some(&mut selected), Some(&legacy), true,
             |run, program, replacement| match update {
-                Some((lease, source, same_bytes, version)) => apply_program_update(run, program, &lease, &source, same_bytes, version, replacement),
+                Some((lease, same_bytes, version)) => apply_program_update(run, program, &lease, same_bytes, version, replacement),
                 None => Ok(()),
             });
         let program = outcome?;
@@ -1285,12 +1302,12 @@ mod windows_impl {
                 drop(known);
                 if decision == CurrentImageDecision::ReuseCurrent { return Ok(installed); }
                 let before = received.task_state()?;
-                let (source_lease, source) = receive_copy_source(received)?;
-                let same_bytes = installed.read_snapshot()? == source.read_snapshot()?;
+                let source_lease = receive_copy_source(received)?;
+                let same_bytes = installed.read_snapshot()?.as_slice() == source_lease.source_bytes()?;
                 revalidate_generation(received, &version)?;
                 let desired = desired.unwrap_or(BackgroundDesired { relay: before.relay_enabled, watchdog: before.watchdog_enabled });
                 let (primary, outcome) = owned_transition(received, installed, desired,
-                    |run, program, replacement| apply_program_update(run, program, &source_lease, &source, same_bytes, version, replacement));
+                    |run, program, replacement| apply_program_update(run, program, &source_lease, same_bytes, version, replacement));
                 let program = outcome?;
                 return match primary {
                     Some(Ok(())) => Ok(program),
@@ -1305,8 +1322,9 @@ mod windows_impl {
         if tasks.relay_enabled || tasks.watchdog_enabled {
             return Err("OwnershipRequired: existing background task references an absent program; preserve the task".into());
         }
-        let (source_lease, source) = receive_copy_source(received)?;
-        let installed = create_managed_image(received, &source_lease, &source)?;
+        let source_lease = receive_copy_source(received)?;
+        let installed = create_managed_image(received, &source_lease)?;
+        source_lease.source_bytes()?;
         record_generation(received, version)?;
         Ok(installed)
     }
@@ -1357,8 +1375,9 @@ mod windows_impl {
 
     /// One full profile operation: the caller supplies both authoritative role
     /// values, including unchanged roles omitted from an Option-valued delta.
-    pub(crate) fn reconcile_with_receiving(desired: BackgroundDesired, cancelled: &AtomicBool) -> BackgroundReceiving {
-        receiving("reconcileBackgroundProfile", cancelled, |received| {
+    pub(crate) fn reconcile_with_receiving(desired: BackgroundDesired, cancelled: &AtomicBool,
+        image: Result<std::sync::Arc<windows_coordinator::process_identity::CurrentImage>, String>) -> BackgroundReceiving {
+        receiving("reconcileBackgroundProfile", cancelled, Some(image), |received| {
             if desired.relay || desired.watchdog {
                 let program = ensure_program(received, Some(desired))?;
                 for (wanted, role) in [(desired.watchdog, "watchdog"), (desired.relay, "relay")] {
@@ -1459,7 +1478,7 @@ mod windows_impl {
             let mut received = BackgroundRun {
                 received: empty_receiving("syntheticNativeCaptureOnly"), cancelled: &cancelled,
                 diagnostic: BackgroundDiagnostic::begin("syntheticNativeCaptureOnly", directory.clone(), None).unwrap(),
-                lease: None, program_directory: directory.clone(), selected_program: directory.join("synthetic-unused-program"), primary_unwind: None, restoring: false, created_directory: None, created_program: None, scheduler_fixture: None,
+                lease: None, program_directory: directory.clone(), selected_program: directory.join("synthetic-unused-program"), primary_unwind: None, restoring: false, created_directory: None, created_program: None, image: None, source_leases: Vec::new(), scheduler_fixture: None,
             };
             // Exceeds Core's 640-character presentation limit. This helper does
             // not connect to Task Scheduler or change product/user state.
@@ -1477,6 +1496,50 @@ mod windows_impl {
             let reference = received.diagnostic.finish(&received.received, None).unwrap();
             assert!(reference.sha256.is_some());
             println!("controlled helper actual exit/capture/terminal retained at {}", reference.path.display());
+        }
+
+        #[test]
+        #[ignore = "requires explicit owned private AG_BACKGROUND_FIXTURE_ROOT; synthetic source only"]
+        fn source_capture_revalidation_failure_retains_actual_observation_and_cause() {
+            let directory = PathBuf::from(env::var_os("AG_BACKGROUND_FIXTURE_ROOT").expect("explicit owned fixture root required"));
+            let source = directory.join(format!("source-{}.exe", windows_installation::new_request_id().unwrap()));
+            eprintln!("OWN_BACKGROUND_SOURCE_CAPTURE_FIXTURE {}", source.display());
+            let mut created = fs::OpenOptions::new().write(true).create_new(true).open(&source).unwrap();
+            created.write_all(b"MZ controlled source; never executed").unwrap();
+            created.sync_all().unwrap(); drop(created);
+            let image = std::sync::Arc::new(windows_coordinator::process_identity::CurrentImage::synthetic(&source).unwrap());
+            for terminal_failure in [false, true] {
+                let cancelled = AtomicBool::new(false);
+                let mut run = BackgroundRun {
+                    received: empty_receiving("syntheticSourceCaptureFailure"), cancelled: &cancelled,
+                    diagnostic: BackgroundDiagnostic::begin("syntheticSourceCaptureFailure", directory.clone(), None).unwrap(),
+                    lease: None, program_directory: directory.join("unused-program"), selected_program: directory.join("unused-program/ag_dns.exe"),
+                    primary_unwind: None, restoring: false, created_directory: None, created_program: None,
+                    image: Some(Ok(image.clone())), source_leases: Vec::new(), scheduler_fixture: None,
+                };
+                windows_installation::fail_next_source_capture_revalidation();
+                let cause = match receive_copy_source(&mut run) { Ok(_) => panic!("controlled source failure missing"), Err(cause) => cause };
+                assert!(cause.starts_with("synthetic source revalidation failure"));
+                for key in ["nativeId=", "sha256=", "bytes=", "metadataSha256="] { assert!(cause.contains(key)); }
+                assert!(run.received.effects.is_empty() && run.received.replacements.is_empty() && run.received.native.is_empty());
+                assert!(run.received.primary_result.is_none());
+                run.received.result = Err(cause.clone());
+                if terminal_failure { run.diagnostic.directory = directory.join("missing-terminal-parent"); }
+                finalize_receiving(&mut run);
+                let actual = run.received.result.as_ref().unwrap_err();
+                assert!(actual.starts_with(&cause));
+                if terminal_failure {
+                    assert!(!run.received.persistence_errors.is_empty());
+                    assert!(actual.contains("diagnostic terminal retention"));
+                } else {
+                    let terminal = run.received.diagnostic.as_ref().unwrap();
+                    let value: serde_json::Value = serde_json::from_slice(&fs::read(&terminal.path).unwrap()).unwrap();
+                    assert_eq!(value["receiving"]["result"]["Err"], cause);
+                    assert!(run.received.persistence_errors.is_empty());
+                }
+                assert!(run.received.effects.is_empty() && run.received.replacements.is_empty() && run.received.native.is_empty());
+                assert!(run.received.primary_result.is_none());
+            }
         }
 
         #[test]
@@ -1507,7 +1570,7 @@ mod windows_impl {
                 let mut received = BackgroundRun {
                     received: empty_receiving("syntheticTransitionModelOnly"), cancelled: &cancelled,
                     diagnostic: BackgroundDiagnostic::begin("syntheticTransitionModelOnly", directory.clone(), None).unwrap(),
-                    lease: None, program_directory: directory.clone(), selected_program: path.clone(), primary_unwind: None, restoring: false, created_directory: None, created_program: None,
+                    lease: None, program_directory: directory.clone(), selected_program: path.clone(), primary_unwind: None, restoring: false, created_directory: None, created_program: None, image: None, source_leases: Vec::new(),
                     scheduler_fixture: Some(SchedulerFixture { relay_present: true, watchdog_present: true,
                         cancel_after_retire: case == "cancel-after-retire", fail_after_retire: case == "sink-after-stop", replies, calls: Vec::new(), program_native_ids: Vec::new() }),
                 };
@@ -1611,7 +1674,7 @@ mod windows_impl {
                     received: empty_receiving("syntheticCurrentImageModelOnly"), cancelled: &cancelled,
                     diagnostic: BackgroundDiagnostic::begin("syntheticCurrentImageModelOnly", root.clone(), None).unwrap(),
                     lease: None, program_directory: root.clone(), selected_program: program.as_path().to_path_buf(),
-                    primary_unwind: None, restoring: false, created_directory: None, created_program: None,
+                    primary_unwind: None, restoring: false, created_directory: None, created_program: None, image: None, source_leases: Vec::new(),
                     scheduler_fixture: Some(SchedulerFixture { relay_present: true, watchdog_present: true, cancel_after_retire: false,
                         fail_after_retire: false, replies, calls: Vec::new(), program_native_ids: Vec::new() }),
                 };

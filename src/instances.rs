@@ -47,7 +47,7 @@ mod gui_instance;
 #[cfg(target_os = "windows")]
 pub(crate) use gui_instance::{
     receive_replacement, request_elevation, ElevationProgress, GuiApplyContinuation, GuiRetirementInputRef,
-    GuiCurrentExpectation, GuiReplacementAction, GuiReplacementReady, GuiReplacementTarget,
+    GuiCurrentExpectation, GuiReplacementAction, GuiReplacementReady, GuiReplacementTarget, ReceivedReplacement,
     GuiTargetExpectation, GuiTargetKind, GUI_REPLACEMENT_FLAG,
 };
 

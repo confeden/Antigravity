@@ -394,8 +394,18 @@ pub struct GuiLifetime {
     action: Mutex<Option<crate::instances::GuiReplacementAction>>,
     #[cfg(windows)]
     retirement_input: Mutex<Option<RetirementInput>>,
+    #[cfg(windows)]
+    image: Option<Result<Arc<crate::windows_coordinator::process_identity::CurrentImage>, String>>,
 }
 impl GuiLifetime {
+    #[cfg(windows)]
+    pub(crate) fn with_image(image: Result<Arc<crate::windows_coordinator::process_identity::CurrentImage>, String>) -> Self {
+        Self { image: Some(image), ..Self::default() }
+    }
+    #[cfg(windows)]
+    pub(crate) fn retained_image(&self) -> Result<Arc<crate::windows_coordinator::process_identity::CurrentImage>, String> {
+        self.image.clone().unwrap_or_else(|| Err("source-selection hold: current image was not received".into()))
+    }
     #[cfg(windows)]
     pub(crate) fn receive_retirement_input(&self, descriptor: crate::instances::GuiRetirementInputRef) -> Result<(), String> {
         let input = RetirementInput::receive(descriptor)?;
@@ -895,7 +905,8 @@ fn run_worker(
                             }
                         }
                         if cancellation.load(Ordering::SeqCst) { return Ok(NativeCompletion::Retired); }
-                        let mut ready = crate::instances::request_elevation(action, cancellation.clone(), progress.clone())?;
+                        let image = lifetime.retained_image()?;
+                        let mut ready = crate::instances::request_elevation(&image, action, cancellation.clone(), progress.clone())?;
                         if cancellation.load(Ordering::SeqCst) {
                             retire_replacement(&mut ready, &progress);
                             return Ok(NativeCompletion::Retired);
@@ -2993,7 +3004,8 @@ fn disable_client_patch_received(ctx: &mut Ctx, #[cfg(windows)] plan: Option<&Al
             watchdog: ctx.settings.auto_patch_wanted() };
         let cancellation = ctx.native_cancel.clone();
         if plan.is_none_or(|plan| plan.native.revert_services) {
-            let receiving = background::with_suspended_background(desired, &cancellation, || revert_client_primary(ctx, plan));
+            let image = ctx.lifetime.retained_image();
+            let receiving = background::with_suspended_background(desired, &cancellation, image, || revert_client_primary(ctx, plan));
             let restoration = receiving.background.result.clone();
             let primary = receiving.primary;
             ctx.background_receivings.push(receiving.background);
@@ -3133,7 +3145,8 @@ fn revert_client_primary(ctx: &mut Ctx, #[cfg(windows)] plan: Option<&AllTargetA
 #[cfg(windows)]
 fn background_roles_effect(ctx: &mut Ctx, relay: bool, watchdog: bool) -> Result<(), String> {
     let cancellation = ctx.native_cancel.clone();
-    let receiving = background::reconcile_with_receiving(background::BackgroundDesired { relay, watchdog }, &cancellation);
+    let image = ctx.lifetime.retained_image();
+    let receiving = background::reconcile_with_receiving(background::BackgroundDesired { relay, watchdog }, &cancellation, image);
     let result = receiving.result.clone();
     // The existing background owner finishes its full private diagnostic before
     // returning. Retain the complete typed packet before interpreting result.
@@ -3558,6 +3571,19 @@ pub fn resolve_manual_path(raw: &Path) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    #[test]
+    fn default_lifetime_never_constructs_a_source_image() {
+        assert!(super::GuiLifetime::default().retained_image().is_err());
+    }
+    #[cfg(windows)]
+    #[test]
+    fn fallback_lifetime_retains_the_same_received_image() {
+        let image = std::sync::Arc::new(crate::windows_coordinator::process_identity::CurrentImage::capture().unwrap());
+        let original = super::GuiLifetime::with_image(Ok(image.clone()));
+        let fallback = super::GuiLifetime::with_image(original.retained_image());
+        assert!(std::sync::Arc::ptr_eq(&image, &fallback.retained_image().unwrap()));
+    }
     #[test]
     #[cfg(windows)]
     fn vendor_current_requires_exact_unique_owner_result() {

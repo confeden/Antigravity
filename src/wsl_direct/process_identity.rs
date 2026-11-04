@@ -11,6 +11,34 @@ use windows_sys::Win32::{Foundation::{FILETIME, HANDLE, LocalFree, WAIT_OBJECT_0
 type Result<T> = std::result::Result<T, String>;
 fn error(stage: &str) -> String { format!("{stage}: {}", std::io::Error::last_os_error()) }
 
+/// A retained actual current-process image, selected only at application entry.
+/// It is an in-memory capability, never a path/serialized approval.
+pub(crate) struct CurrentImage {
+    process: ProcessIdentity,
+    file: super::windows_installation::CheckedPath,
+}
+impl CurrentImage {
+    pub(crate) fn capture() -> Result<Self> {
+        use super::windows_installation::{CheckedPath, PathKind, PathPurpose};
+        let process = ProcessIdentity::current()?;
+        process.recheck()?;
+        let file = CheckedPath::open(process.image(), PathKind::File, PathPurpose::Source)?;
+        process.recheck()?;
+        file.recheck()?;
+        Ok(Self { process, file })
+    }
+    pub(crate) fn recheck(&self) -> Result<()> { self.process.recheck()?; self.file.recheck() }
+    pub(crate) fn process(&self) -> &ProcessIdentity { &self.process }
+    pub(in crate::windows_coordinator) fn file(&self) -> &super::windows_installation::CheckedPath { &self.file }
+    pub(crate) fn path(&self) -> &std::path::Path { self.file.as_path() }
+    pub(crate) fn native_id(&self) -> super::windows_installation::NativeObjectId { self.file.native_id() }
+    #[cfg(test)]
+    pub(crate) fn synthetic(path: &std::path::Path) -> Result<Self> {
+        use super::windows_installation::{CheckedPath, PathKind, PathPurpose};
+        Ok(Self { process: ProcessIdentity::current()?, file: CheckedPath::open(path, PathKind::File, PathPurpose::Source)? })
+    }
+}
+
 pub(crate) struct ProcessIdentity {
     handle: OwnedHandle,
     pid: u32,
@@ -92,5 +120,17 @@ fn image_path(process: HANDLE) -> Result<PathBuf> {
         }
         if std::io::Error::last_os_error().raw_os_error() != Some(122) { return Err(error("receive process image")); }
         capacity = capacity.checked_mul(2).ok_or("native process path length overflow")?;
+    }
+}
+
+#[cfg(test)]
+mod current_image_tests {
+    use super::*;
+    #[test]
+    fn current_image_is_received_from_the_current_process() {
+        let image = CurrentImage::capture().unwrap();
+        assert_eq!(image.process().pid(), std::process::id());
+        image.recheck().unwrap();
+        image.file().recheck().unwrap();
     }
 }

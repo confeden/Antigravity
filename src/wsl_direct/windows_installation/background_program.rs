@@ -152,12 +152,72 @@ pub(crate) struct BackgroundInputs {
     managed_root: NativeDirectoryInput,
     program_parent: NativeDirectoryInput,
     source: Option<BackgroundSourceInput>,
+    diagnostic_source: Option<DiagnosticSourceInput>,
     diagnostic: DiagnosticInputs,
 }
-struct BackgroundSourceInput {
+struct DiagnosticSourceInput {
     parent: NativeDirectoryInput,
     pin: CheckedPath,
     descriptor: String,
+}
+struct BackgroundSourceInput {
+    image: std::sync::Arc<crate::windows_coordinator::process_identity::CurrentImage>,
+    snapshot: SourceSnapshot,
+    ancestors: Vec<(ObjectId, String)>,
+}
+impl BackgroundSourceInput {
+    fn capture(image: std::sync::Arc<crate::windows_coordinator::process_identity::CurrentImage>) -> Result<Self> {
+        image.recheck()?;
+        let pin = image.file();
+        let ancestors = pin._ancestors.iter().map(|file| Ok((object_id(file)?, hash(&security(file.as_raw_handle(), 1 | 4)?))))
+            .collect::<Result<Vec<_>>>()?;
+        let mut file = pin.file.try_clone().map_err(|e| io("background source capture", e))?;
+        let snapshot = read_checked(&mut file, pin.as_path())?;
+        let captured = Self { image, snapshot, ancestors };
+        #[cfg(test)]
+        let validation = if TEST_SOURCE_CAPTURE_FAILURE.with(|value| value.replace(false)) {
+            Err("synthetic source revalidation failure".to_owned())
+        } else { captured.validate_source() };
+        #[cfg(not(test))]
+        let validation = captured.validate_source();
+        if let Err(cause) = validation {
+            return Err(format!("{cause}; rejected source observation: {}", captured.summary()));
+        }
+        Ok(captured)
+    }
+    fn summary(&self) -> String {
+        let metadata = json(&self.snapshot.identity).map(|bytes| hash(&bytes))
+            .unwrap_or_else(|error| format!("unavailable: {error}"));
+        format!("nativeId={:?}, sha256={}, bytes={}, metadataSha256={metadata}",
+            self.image.file().native_id(), self.snapshot.digest, self.snapshot.bytes.len())
+    }
+    fn revalidate(&self) -> Result<()> {
+        self.validate_source().map_err(|cause| format!("{cause}; rejected source observation: {}", self.summary()))
+    }
+    fn validate_source(&self) -> Result<()> {
+        self.image.recheck()?;
+        let pin = self.image.file();
+        let fresh = parents(pin.as_path())?;
+        if fresh.len() != self.ancestors.len() { return Err("background source ancestor count changed".into()); }
+        for ((held, new), (id, descriptor)) in pin._ancestors.iter().zip(&fresh).zip(&self.ancestors) {
+            if object_id(held)? != *id || object_id(new)? != *id
+                || hash(&security(held.as_raw_handle(), 1 | 4)?) != *descriptor
+                || hash(&security(new.as_raw_handle(), 1 | 4)?) != *descriptor {
+                return Err("background source ancestor identity/security changed".into());
+            }
+        }
+        let mut file = pin.file.try_clone().map_err(|e| io("background source recheck", e))?;
+        if !same_snapshot(&read_checked(&mut file, pin.as_path())?, &self.snapshot) {
+            return Err("background source snapshot changed".into());
+        }
+        Ok(())
+    }
+}
+#[cfg(test)]
+thread_local! { static TEST_SOURCE_CAPTURE_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+#[cfg(test)]
+pub(crate) fn fail_next_source_capture_revalidation() {
+    TEST_SOURCE_CAPTURE_FAILURE.with(|value| value.set(true));
 }
 pub(crate) fn background_inputs(
     managed_root: &Path,
@@ -165,17 +225,19 @@ pub(crate) fn background_inputs(
     source: Option<&Path>,
     diagnostic_parent: &Path,
 ) -> Result<BackgroundInputs> {
+    #[cfg(not(test))]
+    if source.is_some() { return Err("background source selection requires the retained current image".into()); }
     let managed_root = NativeDirectoryInput::capture(managed_root)?;
     if !managed_root.is_existing() {
         return Err("background lease root must already exist".into());
     }
-    let source = source
-        .map(|path| -> Result<BackgroundSourceInput> {
+    let diagnostic_source = source
+        .map(|path| -> Result<DiagnosticSourceInput> {
             let pin = CheckedPath::open(path, PathKind::File, PathPurpose::ReplaceSource)?;
             let descriptor = hash(&security(pin.file.as_raw_handle(), 1 | 4)?);
             let parent =
                 NativeDirectoryInput::capture(pin.path.parent().ok_or("source parent absent")?)?;
-            Ok(BackgroundSourceInput {
+            Ok(DiagnosticSourceInput {
                 parent,
                 pin,
                 descriptor,
@@ -185,16 +247,28 @@ pub(crate) fn background_inputs(
     Ok(BackgroundInputs {
         managed_root,
         program_parent: NativeDirectoryInput::capture(program_parent)?,
-        source,
+        source: None,
+        diagnostic_source,
         diagnostic: diagnostic_inputs(diagnostic_parent)?,
     })
 }
+pub(crate) fn background_inputs_selected(
+    managed_root: &Path, program_parent: &Path,
+    image: std::sync::Arc<crate::windows_coordinator::process_identity::CurrentImage>, diagnostic_parent: &Path,
+) -> Result<BackgroundInputs> {
+    let mut inputs = background_inputs(managed_root, program_parent, None, diagnostic_parent)?;
+    inputs.source = Some(BackgroundSourceInput::capture(image)?);
+    Ok(inputs)
+}
 impl BackgroundInputs {
+    pub(crate) fn source_observation(&self) -> Result<String> {
+        Ok(self.source.as_ref().ok_or("background source selection not received")?.summary())
+    }
     fn files(&self) -> impl Iterator<Item = &File> {
         self.managed_root
             .files()
             .chain(self.program_parent.files())
-            .chain(self.source.iter().flat_map(|source| source.parent.files()))
+            .chain(self.diagnostic_source.iter().flat_map(|source| source.parent.files()))
             .chain(self.diagnostic.files())
     }
     pub(crate) fn ancestor_inputs(&self) -> Result<AncestorInputs> {
@@ -212,6 +286,9 @@ impl BackgroundInputs {
         self.program_parent.recheck(before_effects)?;
         self.diagnostic.recheck(before_effects)?;
         if let Some(source) = &self.source {
+            source.revalidate()?;
+        }
+        if let Some(source) = &self.diagnostic_source {
             source.parent.recheck(before_effects)?;
             source.pin.recheck()?;
             if hash(&security(source.pin.file.as_raw_handle(), 1 | 4)?) != source.descriptor {
@@ -239,7 +316,7 @@ impl BackgroundInputs {
             }
             check_context_ancestor(file, context)?;
         }
-        match &self.source {
+        match &self.diagnostic_source {
             Some(source) => file_integrity(&source.pin.file),
             None => Ok(()),
         }
@@ -273,6 +350,16 @@ impl BackgroundLease {
     }
     fn revalidate(&self) -> Result<()> {
         self.inputs.receive_context(self.context(), false)
+    }
+    pub(crate) fn source_capture(&self) -> Result<(ObjectId, &[u8])> {
+        let source = self.inputs.source.as_ref().ok_or("background source selection not received")?;
+        source.revalidate()?;
+        Ok((source.image.file().native_id(), &source.snapshot.bytes))
+    }
+    pub(crate) fn source_bytes(&self) -> Result<&[u8]> {
+        let source = self.inputs.source.as_ref().ok_or("background source selection not received")?;
+        source.revalidate()?;
+        Ok(&source.snapshot.bytes)
     }
 }
 
@@ -375,6 +462,7 @@ pub(crate) fn create_background_directory(lease: &BackgroundLease, path: &Path) 
 }
 
 pub(crate) fn create_background_executable(lease: &BackgroundLease, path: &Path) -> Result<File> {
+    lease.source_bytes()?;
     let parent = checked_background_path(
         lease,
         path.parent().ok_or("background program parent absent")?,
@@ -417,7 +505,7 @@ impl std::error::Error for BackgroundReplacementFailure {}
 
 fn replacement_evidence(
     current: &CheckedPath,
-    source: &CheckedPath,
+    source: Option<&CheckedPath>,
     id: &Option<String>,
     before: &Option<SourceSnapshot>,
     input: &Option<SourceSnapshot>,
@@ -427,7 +515,7 @@ fn replacement_evidence(
 ) -> serde_json::Value {
     serde_json::json!({"schema":1,"kind":"background-program-native-replacement",
         "operationId":id,"phase":phase,"replaceResult":called,
-        "expectedProgramNativeId":current.object,"sourceNativeId":source.object,
+        "expectedProgramNativeId":current.object,"sourceNativeId":source.map(|pin| &pin.object),
         "expectedPreimage":before.as_ref().map(snapshot_evidence),
         "validatedSource":input.as_ref().map(snapshot_evidence),
         "program":path_evidence(&current.path),"programObservation":observe(&current.path),
@@ -444,8 +532,8 @@ fn replacement_evidence(
 pub(crate) fn background_replace_program(
     lease: &BackgroundLease,
     current: &CheckedPath,
-    source: &CheckedPath,
 ) -> std::result::Result<BackgroundReplacementReceiving, BackgroundReplacementFailure> {
+    let source = lease.inputs.source.as_ref().map(|input| input.image.file());
     let mut phase = "preflight";
     let mut called = None;
     let mut id = None;
@@ -454,18 +542,15 @@ pub(crate) fn background_replace_program(
     let mut input = None;
     let result = (|| -> Result<CheckedPath> {
         lease.revalidate()?;
-        if lease.inputs.source.as_ref().map(|input| &input.pin.object) != Some(&source.object) {
-            return Err("replacement source was not captured in the held admission".into());
-        }
+        let captured = lease.inputs.source.as_ref().ok_or("background source selection not received")?;
+        let source = source.ok_or("background source selection not received")?;
         if !matches!(current.purpose, PathPurpose::ReplaceSource) {
             return Err("background program pin is not replacement-compatible; retain caller guards and re-receive it".into());
         }
         current.recheck()?;
         source.recheck()?;
         ancestor_guards(current, lease.context())?;
-        ancestor_guards(source, lease.context())?;
         file_integrity(&current.file)?;
-        file_integrity(&source.file)?;
         if current.object == source.object {
             return Err("background source and target are the same native file".into());
         }
@@ -474,11 +559,7 @@ pub(crate) fn background_replace_program(
             .try_clone()
             .map_err(|error| io("background preimage clone", error))?;
         let old = read_checked(&mut old_file, &current.path)?;
-        let mut new_file = source
-            .file
-            .try_clone()
-            .map_err(|error| io("background source clone", error))?;
-        let new = read_checked(&mut new_file, &source.path)?;
+        let new = captured.snapshot.clone();
         before = Some(old);
         input = Some(new);
         let parent = checked_background_path(
@@ -519,10 +600,9 @@ pub(crate) fn background_replace_program(
         current.recheck()?;
         source.recheck()?;
         file_integrity(&current.file)?;
-        file_integrity(&source.file)?;
+        captured.revalidate()?;
         if !same_snapshot(&read_path(&current.path, READ | DELETE)?, old)
             || object_id(&open_regular(&current.path, READ | DELETE)?)? != current.object
-            || !same_snapshot(&read_path(&source.path, READ | DELETE)?, new)
             || !same_snapshot(&read_path(&work.staged, READ | DELETE)?, &staged)
         {
             return Err(
@@ -639,6 +719,86 @@ mod tests {
         assert!(file_descriptor_integrity(&mut descriptor("(D;;GW;;;WD)(A;;GW;;;WD)")).is_ok());
     }
 
+    #[test]
+    #[ignore = "explicit owned private root; synthetic source and held read capability only"]
+    fn selected_source_capture_denies_mutation_and_rechecks_snapshot() {
+        let root = allocate_owned_root("background-source-read");
+        let source = root.path.join("source.exe");
+        write_private(&source, b"MZ synthetic source; never executed").unwrap();
+        let image = std::sync::Arc::new(crate::windows_coordinator::process_identity::CurrentImage::synthetic(&source).unwrap());
+        let mut capture = BackgroundSourceInput::capture(image).unwrap();
+        assert_eq!(capture.snapshot.bytes, b"MZ synthetic source; never executed");
+        assert!(OpenOptions::new().write(true).open(&source).is_err());
+        assert!(OpenOptions::new().append(true).open(&source).is_err());
+        assert!(fs::rename(&source, root.path.join("renamed.exe")).is_err());
+        assert!(fs::remove_file(&source).is_err());
+        capture.revalidate().unwrap();
+        let baseline = capture.snapshot.clone();
+        capture.snapshot.digest = "0".repeat(64);
+        assert!(capture.revalidate().is_err());
+        capture.snapshot = baseline.clone();
+        capture.snapshot.bytes[0] ^= 1;
+        assert!(capture.revalidate().is_err());
+        capture.snapshot = baseline.clone();
+        capture.snapshot.identity.index ^= 1;
+        assert!(capture.revalidate().is_err());
+        capture.snapshot = baseline.clone();
+        capture.snapshot.identity.security_descriptor.push(0);
+        assert!(capture.revalidate().is_err());
+        capture.snapshot = baseline;
+        let original = capture.ancestors[0].0.clone();
+        capture.ancestors[0].0.file[0] ^= 1;
+        assert!(capture.revalidate().is_err());
+        capture.ancestors[0].0 = original;
+        capture.ancestors[0].1.push('0');
+        assert!(capture.revalidate().is_err());
+    }
+
+    #[test]
+    #[ignore = "explicit owned private root; source/managed role overlap is synthetic"]
+    fn source_projection_preserves_overlapping_mutation_roles() {
+        let root = allocate_owned_root("background-source-overlap");
+        let source = root.path.join("source.exe");
+        write_private(&source, b"MZ synthetic source; never executed").unwrap();
+        let image = std::sync::Arc::new(crate::windows_coordinator::process_identity::CurrentImage::synthetic(&source).unwrap());
+        let inputs = background_inputs_selected(&root.path, &root.path, image, &root.path).unwrap();
+        let root_id = root.object.clone();
+        assert!(inputs.files().any(|file| object_id(file).is_ok_and(|id| id == root_id)));
+        assert!(inputs.source.is_some());
+        assert!(inputs.diagnostic_source.is_none());
+    }
+
+    #[test]
+    #[ignore = "explicit owned private root; receives actual current test image without executing or copying it"]
+    fn selected_source_uses_the_actual_held_current_image() {
+        let root = allocate_owned_root("background-current-image");
+        let image = std::sync::Arc::new(crate::windows_coordinator::process_identity::CurrentImage::capture().unwrap());
+        let expected_id = image.native_id();
+        let inputs = background_inputs_selected(&root.path, &root.path, image.clone(), &root.path).unwrap();
+        let lease = background_lease(inputs, None).unwrap();
+        let (actual_id, bytes) = lease.source_capture().unwrap();
+        assert_eq!(actual_id, expected_id);
+        assert!(!bytes.is_empty());
+        image.recheck().unwrap();
+    }
+
+    #[test]
+    #[ignore = "explicit owned private root; source and managed ACL variations are synthetic"]
+    fn source_only_broad_directory_is_not_a_managed_grant() {
+        let root = allocate_owned_root("background-source-purpose");
+        let source_dir = root.path.join("source"); let managed = root.path.join("managed");
+        let diagnostic = root.path.join("diagnostic");
+        create_private_dir(&source_dir).unwrap(); create_private_dir(&managed).unwrap(); create_private_dir(&diagnostic).unwrap();
+        let source = source_dir.join("source.exe");
+        write_private(&source, b"MZ synthetic source; never executed").unwrap();
+        set_fixture_acl(&source_dir, "(A;;FA;;;AU)");
+        let image = std::sync::Arc::new(crate::windows_coordinator::process_identity::CurrentImage::synthetic(&source).unwrap());
+        let selected = background_inputs_selected(&managed, &managed, image.clone(), &diagnostic).unwrap();
+        selected.receive_context(None, true).unwrap();
+        let overlap = background_inputs_selected(&source_dir, &source_dir, image, &diagnostic).unwrap();
+        assert!(overlap.receive_context(None, true).is_err());
+    }
+
     fn labelled_rejections(inputs: &BackgroundInputs) -> Vec<serde_json::Value> {
         let mut rows = super::super::ancestor_context::take_rejection_provenance();
         for row in &mut rows {
@@ -656,7 +816,7 @@ mod tests {
                 categories.push("product");
             }
             if inputs
-                .source
+                .diagnostic_source
                 .iter()
                 .flat_map(|source| source.parent.files())
                 .any(matches)
@@ -1178,10 +1338,11 @@ mod tests {
         let diagnostic = root.path.join("diagnostic");
         write_private(&source, b"MZ owned managed source; never executed")?;
         create_private_dir(&diagnostic)?;
-        let inputs = background_inputs(
+        let image = std::sync::Arc::new(crate::windows_coordinator::process_identity::CurrentImage::synthetic(&source)?);
+        let inputs = background_inputs_selected(
             locations.managed_root(),
             locations.managed_directory(),
-            Some(&source),
+            image.clone(),
             &diagnostic,
         )?;
         let lease = background_lease(inputs, None)?;
@@ -1200,10 +1361,10 @@ mod tests {
         let later_root = root.path.join("AppearedProgramFiles");
         create_private_dir(&later_root)?;
         let later = BackgroundLocations::from_roots(later_root, legacy)?;
-        let inputs = background_inputs(
+        let inputs = background_inputs_selected(
             later.managed_root(),
             later.managed_directory(),
-            Some(&source),
+            image,
             &diagnostic,
         )?;
         create_private_dir(later.managed_directory())?;
@@ -1252,7 +1413,8 @@ mod tests {
         let capture_dir = root.path.join("private-log");
         create_private_dir(&capture_dir).unwrap();
         let mut product = data.join("AGUnlocker");
-        let inputs = background_inputs(&data, &product, Some(&source_path), &capture_dir).unwrap();
+        let image = std::sync::Arc::new(crate::windows_coordinator::process_identity::CurrentImage::synthetic(&source_path).unwrap());
+        let inputs = background_inputs_selected(&data, &product, image, &capture_dir).unwrap();
         let lease = background_lease(inputs, None).unwrap();
         create_background_directory(&lease, &product).unwrap();
         // A fixture beyond legacy MAX_PATH is an input, never a runtime cap.
@@ -1267,7 +1429,7 @@ mod tests {
             product = product.join("native-long-path-segment");
             create_background_directory(&lease, &product).unwrap();
         }
-        let source = checked_background_path(&lease, &source_path, PathKind::File).unwrap();
+        let source = lease.inputs.source.as_ref().unwrap().image.file();
         let current = make_file(
             &lease,
             &product.join("program.exe"),
@@ -1278,7 +1440,13 @@ mod tests {
         let old = read_path(&current.path, READ | DELETE).unwrap();
         let old_id = current.object.clone();
         TEST_NATIVE_CALLS.with(|count| count.set(0));
-        let receiving = background_replace_program(&lease, &current, &source)
+        let unselected = background_inputs(&data, &product, None, &capture_dir).unwrap();
+        let unselected_lease = background_lease(unselected, None).unwrap();
+        let denied_source = background_replace_program(&unselected_lease, &current).err().expect("unselected source must fail");
+        assert_eq!(denied_source.replace_result, None);
+        assert_eq!(TEST_NATIVE_CALLS.with(|count| count.get()), 0);
+        drop(unselected_lease);
+        let receiving = background_replace_program(&lease, &current)
             .unwrap_or_else(|failure| panic!("{failure}"));
         write_private(
             &root.path.join("replacement-success.json"),
@@ -1305,7 +1473,7 @@ mod tests {
         // A real incompatible reader produces a native failure, not NotCalled.
         let blocked = make_file(&lease, &product.join("blocked.exe"), b"MZ old held image");
         let reader = CheckedPath::open(&blocked.path, PathKind::File, PathPurpose::Review).unwrap();
-        let failure = background_replace_program(&lease, &blocked, &source)
+        let failure = background_replace_program(&lease, &blocked)
             .err()
             .expect("native sharing failure required");
         write_private(
@@ -1325,7 +1493,7 @@ mod tests {
             b"MZ old receiving fixture",
         );
         TEST_RECEIVING_FAILURE.with(|value| value.set(true));
-        let failure = background_replace_program(&lease, &after_call, &source)
+        let failure = background_replace_program(&lease, &after_call)
             .err()
             .expect("post-call receiving failure required");
         write_private(
@@ -1351,7 +1519,7 @@ mod tests {
         )
         .unwrap();
         let count = TEST_NATIVE_CALLS.with(|value| value.get());
-        let failure = background_replace_program(&lease, &denied, &source)
+        let failure = background_replace_program(&lease, &denied)
             .err()
             .expect("incompatible receiving must fail before call");
         write_private(
