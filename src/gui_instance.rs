@@ -77,6 +77,27 @@ pub(crate) struct GuiApplyContinuation {
     #[serde(with = "sha256_hex")]
     pub(crate) saved_settings_sha256: [u8; 32],
     pub(crate) targets: Vec<GuiTargetExpectation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) retirement_input: Option<GuiRetirementInputRef>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct GuiRetirementInputRef {
+    pub(crate) path: PathBuf,
+    pub(crate) native_id: NativeObjectId,
+    #[serde(serialize_with = "sha256_hex::serialize", deserialize_with = "lower_sha256")]
+    pub(crate) sha256: [u8; 32],
+}
+fn lower_sha256<'de, D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<[u8; 32], D::Error> {
+    use serde::Deserialize;
+    let value = String::deserialize(deserializer)?;
+    if value.len() != 64 || !value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+        return Err(serde::de::Error::custom("expected lowercase SHA-256"));
+    }
+    let mut bytes = [0; 32];
+    hex::decode_to_slice(value, &mut bytes).map_err(serde::de::Error::custom)?;
+    Ok(bytes)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -875,6 +896,20 @@ impl Rendezvous {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn retirement_descriptor_is_optional_closed_and_digest_bound() {
+        let mut action = serde_json::to_value(resume_action()).unwrap();
+        assert!(action.get("retirementInput").is_none());
+        action["retirementInput"] = serde_json::json!({"path":"C:\\synthetic\\selection.json",
+            "nativeId":{"volume":7,"file":[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1]}, "sha256":"a".repeat(64)});
+        assert!(serde_json::from_value::<GuiReplacementAction>(action.clone()).is_ok());
+        let mut bad = action.clone(); bad["retirementInput"]["sha256"] = "A".repeat(64).into();
+        assert!(serde_json::from_value::<GuiReplacementAction>(bad).is_err());
+        let mut bad = action.clone(); bad["retirementInput"].as_object_mut().unwrap().remove("nativeId");
+        assert!(serde_json::from_value::<GuiReplacementAction>(bad).is_err());
+        let mut bad = action; bad["retirementInput"]["extra"] = true.into();
+        assert!(serde_json::from_value::<GuiReplacementAction>(bad).is_err());
+    }
     use super::*;
     fn request() -> Vec<OsString> {
         [
@@ -932,6 +967,7 @@ mod tests {
         GuiReplacementAction::ResumeApply(GuiApplyContinuation {
             request_id: "synthetic correlation".into(),
             saved_settings_sha256: [3; 32],
+            retirement_input: None,
             targets: vec![
                 GuiTargetExpectation {
                     target: target(

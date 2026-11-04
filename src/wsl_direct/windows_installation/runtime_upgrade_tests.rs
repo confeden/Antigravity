@@ -207,7 +207,7 @@ fn vendor_update_qualified_package_stages_new_host_without_rules() {
     let source_hash = hash(&f.host.read_snapshot().unwrap());
     let mut window = Window;
     prepare_vendor_update(&prior_digest, f.bound(), None,
-        VendorRuntimeInput::QualifiedPackage { source: &f.host, expected_host_sha256: &source_hash, assets: &f.assets },
+        VendorRuntimeInput::QualifiedPackage { source: &f.host, expected_host_sha256: &source_hash, assets: &f.assets, selection: None },
         None, &AtomicBool::new(false), &mut window).unwrap().execute(None, &AtomicBool::new(false)).unwrap();
     let (current, _) = f.current();
     let received = current.runtime_deployment.received().unwrap();

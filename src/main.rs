@@ -750,6 +750,8 @@ fn main() {
     let mut gui_replacement = false;
     #[cfg(windows)]
     let mut replacement_action = None;
+    #[cfg(windows)]
+    let mut retirement_input = None;
     // Only the exact first role selects a host mode. In particular no argument
     // in an opaque language-server tail can enter console/GUI/service startup.
     #[cfg(windows)]
@@ -772,6 +774,23 @@ fn main() {
                 Err(_) => return,
             };
             gui_replacement = true;
+        }
+    }
+    #[cfg(windows)]
+    if !gui_replacement {
+        let args: Vec<_> = env::args_os().skip(1).collect();
+        let has_input = args.iter().any(|arg| arg == "--wsl-retirement-input" || arg == "--wsl-retirement-input-sha256");
+        if has_input {
+            if args.len() != 4 { return; }
+            let mut path = None;
+            let mut digest = None;
+            for pair in args.chunks_exact(2) {
+                if pair[0] == "--wsl-retirement-input" && path.is_none() { path = Some(std::path::PathBuf::from(&pair[1])); }
+                else if pair[0] == "--wsl-retirement-input-sha256" && digest.is_none() { digest = pair[1].to_str().map(str::to_owned); }
+                else { return; }
+            }
+            let (Some(path), Some(digest)) = (path, digest) else { return; };
+            retirement_input = match ops::retirement_input_ref(path, &digest) { Ok(value) => Some(value), Err(_) => return };
         }
     }
     if !gui_replacement {
@@ -849,6 +868,10 @@ fn main() {
     }
 
     let lifetime = std::sync::Arc::new(ops::GuiLifetime::default());
+    #[cfg(windows)]
+    if let Some(input) = retirement_input {
+        if lifetime.receive_retirement_input(input).is_err() { return; }
+    }
     #[cfg(windows)]
     if let Some(action) = replacement_action {
         if lifetime.receive_action(action).is_err() { return; }

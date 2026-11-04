@@ -392,8 +392,18 @@ pub struct GuiLifetime {
     replacement: Mutex<Option<crate::instances::GuiReplacementReady>>,
     #[cfg(windows)]
     action: Mutex<Option<crate::instances::GuiReplacementAction>>,
+    #[cfg(windows)]
+    retirement_input: Mutex<Option<RetirementInput>>,
 }
 impl GuiLifetime {
+    #[cfg(windows)]
+    pub(crate) fn receive_retirement_input(&self, descriptor: crate::instances::GuiRetirementInputRef) -> Result<(), String> {
+        let input = RetirementInput::receive(descriptor)?;
+        let mut slot = self.retirement_input.lock().map_err(|_| "retirement input lock poisoned")?;
+        if slot.is_some() { return Err("retirement input already received".into()); }
+        *slot = Some(input);
+        Ok(())
+    }
     pub(crate) fn hold_automatic_effects(&self, reason: String) -> Result<(), String> {
         *self.bootstrap_hold.lock().map_err(|_| "GUI startup hold receiving lock poisoned")? = Some(reason);
         Ok(())
@@ -1373,6 +1383,14 @@ fn worker_boot(rx: &Receiver<Cmd>, events: &Sender<Event>, wake: &Arc<Mutex<Box<
             Err(_) => return rejected_boot(rx, events, wake, lifetime, "Не удалось получить продолжение GUI.".into()),
         };
         if let Some(crate::instances::GuiReplacementAction::ResumeApply(intent)) = action {
+            if lifetime.retirement_input.lock().map_or(true, |value| value.is_some()) {
+                return rejected_boot(rx, events, wake, lifetime, "Конфликт входных данных продолжения.".into());
+            }
+            if let Some(descriptor) = intent.retirement_input.clone() {
+                if let Err(error) = lifetime.receive_retirement_input(descriptor) {
+                    return held_boot(rx, events, wake, lifetime, format!("Не удалось получить входные данные продолжения: {error}"));
+                }
+            }
             match receive_apply_continuation(&intent, &lifetime.abort_requested) {
                 Ok(plan) => return Some((plan.wanted.clone(), Startup::Resume(intent), Some(Cmd::ApplySettings))),
                 Err(error) => {
@@ -1380,6 +1398,9 @@ fn worker_boot(rx: &Receiver<Cmd>, events: &Sender<Event>, wake: &Arc<Mutex<Box<
                     return held_boot(rx, events, wake, lifetime, reason);
                 }
             }
+        }
+        if lifetime.retirement_input.lock().map_or(true, |value| value.is_some()) {
+            return Some((Settings::load(), Startup::Explicit, None));
         }
     }
     Some((Settings::load(), Startup::Ordinary, None))
@@ -2094,6 +2115,41 @@ impl ApplyInstallation {
 }
 
 #[cfg(windows)]
+struct RetirementInput {
+    descriptor: crate::instances::GuiRetirementInputRef,
+    file: crate::windows_coordinator::windows_installation::CheckedPath,
+    selection: crate::windows_coordinator::windows_installation::gateway_rules::GatewayRetirementSelectionV1,
+}
+#[cfg(windows)]
+impl RetirementInput {
+    fn receive(descriptor: crate::instances::GuiRetirementInputRef) -> Result<Self, String> {
+        use crate::windows_coordinator::windows_installation::{CheckedPath, PathKind, PathPurpose};
+        use sha2::{Digest, Sha256};
+        let file = CheckedPath::open(&descriptor.path, PathKind::File, PathPurpose::Source)?;
+        if file.native_id() != descriptor.native_id { return Err("retirement input native identity changed".into()); }
+        let bytes = file.read_snapshot()?;
+        if Sha256::digest(&bytes).as_slice() != descriptor.sha256 { return Err("retirement input digest differs".into()); }
+        let selection = serde_json::from_slice(&bytes).map_err(|e| format!("retirement input: {e}"))?;
+        Ok(Self { descriptor, file, selection })
+    }
+    fn recheck(&self) -> Result<(), String> {
+        self.file.recheck()?;
+        use sha2::{Digest, Sha256};
+        if Sha256::digest(self.file.read_snapshot()?).as_slice() != self.descriptor.sha256 { return Err("retirement input changed".into()); }
+        Ok(())
+    }
+}
+#[cfg(windows)]
+pub(crate) fn retirement_input_ref(path: std::path::PathBuf, digest: &str) -> Result<crate::instances::GuiRetirementInputRef, String> {
+    use crate::windows_coordinator::windows_installation::{CheckedPath, PathKind, PathPurpose};
+    if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) { return Err("retirement input digest must be lowercase SHA-256".into()); }
+    let mut sha256 = [0; 32]; hex::decode_to_slice(digest, &mut sha256).map_err(|e| e.to_string())?;
+    let file = CheckedPath::open(&path, PathKind::File, PathPurpose::Source)?;
+    let descriptor = crate::instances::GuiRetirementInputRef { path, native_id: file.native_id(), sha256 };
+    RetirementInput::receive(descriptor.clone())?;
+    Ok(descriptor)
+}
+#[cfg(windows)]
 pub(crate) struct AllTargetApplyPlan {
     wanted: Settings,
     saved_sha256: [u8; 32],
@@ -2101,10 +2157,18 @@ pub(crate) struct AllTargetApplyPlan {
     native: NativeApplyPlan,
     client_patch: Option<bool>,
     wsl: Option<crate::wsl_runtime::WslApplyPreparation>,
+    retirement_input: Option<RetirementInput>,
 }
 #[cfg(windows)]
 impl AllTargetApplyPlan {
     pub(crate) fn wanted(&self) -> &Settings { &self.wanted }
+    pub(crate) fn saved_sha256(&self) -> &[u8; 32] { &self.saved_sha256 }
+    pub(crate) fn retirement_for(&self, expected: &crate::windows_coordinator::windows_installation::VendorUpdateObservation) -> Result<Option<&crate::windows_coordinator::windows_installation::gateway_rules::GatewayRetirementSelectionV1>, String> {
+        match &self.retirement_input {
+            Some(input) if input.selection.slot_id == expected.slot_id => { input.recheck()?; input.selection.validate_binding(expected, &self.saved_sha256)?; Ok(Some(&input.selection)) },
+            _ => Ok(None),
+        }
+    }
     pub(crate) fn wsl(&self) -> Result<&crate::wsl_runtime::WslApplyPreparation, String> {
         self.wsl.as_ref().ok_or_else(|| "WSL requirements were not received".into())
     }
@@ -2116,6 +2180,7 @@ impl AllTargetApplyPlan {
         self.targets.iter().map(|target| target.expectation.clone()).collect()
     }
     fn recheck(&self) -> Result<(), String> {
+        if let Some(input) = &self.retirement_input { input.recheck()?; }
         if crate::settings::saved_intent_sha256(&self.wanted)? != self.saved_sha256 { return Err("saved Apply input changed".into()); }
         for target in &self.targets {
             target.recheck()?;
@@ -2126,7 +2191,7 @@ impl AllTargetApplyPlan {
     fn continuation(&self) -> Result<crate::instances::GuiApplyContinuation, String> {
         self.recheck()?;
         Ok(crate::instances::GuiApplyContinuation { request_id: crate::windows_coordinator::windows_installation::new_request_id()?,
-            saved_settings_sha256: self.saved_sha256, targets: self.expectations() })
+            saved_settings_sha256: self.saved_sha256, targets: self.expectations(), retirement_input: self.retirement_input.as_ref().map(|input| input.descriptor.clone()) })
     }
 }
 
@@ -2161,10 +2226,12 @@ fn apply_target_key(target: &crate::instances::GuiTargetExpectation) -> (u8, u64
 }
 
 #[cfg(windows)]
-pub(crate) fn receive_all_target_apply_plan(wanted: Settings, cancel: &AtomicBool) -> Result<AllTargetApplyPlan, ApplyPlanError> {
+pub(crate) fn receive_all_target_apply_plan(wanted: Settings, cancel: &AtomicBool,
+    descriptor: Option<crate::instances::GuiRetirementInputRef>) -> Result<AllTargetApplyPlan, ApplyPlanError> {
     use crate::{instances::{GuiCurrentExpectation, GuiReplacementTarget, GuiTargetExpectation, GuiTargetKind},
         windows_coordinator::{self as coordinator, windows_installation as owner}};
     let saved_sha256 = crate::settings::saved_intent_sha256(&wanted)?;
+    let retirement_input = descriptor.map(RetirementInput::receive).transpose()?;
     let mut roots = crate::find_all_installs_checked(cancel)?;
     for root in &wanted.manual_paths { if !roots.contains(root) { roots.push(root.clone()); } }
     let mut targets: Vec<ApplyInstallation> = Vec::new();
@@ -2202,12 +2269,25 @@ pub(crate) fn receive_all_target_apply_plan(wanted: Settings, cancel: &AtomicBoo
         } else { targets.push(ApplyInstallation { kind: layout.kind, root, anchor, expectation }); }
     }
     targets.sort_by_key(|target| apply_target_key(&target.expectation));
+    if let Some(input) = &retirement_input {
+        let count = targets.iter().filter(|target| matches!(&target.expectation.current,
+            GuiCurrentExpectation::VendorUpdate { slot_id, prior_current_sha256, new_binding_sha256, .. }
+            if target.kind == crate::InstallationKind::Desktop && slot_id == &input.selection.slot_id
+                && hex::encode(prior_current_sha256) == input.selection.prior_current_sha256
+                && hex::encode(new_binding_sha256) == input.selection.new_binding_sha256)).count();
+        if count != 1 || input.selection.saved_settings_sha256 != hex::encode(saved_sha256) || wanted.wsl.is_none() {
+            return Err("retirement input does not bind exactly one selected vendor update".to_owned().into());
+        }
+    }
     let Some(mut native) = inspect_native_apply(&wanted, cancel)? else { return Err(ApplyPlanError::Cancelled); };
     let client_patch = if wanted.client_patch && !all_patched { Some(true) }
         else if !wanted.client_patch && any_patched { Some(false) } else { None };
     native.revert_services = client_patch == Some(false) && native.services_present;
-    let mut plan = AllTargetApplyPlan { wanted, saved_sha256, targets, native, client_patch, wsl: None };
+    let mut plan = AllTargetApplyPlan { wanted, saved_sha256, targets, native, client_patch, wsl: None, retirement_input };
     plan.wsl = Some(crate::wsl_runtime::inspect_selection(&plan, cancel)?);
+    if plan.retirement_input.is_some() && !matches!(&plan.wsl, Some(crate::wsl_runtime::WslApplyPreparation::Selected(_))) {
+        return Err("retirement input requires a selected WSL vendor update".to_owned().into());
+    }
     plan.recheck()?;
     Ok(plan)
 }
@@ -2218,7 +2298,7 @@ fn receive_apply_continuation(intent: &crate::instances::GuiApplyContinuation, c
     use crate::{instances::{GuiCurrentExpectation, GuiTargetKind}, windows_coordinator::windows_installation as owner};
     owner::validate_request_id(&intent.request_id)?;
     let wanted = crate::settings::receive_saved_intent(&intent.saved_settings_sha256)?;
-    let plan = receive_all_target_apply_plan(wanted, cancel).map_err(|error| error.to_string())?;
+    let plan = receive_all_target_apply_plan(wanted, cancel, intent.retirement_input.clone()).map_err(|error| error.to_string())?;
     let mut expected = intent.targets.clone();
     expected.sort_by_key(apply_target_key);
     if expected.windows(2).any(|pair| apply_target_key(&pair[0]) == apply_target_key(&pair[1])) {
@@ -2387,7 +2467,8 @@ fn apply_acknowledged(ctx: &mut Ctx, wanted: Settings, cancellation: &AtomicBool
                     let mut attempted = std::collections::BTreeSet::new();
                     loop {
                         if cancellation.load(Ordering::SeqCst) { break Err("Применение отменено до следующих действий.".into()); }
-                        match receive_all_target_apply_plan(wanted.clone(), cancellation) {
+                        let descriptor = ctx.lifetime.retirement_input.lock().map_err(|_| "retirement input lock poisoned")?.as_ref().map(|input| input.descriptor.clone());
+                        match receive_all_target_apply_plan(wanted.clone(), cancellation, descriptor) {
                             Ok(plan) => break Ok(plan),
                             Err(ApplyPlanError::GatewayRecoveryRequired(prerequisite)) => {
                                 if let Err(error) = receive_gateway_prerequisite_once(&mut attempted, &prerequisite.observation, cancellation) { break Err(error); }
@@ -2422,7 +2503,8 @@ fn apply_acknowledged(ctx: &mut Ctx, wanted: Settings, cancellation: &AtomicBool
             if plan.has_vendor_update() {
                 plan.recheck()?;
                 let vendor_results = crate::wsl_runtime::apply_vendor_prerequisites(&plan, cancellation)?;
-                let next = receive_all_target_apply_plan(wanted.clone(), cancellation).map_err(|error| error.to_string())?;
+                *ctx.lifetime.retirement_input.lock().map_err(|_| "retirement input lock poisoned")? = None;
+                let next = receive_all_target_apply_plan(wanted.clone(), cancellation, None).map_err(|error| error.to_string())?;
                 receive_settled_vendor_plan(&plan, &next, &vendor_results)?;
                 if (next.native.requires_elevation() && !is_admin()) || next.wsl()?.requires_elevation() {
                     return Err("UpdatePending: Apply requirements changed after vendor update".into());

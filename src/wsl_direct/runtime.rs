@@ -225,6 +225,7 @@ pub(crate) fn apply_vendor_prerequisites(plan: &crate::ops::AllTargetApplyPlan, 
             };
             let received = apply_vendor_update(bound, &expected, owner::VendorRuntimeInput::QualifiedPackage {
                 source: &selected.source, expected_host_sha256: &selected.source_sha256, assets: &selected.assets,
+                selection: plan.retirement_for(&expected)?,
             }, plan.wanted(), false, cancellation).map_err(|error| error.to_string())?;
             if received.slot_id != expected.slot_id { return Err("vendor result slot differs".into()); }
             Ok((received.slot_id, received.current_sha256))
@@ -280,7 +281,8 @@ pub(crate) fn inspect_selection(plan: &crate::ops::AllTargetApplyPlan, cancellat
         let vendor = matches!(&observation, owner::ApplyCurrentObservation::VendorReplacement(_));
         let host = match observation {
             owner::ApplyCurrentObservation::VendorReplacement(ref expected) =>
-                GatewayHostInput::vendor_prerequisite(&bound, &source, &source_sha256, expected),
+                GatewayHostInput::vendor_prerequisite(&bound, &source, &source_sha256, expected,
+                    plan.retirement_for(expected)?, plan.saved_sha256()),
             _ => GatewayHostInput::receive(&bound, &source, &source_sha256),
         }.map_err(|error| error.to_string())?;
         let wanted = match active_profiles {

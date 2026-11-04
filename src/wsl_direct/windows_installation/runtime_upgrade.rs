@@ -257,6 +257,7 @@ fn receive_vendor_intent(slot: &CheckedPath, value: &EvidenceRef) -> Result<Vend
                 return Err("RecoveryRequired: vendor qualified package binding differs".into());
             }
             gateway_rules::validate_vendor_retirement(slot, old, retirement)?;
+            gateway_rules::validate_vendor_selection_context(retirement, &intent.slot_id, &intent.expected_current_digest, &intent.new_binding)?;
             let host = new.receive_host(slot)?;
             PackageAssets::receive(&host, Some(helper_sha256))?.recheck()?;
         }
@@ -1173,7 +1174,7 @@ pub(crate) struct PreparedVendorUpdate<'a, W: MaintenanceWindow> {
 
 pub(crate) enum VendorRuntimeInput<'a> {
     ReuseReceivedRuntime { source: &'a CheckedPath, source_sha256: &'a str },
-    QualifiedPackage { source: &'a CheckedPath, expected_host_sha256: &'a str, assets: &'a PackageAssets },
+    QualifiedPackage { source: &'a CheckedPath, expected_host_sha256: &'a str, assets: &'a PackageAssets, selection: Option<&'a gateway_rules::GatewayRetirementSelectionV1> },
 }
 
 fn check_reuse_engine(input: &VendorRuntimeInput<'_>, host: &CheckedPath, deployment: &RuntimeDeployment) -> Result<()> {
@@ -1228,7 +1229,7 @@ pub(crate) fn prepare_vendor_update<'a, W: MaintenanceWindow>(
     }
     let retirement = match &runtime_input {
         VendorRuntimeInput::ReuseReceivedRuntime { .. } => None,
-        VendorRuntimeInput::QualifiedPackage { source, expected_host_sha256, assets } => {
+        VendorRuntimeInput::QualifiedPackage { source, expected_host_sha256, assets, selection } => {
             source.recheck()?;
             assets.recheck()?;
             let expected_helper = source.path.parent().ok_or("runtime package parent")?.join("ag_wsl_launch");
@@ -1237,7 +1238,9 @@ pub(crate) fn prepare_vendor_update<'a, W: MaintenanceWindow>(
                 return Err("PackageIncomplete: selected host/assets binding differs".into());
             }
             PackageAssets::receive(source, Some(assets.helper_digest()))?.recheck()?;
-            Some(gateway_rules::plan_vendor_retirement(&authority, runner, cancel)?)
+            let plan = gateway_rules::plan_vendor_retirement(&authority, runner, *selection, cancel)?;
+            gateway_rules::validate_vendor_selection_context(&plan, &authority.current.slot_id, expected_prior_current_digest, &new_binding)?;
+            Some(plan)
         }
     };
     let workspace = match chosen {
@@ -1269,7 +1272,7 @@ impl<W: MaintenanceWindow> PreparedVendorUpdate<'_, W> {
         let mut staged_host = None;
         let runtime_input = match &self.runtime_input {
             VendorRuntimeInput::ReuseReceivedRuntime { .. } => VendorRuntimeRecord::ReuseReceivedRuntime,
-            VendorRuntimeInput::QualifiedPackage { source, expected_host_sha256, assets } => {
+            VendorRuntimeInput::QualifiedPackage { source, expected_host_sha256, assets, .. } => {
                 source.recheck()?;
                 assets.recheck()?;
                 let bytes = source.read_snapshot()?;
@@ -1922,7 +1925,7 @@ pub(super) fn runtime_installed(bound: &BoundInstallation) -> Result<bool> {
 
 #[cfg(test)]
 thread_local! {
-    static TEST_STOP_AFTER_RECEIPT: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+    pub(super) static TEST_STOP_AFTER_RECEIPT: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
     static TEST_LOSE_RECEIPT: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
 }
 

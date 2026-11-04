@@ -348,12 +348,13 @@ fn effective_policy(
 fn request_scope(request: &GatewayRuleRequest) -> &GatewayRuleScope {
     match request {
         GatewayRuleRequest::Inspect { scope, .. }
+        | GatewayRuleRequest::InspectOwned { scope, .. }
         | GatewayRuleRequest::Create { scope, .. }
         | GatewayRuleRequest::Remove { scope, .. } => scope,
     }
 }
 fn is_mutation(request: &GatewayRuleRequest) -> bool {
-    !matches!(request, GatewayRuleRequest::Inspect { .. })
+    !matches!(request, GatewayRuleRequest::Inspect { .. } | GatewayRuleRequest::InspectOwned { .. })
 }
 
 fn child_identity(child: &Child) -> Result<ProcessIdentity> {
@@ -570,6 +571,7 @@ impl NativeAttempt {
                     let mut policy = effective_policy(request_scope(request), evidence);
                     let selected_name = match request {
                         GatewayRuleRequest::Inspect { name, .. } => name.as_deref(),
+                        GatewayRuleRequest::InspectOwned { name, .. } => Some(name.as_str()),
                         GatewayRuleRequest::Create { name, .. } => Some(name.as_str()),
                         GatewayRuleRequest::Remove { persistent, .. } => {
                             Some(persistent.name.as_str())
@@ -618,8 +620,9 @@ impl NativeAttempt {
                         self.control.take();
                     }
                     self.received.policy_observations.push(policy);
-                } else if report.stage == GatewayNativeStage::ReadyToInvoke
-                    || (report.stage == GatewayNativeStage::Done && report.inspection.is_some())
+                } else if !matches!(request, GatewayRuleRequest::InspectOwned { .. } | GatewayRuleRequest::Remove { .. })
+                    && (report.stage == GatewayNativeStage::ReadyToInvoke
+                    || (report.stage == GatewayNativeStage::Done && report.inspection.is_some()))
                 {
                     self.protocol_failure(
                         "required native effective-policy evidence is absent".into(),
@@ -1060,6 +1063,18 @@ function Environment($name) {
    policy=[ordered]@{state='unavailable';detail='native policy facts awaiting caller receiving'};persistent=$persistent;active=$operative;activeEnforcement=@($activeRows.enforcement)}
  }
 }
+function OwnedEnvironment($name) {
+ if([string]::IsNullOrEmpty([string]$name)){throw 'NativeOwnedNameMissing'}
+ $fw=New-Object -ComObject HNetCfg.FwPolicy2
+ $active=[uint32]$fw.CurrentProfileTypes
+ $unsupported=[Collections.Generic.List[object]]::new()
+ $persistentRows=Rules 'PersistentStore' $name $unsupported;$activeRows=Rules 'ActiveStore' $name $unsupported
+ if($unsupported.Count){throw 'NativeOwnedRuleUnsupportedConditions'}
+ $principal=[Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())
+ [ordered]@{administrator=$principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator);activeProfiles=$active
+  namespace=$null;policy=[ordered]@{state='unavailable';detail='historical custody inspection; no live transport admission'}
+  persistent=@($persistentRows.rules);active=@($activeRows.rules)}
+}
 function SamePreimage($actual,$expected) {
  # This is native preimage equality, using received keys rather than a second
  # scope predicate or an assumption about cross-language JSON member order.
@@ -1071,7 +1086,7 @@ function SamePreimage($actual,$expected) {
 try {
  $line=[Console]::ReadLine();if($null -eq $line){[Console]::Error.WriteLine('NativeInputNotReceived');exit 3}
  $x=$line|ConvertFrom-Json -ErrorAction Stop
- if($x.version -ne 1 -or [string]::IsNullOrEmpty([string]$x.attemptId) -or [string]$x.request.action -notin @('inspect','create','remove')){throw 'NativeInputShapeInvalid'}
+  if($x.version -ne 1 -or [string]::IsNullOrEmpty([string]$x.attemptId) -or [string]$x.request.action -notin @('inspect','inspectOwned','create','remove')){throw 'NativeInputShapeInvalid'}
  if($x.request.action -eq 'create' -and [string](Required $x.parameters 'package') -cne 'Any'){throw 'NativePackageRestrictionUnsupported'}
  if([Console]::ReadLine() -cne ('GO '+[string]$x.attemptId)){Report 'done' $null;exit 0}
  foreach($module in @('NetSecurity','NetAdapter','NetTCPIP')){Import-Module -Name (Join-Path $PSHOME ('Modules\'+$module+'\'+$module+'.psd1')) -ErrorAction Stop}
@@ -1080,10 +1095,16 @@ try {
   $environment=Environment $x.request.name;$inspection=$environment.inspection;$policyEvidence=$environment.policyEvidence
   $action=[ordered]@{state='returnedSuccess'};Report 'done' $null;exit 0
  }
+  if($x.request.action -eq 'inspectOwned') {
+   $action=[ordered]@{state='unknown'};Report 'progress' $null
+   $inspection=OwnedEnvironment $x.request.name
+   $action=[ordered]@{state='returnedSuccess'};Report 'done' $null;exit 0
+  }
  $name=if($x.request.action -eq 'create'){[string]$x.request.name}else{[string]$x.request.persistent.name}
- $prepared=Environment $name;$policyEvidence=$prepared.policyEvidence
- if(!$prepared.inspection.administrator){Report 'done' ([ordered]@{kind=[ordered]@{state='permission'};message='native administrator capability unavailable before invocation'});exit 0}
- if($x.request.action -eq 'create' -and (@($prepared.inspection.persistent).Count -or @($prepared.inspection.active).Count)){throw 'IntendedNativeRuleNameOccupied'}
+  if($x.request.action -eq 'create'){$prepared=Environment $name;$policyEvidence=$prepared.policyEvidence;$preparedInspection=$prepared.inspection}
+  else {$preparedInspection=OwnedEnvironment $name}
+  if(!$preparedInspection.administrator){Report 'done' ([ordered]@{kind=[ordered]@{state='permission'};message='native administrator capability unavailable before invocation'});exit 0}
+  if($x.request.action -eq 'create' -and (@($preparedInspection.persistent).Count -or @($preparedInspection.active).Count)){throw 'IntendedNativeRuleNameOccupied'}
  Report 'readyToInvoke' $null
  if([Console]::ReadLine() -cne ('CALL '+[string]$x.attemptId)){Report 'done' $null;exit 0}
  if($x.request.action -eq 'create') {
@@ -1213,6 +1234,108 @@ $results|ConvertTo-Json -Depth 8 -Compress
         assert_eq!(report.stage, GatewayNativeStage::Done);
         assert_eq!(report.action, GatewayActionReport::NotInvoked);
         assert!(report.diagnostic.unwrap().message.contains("NativePackageRestrictionUnsupported"));
+    }
+
+    // Execute the production script and its actual dispatch/control branches.
+    // Only operating-system facts and native effects are replaced. In particular,
+    // Environment, OwnedEnvironment, Rules, NativeRule and SamePreimage remain
+    // the production functions, and no real firewall command can be reached.
+    #[test]
+    #[ignore = "Root-owned production-script test with synthetic Windows facts; no real firewall mutation"]
+    fn stale_interface_owned_inspection_and_exact_removal_use_production_script() {
+        const FACTS: &str = r#"
+function Import-Module { [CmdletBinding()] param($Name) }
+function Get-NetAdapter { [CmdletBinding()] param([switch]$IncludeHidden) }
+function Get-NetIPAddress { [CmdletBinding()] param($AddressFamily,$InterfaceIndex) throw 'UnexpectedOldAddressQuery' }
+function New-Object { [CmdletBinding()] param($ComObject) if($ComObject -cne 'HNetCfg.FwPolicy2'){throw 'UnexpectedComObject'}; [pscustomobject]@{CurrentProfileTypes=2} }
+function Get-NetFirewallRule {
+ [CmdletBinding()] param($PolicyStore,$Enabled,$Direction,$Action,$AssociatedNetFirewallApplicationFilter)
+ if($null -ne $Enabled){return}
+ $r=[pscustomobject]@{Name='synthetic-owned';InstanceID='synthetic-instance';PolicyStoreSource='synthetic-store';PolicyStoreSourceType='synthetic-source';Enabled='True';Direction='Inbound';Action='Allow';Profile=6;EdgeTraversalPolicy='Block'}
+ if($x.request.action -eq 'remove' -and $x.request.persistent.name -ceq 'synthetic-ambiguous'){$r.Name='synthetic-ambiguous';$r;$r;return};$r
+}
+function Get-NetFirewallApplicationFilter { [CmdletBinding()] param($AssociatedNetFirewallRule,$PolicyStore); [pscustomobject]@{Program=[string]$x.parameters.program;Package='Any';CimInstanceProperties=@{Package=[pscustomobject]@{CimType='String';Value='Any'}}} }
+function Get-NetFirewallPortFilter { [CmdletBinding()] param($AssociatedNetFirewallRule,$PolicyStore); [pscustomobject]@{Protocol='TCP';LocalPort=@('Any');RemotePort=@('Any')} }
+function Get-NetFirewallAddressFilter { [CmdletBinding()] param($AssociatedNetFirewallRule,$PolicyStore); [pscustomobject]@{LocalAddress=@($x.parameters.localAddresses);RemoteAddress=@($x.parameters.remoteAddresses)} }
+function Get-NetFirewallInterfaceFilter { [CmdletBinding()] param($AssociatedNetFirewallRule,$PolicyStore); [pscustomobject]@{InterfaceAlias=@($x.parameters.interfaceAliases)} }
+function Get-NetFirewallInterfaceTypeFilter { [CmdletBinding()] param($AssociatedNetFirewallRule,$PolicyStore); [pscustomobject]@{InterfaceType=@('Any')} }
+function Get-NetFirewallServiceFilter { [CmdletBinding()] param($AssociatedNetFirewallRule,$PolicyStore); [pscustomobject]@{Service='Any'} }
+function Get-NetFirewallSecurityFilter { [CmdletBinding()] param($AssociatedNetFirewallRule,$PolicyStore); [pscustomobject]@{LocalUser='Any';RemoteUser='Any';RemoteMachine='Any';Authentication='NotRequired';Encryption='NotRequired';OverrideBlockRules=$false} }
+function Remove-NetFirewallRule { [CmdletBinding(SupportsShouldProcess)] param($InputObject); [Console]::Error.WriteLine('SYNTHETIC_REMOVAL') }
+function New-NetFirewallRule { [CmdletBinding()] param(); throw 'UnexpectedCreate' }
+"#;
+        let principal = "$principal=[Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())";
+        let fake_principal = "$principal=[pscustomobject]@{}; $principal | Add-Member ScriptMethod IsInRole { param($role) $true }";
+        assert_eq!(NATIVE_SCRIPT.matches(principal).count(), 2);
+        let script = NATIVE_SCRIPT.replace(principal, fake_principal)
+            .replacen("try {\n $line=[Console]::ReadLine()", &format!("{FACTS}\ntry {{\n $line=[Console]::ReadLine()"), 1);
+        assert!(script.contains(FACTS));
+        let scope = scope();
+        let parameters = scope.creation_parameters();
+        let mut wire = serde_json::to_value(&parameters).unwrap();
+        wire["name"] = "synthetic-owned".into();
+        wire["instanceId"] = "synthetic-instance".into();
+        wire["policyStoreSource"] = "synthetic-store".into();
+        wire["policyStoreSourceType"] = "synthetic-source".into();
+        let rule: GatewayNativeRule = serde_json::from_value(wire).unwrap();
+        let program = super::super::system_powershell_program().unwrap();
+        let run = |request: GatewayRuleRequest| {
+            let input = NativeInput { version: 1, attempt_id: "historical-fixture", request: &request, parameters: scope.creation_parameters() };
+            let mut child = Command::new(program.as_path()).args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", &script])
+                .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+            let mut bytes = serde_json::to_vec(&input).unwrap();
+            bytes.extend_from_slice(b"\nGO historical-fixture\nCALL historical-fixture\n");
+            child.stdin.take().unwrap().write_all(&bytes).unwrap();
+            let output = child.wait_with_output().unwrap();
+            let reports: Vec<GatewayNativeReport> = output.stdout.split(|b| *b == b'\n')
+                .filter_map(|line| line.strip_prefix(REPORT_PREFIX))
+                .map(|line| serde_json::from_slice(line).unwrap()).collect();
+            (output, reports)
+        };
+        let (output, reports) = run(GatewayRuleRequest::InspectOwned { scope: scope.clone(), name: "synthetic-owned".into() });
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let inspection = reports.last().unwrap().inspection.as_ref().unwrap();
+        assert_eq!(inspection.namespace, None);
+        assert_eq!(inspection.persistent, [rule.clone()]);
+        assert_eq!(inspection.active, [rule.clone()]);
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("SYNTHETIC_REMOVAL"));
+        let (output, reports) = run(GatewayRuleRequest::InspectOwned { scope: scope.clone(), name: "synthetic-absent".into() });
+        assert!(output.status.success());
+        let inspection = reports.last().unwrap().inspection.as_ref().unwrap();
+        assert!(inspection.persistent.is_empty() && inspection.active.is_empty());
+        for request in [GatewayRuleRequest::Inspect { scope: scope.clone(), name: Some("synthetic-owned".into()) },
+                        GatewayRuleRequest::Create { scope: scope.clone(), name: "synthetic-owned".into() }] {
+            let (output, reports) = run(request);
+            assert!(!output.status.success());
+            assert!(String::from_utf8_lossy(&output.stderr).contains("FreshGatewayInterfaceChanged"));
+            assert!(reports.iter().all(|r| r.stage != GatewayNativeStage::ReadyToInvoke));
+            assert!(!String::from_utf8_lossy(&output.stderr).contains("SYNTHETIC_REMOVAL"));
+        }
+        let mut variants = Vec::new();
+        let mut changed = rule.clone(); changed.instance_id = Some("changed-instance".into()); variants.push((changed, rule.clone()));
+        let mut changed = rule.clone(); changed.policy_store_source = Some("changed-source".into()); variants.push((rule.clone(), changed));
+        let mut changed = rule.clone(); changed.program = "C:\\synthetic-other.exe".into(); variants.push((changed, rule.clone()));
+        let mut changed = rule.clone(); changed.remote_addresses = vec!["192.0.2.99".into()]; variants.push((rule.clone(), changed));
+        for (persistent, active) in variants {
+            let (output, _) = run(GatewayRuleRequest::Remove { scope: scope.clone(), persistent, active });
+            assert!(!output.status.success());
+            assert!(String::from_utf8_lossy(&output.stderr).contains("NativeRemovalPreimageChangedPreserved"));
+            assert!(!String::from_utf8_lossy(&output.stderr).contains("SYNTHETIC_REMOVAL"));
+        }
+        let mut missing = rule.clone(); missing.name = "synthetic-absent".into();
+        let (output, _) = run(GatewayRuleRequest::Remove { scope: scope.clone(), persistent: missing.clone(), active: missing });
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("NativeRemovalPreimageMissingOrAmbiguous"));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("SYNTHETIC_REMOVAL"));
+        let mut ambiguous = rule.clone(); ambiguous.name = "synthetic-ambiguous".into();
+        let (output, _) = run(GatewayRuleRequest::Remove { scope: scope.clone(), persistent: ambiguous.clone(), active: ambiguous });
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("NativeRemovalPreimageMissingOrAmbiguous"));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("SYNTHETIC_REMOVAL"));
+        let (output, reports) = run(GatewayRuleRequest::Remove { scope: scope.clone(), persistent: rule.clone(), active: rule });
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert_eq!(String::from_utf8_lossy(&output.stderr).matches("SYNTHETIC_REMOVAL").count(), 1);
+        assert_eq!(reports.last().unwrap().action, GatewayActionReport::ReturnedSuccess);
     }
 
     #[test]
@@ -1404,7 +1527,7 @@ $null=[Console]::ReadLine();$null=[Console]::ReadLine()
         let GatewayRuleRequest::Inspect { scope, name } = &request else {
             unreachable!()
         };
-        assert_eq!(received.namespace, scope.namespace);
+        assert_eq!(received.namespace.as_ref(), Some(&scope.namespace));
         assert_eq!(received.persistent[0].name, name.as_ref().unwrap().as_str());
         assert_eq!(received.persistent[0].program, scope.host.path);
         assert_eq!(
