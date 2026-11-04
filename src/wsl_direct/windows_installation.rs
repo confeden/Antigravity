@@ -255,12 +255,15 @@ impl CheckedPath {
     pub(crate) fn security_digest(&self) -> Result<String> {
         Ok(hash(&security(self.file.as_raw_handle(), 1 | 4)?))
     }
-    pub(crate) fn read_snapshot(&self) -> Result<Vec<u8>> {
+    pub(crate) fn read_checked_snapshot(&self) -> Result<SourceSnapshot> {
         let mut file = self
             .file
             .try_clone()
             .map_err(|e| io("clone readonly input", e))?;
-        Ok(read_checked_purpose(&mut file, &self.path, self.purpose)?.bytes)
+        read_checked_purpose(&mut file, &self.path, self.purpose)
+    }
+    pub(crate) fn read_snapshot(&self) -> Result<Vec<u8>> {
+        Ok(self.read_checked_snapshot()?.bytes)
     }
     pub(crate) fn read(&mut self) -> Result<Vec<u8>> {
         Ok(read_checked_purpose(&mut self.file, &self.path, self.purpose)?.bytes)

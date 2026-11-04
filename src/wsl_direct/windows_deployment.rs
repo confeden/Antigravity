@@ -141,7 +141,7 @@ impl DeploymentVerifier for Registration {
             || selected != self.selected
             || self.marker.security_digest()? != self.marker_sd
             || self.binary.security_digest()? != self.binary_sd
-            || hash(&read(&self.binary)?) != self.binary_digest
+            || self.binary.read_checked_snapshot()?.digest() != self.binary_digest
         {
             return Err(
                 "UnsupportedActorContext: registration/binary/native security binding changed"
@@ -175,8 +175,8 @@ fn registration(marker_path: &Path, binary_path: &Path) -> Result<Registration> 
     owner::WindowsExecutablePath::parse(binary_path.as_os_str())?;
     let binary = CheckedPath::open(binary_path, PathKind::File, PathPurpose::Executable)?;
     let (names, selected) = marker(&read(&marker_pin)?)?;
-    let binary_bytes = read(&binary)?;
-    if !registration_interface(&binary_bytes) {
+    let binary_snapshot = binary.read_checked_snapshot()?;
+    if !registration_interface(binary_snapshot.bytes()) {
         return Err(
             "UnsupportedActorContext: signed provider registration interface association absent"
                 .into(),
@@ -186,7 +186,7 @@ fn registration(marker_path: &Path, binary_path: &Path) -> Result<Registration> 
     if signer.organization != PUBLISHER || signer.simple_name != PUBLISHER {
         return Err("UnsupportedActorContext: unexpected signed provider identity".into());
     }
-    let binary_digest = hash(&binary_bytes);
+    let binary_digest = binary_snapshot.digest().to_owned();
     let marker_sd = marker_pin.security_digest()?;
     let binary_sd = binary.security_digest()?;
     Ok(Registration {

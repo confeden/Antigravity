@@ -1108,11 +1108,15 @@ impl std::fmt::Debug for FileIdentity {
     }
 }
 #[derive(Debug, Clone)]
-pub(super) struct SourceSnapshot {
-    pub target: PathBuf,
-    pub bytes: Vec<u8>,
-    pub digest: String,
-    pub identity: FileIdentity,
+pub(crate) struct SourceSnapshot {
+    pub(super) target: PathBuf,
+    pub(super) bytes: Vec<u8>,
+    pub(super) digest: String,
+    pub(super) identity: FileIdentity,
+}
+impl SourceSnapshot {
+    pub(crate) fn bytes(&self) -> &[u8] { &self.bytes }
+    pub(crate) fn digest(&self) -> &str { &self.digest }
 }
 #[derive(Debug, Clone)]
 pub(super) struct InstallPaths {
@@ -1520,6 +1524,18 @@ mod filesystem_path_tests {
         let checked = CheckedPath::open(&file, PathKind::File, PathPurpose::Review).unwrap();
         private(&checked.file).unwrap();
         assert_eq!(checked.read_snapshot().unwrap(), b"owned long native path readback");
+        let snapshot = checked.read_checked_snapshot().unwrap();
+        assert_eq!(snapshot.bytes(), b"owned long native path readback");
+        assert_eq!(snapshot.digest(), format!("{:x}", Sha256::digest(snapshot.bytes())));
+        assert_ne!(snapshot.digest(), "");
+        let empty = directory.join("empty.bin");
+        write_private(&empty, b"").unwrap();
+        let empty_pin = CheckedPath::open(&empty, PathKind::File, PathPurpose::Review).unwrap();
+        let empty_snapshot = empty_pin.read_checked_snapshot().unwrap();
+        assert!(empty_snapshot.bytes().is_empty());
+        assert_eq!(empty_snapshot.digest(), format!("{:x}", Sha256::digest(b"")));
+        assert_ne!(empty_snapshot.digest(), "");
+        assert!(CheckedPath::open(&directory.join("missing.bin"), PathKind::File, PathPurpose::Review).is_err());
         assert!(create_private_dir(&directory).is_err());
         assert!(create_owned_file(&file).is_err());
     }
