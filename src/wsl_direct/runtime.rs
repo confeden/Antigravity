@@ -164,7 +164,11 @@ pub(crate) fn automatic_vendor_update(root: &std::path::Path, settings: &Setting
     if let Some(context) = coordinator::receive_saved_context(&bound)? { bound.attach_ancestor_context(context)?; }
     match owner::observe_apply_current(&bound)? {
         owner::ApplyCurrentObservation::VendorReplacement(expected) => {
-            apply_vendor_update(bound, &expected, owner::VendorRuntimeInput::ReuseReceivedRuntime,
+            use sha2::{Digest, Sha256};
+            let source = owner::CheckedPath::open(&std::env::current_exe().map_err(|e| format!("runtime image: {e}"))?,
+                owner::PathKind::File, owner::PathPurpose::Executable)?;
+            let source_sha256 = hex::encode(Sha256::digest(source.read_snapshot()?));
+            apply_vendor_update(bound, &expected, owner::VendorRuntimeInput::ReuseReceivedRuntime { source: &source, source_sha256: &source_sha256 },
                 settings, true, cancellation).map_err(|error| error.to_string())?;
             Ok(true)
         }

@@ -1172,8 +1172,21 @@ pub(crate) struct PreparedVendorUpdate<'a, W: MaintenanceWindow> {
 }
 
 pub(crate) enum VendorRuntimeInput<'a> {
-    ReuseReceivedRuntime,
+    ReuseReceivedRuntime { source: &'a CheckedPath, source_sha256: &'a str },
     QualifiedPackage { source: &'a CheckedPath, expected_host_sha256: &'a str, assets: &'a PackageAssets },
+}
+
+fn check_reuse_engine(input: &VendorRuntimeInput<'_>, host: &CheckedPath, deployment: &RuntimeDeployment) -> Result<()> {
+    if let VendorRuntimeInput::ReuseReceivedRuntime { source, source_sha256 } = input {
+        source.recheck()?;
+        host.recheck()?;
+        if hash(&source.read_snapshot()?) != *source_sha256
+            || hash(&host.read_snapshot()?) != deployment.host.sha256
+            || *source_sha256 != deployment.host.sha256 {
+            return Err("UpdatePending: runtime engine differs; use ordinary Apply with a qualified package".into());
+        }
+    }
+    Ok(())
 }
 
 /// Actual owner readback after canonical publication, not a future promise.
@@ -1199,6 +1212,7 @@ pub(crate) fn prepare_vendor_update<'a, W: MaintenanceWindow>(
     deployment.receive_receipt(&authority.slot)?;
     let host = deployment.receive_host(&authority.slot)?;
     let _gate_host = pin_deployment_host(&authority, &deployment)?;
+    check_reuse_engine(&runtime_input, &host, &deployment)?;
     bound.revalidate_context()?;
     bound.exe.recheck()?;
     bound.recheck_archive()?;
@@ -1213,7 +1227,7 @@ pub(crate) fn prepare_vendor_update<'a, W: MaintenanceWindow>(
         return Err("UpdatePending: vendor update requires a supported pristine archive".into());
     }
     let retirement = match &runtime_input {
-        VendorRuntimeInput::ReuseReceivedRuntime => None,
+        VendorRuntimeInput::ReuseReceivedRuntime { .. } => None,
         VendorRuntimeInput::QualifiedPackage { source, expected_host_sha256, assets } => {
             source.recheck()?;
             assets.recheck()?;
@@ -1244,16 +1258,17 @@ impl<W: MaintenanceWindow> PreparedVendorUpdate<'_, W> {
         self.bound.revalidate_context()?;
         self.bound.exe.recheck()?;
         self.bound.recheck_archive()?;
-        self.window.ensure_held()?;
         if self.bound.binding()? != self.new_binding || hash(&self.bound.exe.read_snapshot()?) != self.new_binding.executable_digest {
             return Err("UpdatePending: selected vendor input changed before intent".into());
         }
         let old = self.authority.current.runtime_deployment.received()?.clone();
-        let _host = pin_deployment_host(&self.authority, &old)?;
+        let host = pin_deployment_host(&self.authority, &old)?;
+        check_reuse_engine(&self.runtime_input, &host, &old)?;
+        self.window.ensure_held()?;
         let mut deployment = old.clone();
         let mut staged_host = None;
         let runtime_input = match &self.runtime_input {
-            VendorRuntimeInput::ReuseReceivedRuntime => VendorRuntimeRecord::ReuseReceivedRuntime,
+            VendorRuntimeInput::ReuseReceivedRuntime { .. } => VendorRuntimeRecord::ReuseReceivedRuntime,
             VendorRuntimeInput::QualifiedPackage { source, expected_host_sha256, assets } => {
                 source.recheck()?;
                 assets.recheck()?;

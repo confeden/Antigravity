@@ -109,6 +109,65 @@ fn replace_with_vendor_update(f: &Fixture) -> Vec<u8> {
 
 #[test]
 #[ignore = "owned qualified fixture, genuine context and explicit new pristine archive; real file replacements"]
+fn vendor_reuse_rejects_different_or_missing_engine_before_window() {
+    struct CountingWindow(usize);
+    impl MaintenanceWindow for CountingWindow {
+        fn ensure_held(&mut self) -> Result<()> { self.0 += 1; Ok(()) }
+    }
+    let f = fixture("vendor-update-engine-mismatch");
+    f.upgrade().unwrap();
+    let (_, prior_digest) = f.current();
+    let original = replace_with_vendor_update(&f);
+    let different = CheckedPath::open(&f.desktop, PathKind::File, PathPurpose::Executable).unwrap();
+    let different_hash = hash(&different.read_snapshot().unwrap());
+    let source_hash = hash(&f.host.read_snapshot().unwrap());
+    assert_ne!(different_hash, source_hash);
+    let calls = TEST_NATIVE_CALLS.with(|value| value.get());
+    for (source, digest) in [(&different, different_hash.as_str()), (&f.host, "")] {
+        let mut window = CountingWindow(0);
+        let error = match prepare_vendor_update(&prior_digest, f.bound(), None,
+            VendorRuntimeInput::ReuseReceivedRuntime { source, source_sha256: digest },
+            None, &AtomicBool::new(false), &mut window) {
+            Ok(_) => panic!("mismatched engine was admitted"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("UpdatePending"));
+        assert_eq!(window.0, 0);
+        assert_eq!(TEST_NATIVE_CALLS.with(|value| value.get()), calls);
+        assert_eq!(f.archive().bytes, original);
+        assert_eq!(hex::encode(observe_vendor_update(&f.bound()).unwrap().prior_current_sha256), prior_digest);
+    }
+}
+
+#[test]
+#[ignore = "owned qualified fixture, genuine context and explicit new pristine archive; real file replacements"]
+fn vendor_reuse_rechecks_engine_before_execute_effects() {
+    struct CountingWindow(usize);
+    impl MaintenanceWindow for CountingWindow {
+        fn ensure_held(&mut self) -> Result<()> { self.0 += 1; Ok(()) }
+    }
+    let f = fixture("vendor-update-engine-changed");
+    f.upgrade().unwrap();
+    let (_, prior_digest) = f.current();
+    let original = replace_with_vendor_update(&f);
+    let digest = hash(&f.host.read_snapshot().unwrap());
+    let calls = TEST_NATIVE_CALLS.with(|value| value.get());
+    let mut window = CountingWindow(0);
+    let mut prepared = prepare_vendor_update(&prior_digest, f.bound(), None,
+        VendorRuntimeInput::ReuseReceivedRuntime { source: &f.host, source_sha256: &digest },
+        None, &AtomicBool::new(false), &mut window).unwrap();
+    // Synthetic degraded operation input; the retained Windows source handle
+    // intentionally prevents this test from replacing its bytes in place.
+    prepared.runtime_input = VendorRuntimeInput::ReuseReceivedRuntime { source: &f.host, source_sha256: "" };
+    assert!(prepared.execute(None, &AtomicBool::new(false)).is_err());
+    assert_eq!(window.0, 1);
+    assert_eq!(TEST_NATIVE_CALLS.with(|value| value.get()), calls);
+    assert_eq!(f.archive().bytes, original);
+    assert_eq!(hex::encode(observe_vendor_update(&f.bound()).unwrap().prior_current_sha256), prior_digest);
+}
+
+#[test]
+#[ignore = "owned qualified fixture, genuine context and explicit new pristine archive; real file replacements"]
 fn vendor_update_receives_new_original_and_retains_runtime_custody() {
     let f = fixture("vendor-update");
     f.upgrade().unwrap();
@@ -119,11 +178,12 @@ fn vendor_update_receives_new_original_and_retains_runtime_custody() {
     assert_eq!(observed.slot_id, prior.slot_id);
     assert_eq!(hex::encode(observed.prior_current_sha256), prior_digest);
     let before = TEST_NATIVE_CALLS.with(|value| value.get());
-    assert!(prepare_vendor_update(&"0".repeat(64), f.bound(), None, VendorRuntimeInput::ReuseReceivedRuntime,
+    let source_sha256 = hash(&f.host.read_snapshot().unwrap());
+    assert!(prepare_vendor_update(&"0".repeat(64), f.bound(), None, VendorRuntimeInput::ReuseReceivedRuntime { source: &f.host, source_sha256: &source_sha256 },
         None, &AtomicBool::new(false), &mut Window).is_err());
     assert_eq!(TEST_NATIVE_CALLS.with(|value| value.get()), before);
     let mut window = Window;
-    prepare_vendor_update(&prior_digest, f.bound(), None, VendorRuntimeInput::ReuseReceivedRuntime,
+    prepare_vendor_update(&prior_digest, f.bound(), None, VendorRuntimeInput::ReuseReceivedRuntime { source: &f.host, source_sha256: &source_sha256 },
         None, &AtomicBool::new(false), &mut window).unwrap().execute(None, &AtomicBool::new(false)).unwrap();
     let (current, _) = f.current();
     let actual = current.runtime_deployment.received().unwrap();
@@ -168,9 +228,10 @@ fn vendor_update_received_success_recovers_without_native_replay() {
     f.upgrade().unwrap();
     let (_, prior_digest) = f.current();
     replace_with_vendor_update(&f);
+    let source_sha256 = hash(&f.host.read_snapshot().unwrap());
     TEST_STOP_AFTER_RECEIPT.with(|value| value.set(Some("apply-v2")));
     let mut window = Window;
-    assert!(prepare_vendor_update(&prior_digest, f.bound(), None, VendorRuntimeInput::ReuseReceivedRuntime,
+    assert!(prepare_vendor_update(&prior_digest, f.bound(), None, VendorRuntimeInput::ReuseReceivedRuntime { source: &f.host, source_sha256: &source_sha256 },
         None, &AtomicBool::new(false), &mut window).unwrap().execute(None, &AtomicBool::new(false)).is_err());
     let calls = TEST_NATIVE_CALLS.with(|value| value.get());
     f.recover().unwrap();
@@ -185,9 +246,10 @@ fn vendor_update_lost_receipt_stays_pending_without_replay() {
     f.upgrade().unwrap();
     let (_, prior_digest) = f.current();
     replace_with_vendor_update(&f);
+    let source_sha256 = hash(&f.host.read_snapshot().unwrap());
     TEST_LOSE_RECEIPT.with(|value| value.set(Some("apply-v2")));
     let mut window = Window;
-    assert!(prepare_vendor_update(&prior_digest, f.bound(), None, VendorRuntimeInput::ReuseReceivedRuntime,
+    assert!(prepare_vendor_update(&prior_digest, f.bound(), None, VendorRuntimeInput::ReuseReceivedRuntime { source: &f.host, source_sha256: &source_sha256 },
         None, &AtomicBool::new(false), &mut window).unwrap().execute(None, &AtomicBool::new(false)).is_err());
     let calls = TEST_NATIVE_CALLS.with(|value| value.get());
     assert!(f.recover().is_err());
