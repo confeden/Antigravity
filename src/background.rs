@@ -636,7 +636,8 @@ mod windows_impl {
         let host = windows_coordinator::system_powershell_program()?;
         let mut command = Command::new(host.as_path());
         command.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script]);
-        let stdout = windows_coordinator::runtime_metadata(&host, command, cancelled, false)?;
+        let stdout = windows_coordinator::runtime_metadata(&host, command, cancelled, false,
+            windows_coordinator::MetadataContext::new(windows_coordinator::MetadataPurpose::BackgroundStateQuery, None))?;
         parse_checked_json(stdout.as_bytes())
     }
 

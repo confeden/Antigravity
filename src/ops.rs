@@ -671,10 +671,29 @@ impl Ctx {
         if self.events.send(Event::Log(level, msg.into())).is_err() { self.lifetime.channel_lost.store(true, Ordering::SeqCst); }
         if let Ok(wake) = self.wake.lock() { (wake)(); }
     }
+    fn poll_wsl_report(&mut self) -> bool {
+        let Some(diagnostics) = self.wsl.poll() else { return false; };
+        for diagnostic in diagnostics { self.log(Level::Err, diagnostic); }
+        true
+    }
     fn busy(&self, what: Option<&str>) {
         if self.events.send(Event::Busy(what.map(|s| s.to_string()))).is_err() { self.lifetime.channel_lost.store(true, Ordering::SeqCst); }
         if let Ok(wake) = self.wake.lock() { (wake)(); }
     }
+}
+
+#[cfg(all(test, windows))]
+pub(crate) fn test_forward_wsl_diagnostic(events: Sender<Event>, error: String) -> bool {
+    let lifetime = Arc::new(GuiLifetime::default());
+    let mut ctx = Ctx { events, wake: Arc::new(Mutex::new(Box::new(|| {}))), settings: Settings::default(),
+        wsl: crate::wsl_controller::test_pending_diagnostic(error), native_apply_pending: Arc::new(AtomicBool::new(false)),
+        native_cancel: Arc::new(AtomicBool::new(false)), background_receivings: Vec::new(), lifetime: lifetime.clone(),
+        vpn_job: None, vpn_unsettled: false, startup: Startup::Ordinary, proxy_var_carried: None,
+        proxy_var_retryable: false, patched_seen: HashMap::new(), vpn: None, relay_egress: None,
+        last: None, dns_probe: (false, false), carrier_set_proxy: false };
+    while !ctx.poll_wsl_report() { std::thread::yield_now(); }
+    assert!(!ctx.poll_wsl_report());
+    lifetime.channel_lost.load(Ordering::SeqCst)
 }
 
 /// True while a VPN measurement is out at a thread. One at a time: the watcher
@@ -833,7 +852,7 @@ fn run_worker(
             push_status(&mut ctx, Scan::Settings);
             if !ctx.wsl.is_pending() && !lifetime.handoff_requested.load(Ordering::SeqCst) { ctx.busy(None); }
         }
-        if ctx.wsl.poll() {
+        if ctx.poll_wsl_report() {
             push_status(&mut ctx, Scan::Settings);
             if !ctx.wsl.is_pending() { ctx.busy(None); }
             #[cfg(windows)]

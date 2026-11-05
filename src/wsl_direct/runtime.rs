@@ -63,16 +63,20 @@ fn selection_without_effects(settings: &Settings) -> Result<Option<SelectionPrep
     let preferences = settings.wsl.as_ref().ok_or("Выбор WSL ещё не подтверждён.")?;
     if !preferences.enabled {
         return Ok(Some(SelectionPreparation { results: preferences.distros.iter().map(|name| TargetApplyResult { name: name.clone(),
-            state: WslTargetState::NotApplied, detail: Some("WSL выключен.".into()) }).collect(), needs_elevation: false }));
+            state: WslTargetState::NotApplied, detail: Some("WSL выключен.".into()), diagnostic: None }).collect(), needs_elevation: false }));
     }
     if preferences.distros.is_empty() { return Err("Выберите дистрибутив WSL.".into()); }
     if !settings.client_patch && !wants_transport(&settings) {
         return Ok(Some(SelectionPreparation { results: preferences.distros.iter().map(|name| TargetApplyResult {
             name: name.clone(), state: WslTargetState::NotApplied,
-            detail: Some("Для WSL не выбраны изменения; запуск остаётся обычным.".into()),
+            detail: Some("Для WSL не выбраны изменения; запуск остаётся обычным.".into()), diagnostic: None,
         }).collect(), needs_elevation: false }));
     }
     Ok(None)
+}
+
+pub(crate) fn preparation_can_start_guest(settings: &Settings) -> bool {
+    matches!(selection_without_effects(settings), Ok(None))
 }
 
 fn wants_transport(settings: &Settings) -> bool {
@@ -327,6 +331,7 @@ pub(crate) fn prepare_runtime(input: RuntimePreparationInput, cancellation: Arc<
     let transport = wants_transport(&input.settings);
     let mut gateway = None;
     let architecture;
+    let guest_home;
     if transport {
         let ps = coordinator::system_powershell_program()?;
         let context = coordinator::discover_runtime_context(&program, &ps, &input.launch.distro, &cancellation)?;
@@ -342,6 +347,7 @@ pub(crate) fn prepare_runtime(input: RuntimePreparationInput, cancellation: Arc<
         }
         receive_gateway_rule(&read, &context, &cancellation)?;
         architecture = context.architecture.clone();
+        guest_home = context.home.clone();
         gateway = Some(session::SessionSpec {
             program: session::GatewayProgramRef::receive(host.as_path(), &host.native_id(), &input.host_sha256)?,
             selected_distro: input.launch.distro.clone(), selected_user: context.user,
@@ -353,9 +359,11 @@ pub(crate) fn prepare_runtime(input: RuntimePreparationInput, cancellation: Arc<
             status_line_bytes: 16_384,
         });
     } else {
-        architecture = coordinator::discover_runtime_identity(&program, &input.launch.distro, &cancellation)?.architecture;
+        let identity = coordinator::discover_runtime_identity(&program, &input.launch.distro, &cancellation)?;
+        architecture = identity.architecture;
+        guest_home = identity.home;
     }
-    let launcher = coordinator::provision_runtime_helper(&program, &input.launch.distro, &assets, &architecture, &cancellation)?;
+    let launcher = coordinator::provision_runtime_helper(&program, &input.launch.distro, &assets, &architecture, &guest_home, &cancellation)?;
     if cancellation.load(Ordering::SeqCst) { return Err("runtime preparation cancelled after helper retirement".into()); }
     host.recheck()?;
     Ok(RuntimeRecipe { gateway, program, launch: input.launch, launcher,
@@ -382,12 +390,12 @@ fn prepare_windows_selection(plan: Arc<crate::ops::AllTargetApplyPlan>, cancella
     let mut results = Vec::new();
     for name in &wanted.distros {
         if cancellation.load(Ordering::SeqCst) {
-            results.push(TargetApplyResult { name: name.clone(), state: WslTargetState::Cancelled, detail: None });
+            results.push(TargetApplyResult { name: name.clone(), state: WslTargetState::Cancelled, detail: None, diagnostic: None });
             continue;
         }
         if !registered.iter().any(|row| row.name == *name) {
             results.push(TargetApplyResult { name: name.clone(), state: WslTargetState::Blocked,
-                detail: Some("Дистрибутив больше не зарегистрирован.".into()) });
+                detail: Some("Дистрибутив больше не зарегистрирован.".into()), diagnostic: None });
             continue;
         }
         for (index, target) in desktops.iter().enumerate() {
@@ -455,9 +463,9 @@ fn prepare_windows_selection(plan: Arc<crate::ops::AllTargetApplyPlan>, cancella
                 }
                 let program = coordinator::system_wsl_program()?;
                 let identity = coordinator::discover_runtime_identity(&program, name, &cancellation)?;
-                let launcher = coordinator::provision_runtime_helper(&program, name, assets, &identity.architecture, &cancellation)?;
+                let launcher = coordinator::provision_runtime_helper(&program, name, assets, &identity.architecture, &identity.home, &cancellation)?;
                 prepare_private_copy(&program, name, &launcher, &read.server_version()?, &settings,
-                    assets.helper_digest(), &cancellation)?;
+                    assets.helper_digest(), &identity.home, &cancellation)?;
                 if wants_transport(&settings) {
                     let ps = coordinator::system_powershell_program()?;
                     let context = coordinator::discover_runtime_context(&program, &ps, name, &cancellation)?;
@@ -491,10 +499,15 @@ fn prepare_windows_selection(plan: Arc<crate::ops::AllTargetApplyPlan>, cancella
             })();
             merge_target_result(&mut results, match operation {
                 Ok(()) => TargetApplyResult { name: name.clone(), state: WslTargetState::ReadyToOpen,
-                    detail: Some("Подготовка проверена. Откройте WSL в Antigravity.".into()) },
+                    detail: Some("Откройте WSL в Antigravity.".into()), diagnostic: None },
                 Err(error) => TargetApplyResult { name: name.clone(), state: if error.starts_with("Cancelled:") { WslTargetState::Cancelled }
                     else if error.contains("RecoveryRequired:") || error.contains("PreparationIncomplete:") { WslTargetState::Pending }
-                    else { WslTargetState::Blocked }, detail: Some(error) },
+                    else { WslTargetState::Blocked },
+                    detail: Some("Не удалось завершить подготовку. Подробности — в журнале.".into()),
+                    diagnostic: Some(format!("WSL {}: {}", name, crate::windows_coordinator::MetadataContext {
+                        purpose: crate::windows_coordinator::MetadataPurpose::PrivateServerPreparation,
+                        distro: Some(name), private_values: &[desktop.to_str().unwrap_or("")],
+                    }.safe_text(&error))) },
             });
             if needs_elevation { return Ok(SelectionPreparation { results, needs_elevation: true }); }
         }
@@ -547,6 +560,13 @@ fn merge_target_result(results: &mut Vec<TargetApplyResult>, next: TargetApplyRe
         if current.detail.as_ref() != Some(&detail) {
             current.detail = Some(match current.detail.take() { Some(prior) => format!("{prior}; {detail}"), None => detail });
         }
+    }
+    if let Some(diagnostic) = next.diagnostic {
+        current.diagnostic = Some(match current.diagnostic.take() {
+            Some(prior) if prior != diagnostic => format!("{prior}; {diagnostic}"),
+            Some(prior) => prior,
+            None => diagnostic,
+        });
     }
 }
 
@@ -618,12 +638,14 @@ impl crate::windows_coordinator::windows_installation::MaintenanceWindow for Gui
 
 #[cfg(windows)]
 fn prepare_private_copy(program: &crate::windows_coordinator::windows_installation::CheckedPath, distro: &str,
-    launcher: &str, version: &str, settings: &Settings, expected_helper: &str, cancel: &AtomicBool) -> Result<(), String> {
+    launcher: &str, version: &str, settings: &Settings, expected_helper: &str, guest_home: &str, cancel: &AtomicBool) -> Result<(), String> {
     let mut command = std::process::Command::new(program.as_path());
     command.args(["-d", distro, "--exec", "sh", "-c",
         r#"agLauncher=$1; agEligibility=$2; agTransport=$3; agVersion=$4; exec "$agLauncher" --prepare-only --profile "$agEligibility" "$agTransport" "$HOME/.antigravity-server/bin/$agVersion/language_server""#,
         "sh", launcher, if settings.client_patch { "1" } else { "0" }, if wants_transport(settings) { "1" } else { "0" }, version]);
-    let output = crate::windows_coordinator::runtime_metadata(program, command, cancel, true)?;
+    let output = crate::windows_coordinator::runtime_metadata(program, command, cancel, true,
+        crate::windows_coordinator::MetadataContext { purpose: crate::windows_coordinator::MetadataPurpose::PrivateServerPreparation,
+            distro: Some(distro), private_values: &[launcher, guest_home] })?;
     receive_private_copy_manifest(&output, settings, expected_helper)
 }
 
@@ -708,13 +730,16 @@ mod tests {
         assert!(!automatic_vendor_update_wanted(&settings));
         settings.wsl = Some(crate::wsl_api::WslPreferences { enabled: true, distros: vec!["fixture".into()] });
         assert!(!automatic_vendor_update_wanted(&settings));
+        assert!(!preparation_can_start_guest(&settings));
         settings.client_patch = true;
         assert!(automatic_vendor_update_wanted(&settings));
+        assert!(preparation_can_start_guest(&settings));
         settings.patch_declined = true;
         assert!(!automatic_vendor_update_wanted(&settings));
         settings.patch_declined = false;
         settings.wsl.as_mut().unwrap().distros.clear();
         assert!(!automatic_vendor_update_wanted(&settings));
+        assert!(!preparation_can_start_guest(&settings));
         settings.wsl.as_mut().unwrap().distros.push("fixture".into());
         settings.wsl.as_mut().unwrap().enabled = false;
         assert!(!automatic_vendor_update_wanted(&settings));

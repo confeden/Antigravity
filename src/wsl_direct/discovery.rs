@@ -14,6 +14,173 @@ pub(crate) struct DiscoveryObservation {
     pub error: Option<String>,
 }
 
+/// Explicit command purpose; the command's script, argv and environment are
+/// never themselves rendered into diagnostics.
+#[derive(Clone, Copy)]
+pub(crate) enum MetadataPurpose { RegisteredNames, RunningNames, DesktopProcessCheck, FirewallProfileQuery,
+    GuestNetworkContext, HostAdapterQuery, GuestIdentity, HelperPath, HelperProvision, HelperVerify,
+    PrivateServerPreparation, BackgroundStateQuery }
+impl MetadataPurpose {
+    fn label(self) -> &'static str { match self {
+        Self::RegisteredNames => "RegisteredNames", Self::RunningNames => "RunningNames",
+        Self::DesktopProcessCheck => "DesktopProcessCheck", Self::FirewallProfileQuery => "FirewallProfileQuery",
+        Self::GuestNetworkContext => "GuestNetworkContext", Self::HostAdapterQuery => "HostAdapterQuery",
+        Self::GuestIdentity => "GuestIdentity", Self::HelperPath => "HelperPath", Self::HelperProvision => "HelperProvision",
+        Self::HelperVerify => "HelperVerify", Self::PrivateServerPreparation => "PrivateServerPreparation",
+        Self::BackgroundStateQuery => "BackgroundStateQuery",
+    } }
+}
+#[derive(Clone, Copy)]
+pub(crate) struct MetadataContext<'a> {
+    pub purpose: MetadataPurpose,
+    pub distro: Option<&'a str>,
+    pub private_values: &'a [&'a str],
+}
+impl<'a> MetadataContext<'a> {
+    pub(crate) fn new(purpose: MetadataPurpose, distro: Option<&'a str>) -> Self {
+        Self { purpose, distro, private_values: &[] }
+    }
+    pub(super) fn heading(&self) -> String {
+        match self.distro {
+            Some(name) => format!("{} [{}]", self.purpose.label(), escaped(name)),
+            None => self.purpose.label().to_owned(),
+        }
+    }
+    pub(crate) fn safe_stderr(&self, bytes: &[u8]) -> String {
+        self.safe_stderr_extra(bytes, &[])
+    }
+    pub(crate) fn safe_text(&self, text: &str) -> String {
+        self.safe_text_extra(text, &[])
+    }
+    fn safe_text_extra(&self, text: &str, extra: &[String]) -> String {
+        self.safe_projected(text.as_bytes(), extra, true)
+    }
+    fn failure_stdout(&self, bytes: &[u8], extra: &[String]) -> String {
+        if private_stdout_payload(self.purpose, bytes) { "[private output withheld]".into() }
+        else { self.safe_stderr_extra(bytes, extra) }
+    }
+    fn safe_stderr_extra(&self, bytes: &[u8], extra: &[String]) -> String {
+        self.safe_projected(bytes, extra, false)
+    }
+    fn safe_projected(&self, bytes: &[u8], extra: &[String], known_utf8: bool) -> String {
+        let mut private: Vec<String> = self.private_values.iter().filter(|s| !s.is_empty()).map(|s| (*s).to_owned()).collect();
+        private.extend(extra.iter().filter(|s| !s.is_empty()).cloned());
+        for name in ["USERPROFILE", "HOME", "LOCALAPPDATA", "APPDATA"] {
+            if let Some(value) = std::env::var_os(name).and_then(|s| s.into_string().ok()) {
+                if !value.is_empty() { private.push(value); }
+            }
+        }
+        let hidden = private_byte_spans(bytes, &private);
+        let render = |text: &str, offset: usize, wide: bool| {
+            let mut projected = String::new();
+            let mut position = offset;
+            let mut masking = false;
+            for ch in text.chars() {
+                let width = if wide { ch.len_utf16() * 2 } else { ch.len_utf8() };
+                let private = hidden[position..position + width].iter().any(|hidden| *hidden);
+                if private {
+                    if !masking { projected.push_str("[private]"); }
+                } else { projected.push(ch); }
+                masking = private;
+                position += width;
+            }
+            if projected.is_empty() { return "[empty]".to_owned(); }
+            projected.split('\n').map(|line| {
+                let trimmed = line.trim_start();
+                let category = trimmed.strip_prefix('+').map(str::trim_start)
+                    .is_some_and(|s| s.starts_with("CategoryInfo") || s.starts_with("FullyQualifiedErrorId"));
+                if (trimmed.starts_with('+') && !category) || trimmed.starts_with("At line:") || trimmed.starts_with("строка:") {
+                    "[source excerpt removed]".to_owned()
+                } else { escaped(line) }
+            }).collect::<Vec<_>>().join("\\n")
+        };
+        let utf8_bom = !known_utf8 && bytes.starts_with(&[0xef, 0xbb, 0xbf]);
+        let utf16_bom = !known_utf8 && bytes.starts_with(&[0xff, 0xfe]);
+        let utf8_offset = if utf8_bom { 3 } else { 0 };
+        let utf16_offset = if utf16_bom { 2 } else { 0 };
+        let utf8 = if utf16_bom { None } else { std::str::from_utf8(&bytes[utf8_offset..]).ok() };
+        let raw16 = &bytes[utf16_offset..];
+        let utf16 = if known_utf8 || utf8_bom || raw16.len() % 2 != 0 { None } else {
+            let units: Vec<u16> = raw16.chunks_exact(2).map(|p| u16::from_le_bytes([p[0], p[1]])).collect();
+            String::from_utf16(&units).ok()
+        };
+        match (utf8, utf16) {
+            (Some(a), Some(b)) => {
+                let a = render(a, utf8_offset, false);
+                let b = render(&b, utf16_offset, true);
+                if a == b { a } else { format!("[encoding ambiguous; UTF-8] {a}; [UTF-16LE] {b}") }
+            },
+            (Some(a), None) if utf8_bom || known_utf8 => render(a, utf8_offset, false),
+            (Some(a), None) => format!("[encoding unconfirmed; UTF-8] {}", render(a, utf8_offset, false)),
+            (None, Some(b)) if utf16_bom => render(&b, utf16_offset, true),
+            (None, Some(b)) => format!("[encoding unconfirmed; UTF-16LE] {}", render(&b, utf16_offset, true)),
+            (None, None) => format!("[undecodable: {} bytes]", bytes.len()),
+        }
+    }
+}
+fn private_byte_spans(bytes: &[u8], values: &[String]) -> Vec<bool> {
+    let mut hidden = vec![false; bytes.len()];
+    for value in values.iter().filter(|value| !value.is_empty()) {
+        let wide: Vec<u8> = value.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        for needle in [value.as_bytes(), wide.as_slice()] {
+            if needle.len() <= bytes.len() {
+                for (start, window) in bytes.windows(needle.len()).enumerate() {
+                    if window == needle { hidden[start..start + needle.len()].fill(true); }
+                }
+            }
+        }
+    }
+    hidden
+}
+fn escaped(text: &str) -> String {
+    text.chars().map(|c| if c.is_control() { c.escape_default().to_string() } else { c.to_string() }).collect()
+}
+fn private_stdout_payload(purpose: MetadataPurpose, bytes: &[u8]) -> bool {
+    let wide_marker = bytes.starts_with(&[b'A', 0, b'G', 0]);
+    let wide = if bytes.starts_with(&[0xff, 0xfe]) || wide_marker {
+        let raw = bytes.strip_prefix(&[0xff, 0xfe]).unwrap_or(bytes);
+        if raw.len() % 2 != 0 { return true; }
+        let units: Vec<u16> = raw.chunks_exact(2).map(|p| u16::from_le_bytes([p[0], p[1]])).collect();
+        match String::from_utf16(&units) { Ok(value) => Some(value), Err(_) => return true }
+    } else { None };
+    let bytes = wide.as_ref().map(|text| text.as_bytes()).unwrap_or(bytes);
+    let bytes = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(bytes);
+    let bytes = bytes.iter().position(|b| !b.is_ascii_whitespace()).map(|start| &bytes[start..]).unwrap_or(bytes);
+    let marker = match purpose {
+        MetadataPurpose::GuestIdentity => Some(&b"AG_USER_V1"[..]),
+        MetadataPurpose::GuestNetworkContext => Some(&b"AG_CONTEXT_V1"[..]),
+        MetadataPurpose::HelperVerify => Some(&b"AG_HELPER_V1"[..]),
+        _ => None,
+    };
+    if let Some(marker) = marker {
+        if !bytes.is_empty() && (bytes.starts_with(marker) || marker.starts_with(bytes)) { return true; }
+    }
+    if matches!(purpose, MetadataPurpose::HelperPath | MetadataPurpose::HelperProvision) && bytes.starts_with(b"/") {
+        return true;
+    }
+    if matches!(purpose, MetadataPurpose::PrivateServerPreparation | MetadataPurpose::BackgroundStateQuery) {
+        if bytes.starts_with(b"{") { return true; }
+        if let Some(rest) = bytes.strip_prefix(b"[") {
+            let rest = rest.iter().position(|b| !b.is_ascii_whitespace()).map(|start| &rest[start..]).unwrap_or(&[]);
+            let json_literal = [&b"null"[..], &b"true"[..], &b"false"[..]]
+                .iter().any(|literal| !rest.is_empty() && (rest.starts_with(literal) || literal.starts_with(rest)));
+            if rest.is_empty() || json_literal || matches!(rest[0], b'"' | b'{' | b'[' | b']' | b'-' | b'0'..=b'9') {
+                return true;
+            }
+        }
+    }
+    false
+}
+#[cfg(test)]
+pub(crate) fn test_diagnostic_text() -> String {
+    let context = MetadataContext { purpose: MetadataPurpose::GuestIdentity, distro: Some("Ubuntu"), private_values: &["fixture-secret"] };
+    let program = system_program(Path::new(r"WindowsPowerShell\v1.0\powershell.exe")).expect("fixture program");
+    let mut command = Command::new(program.as_path());
+    command.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
+        "[Console]::Out.Write('a'); [Console]::Out.Write([char]0); [Console]::Out.Write('b'); [Console]::Out.Write([char]0); [Console]::Out.Write('native error 51 fixture-secret'); exit 51"]);
+    metadata_output(&program, command, &AtomicBool::new(false), context).unwrap_err()
+}
+
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn GetSystemDirectoryW(buffer: *mut u16, size: u32) -> u32;
@@ -61,33 +228,57 @@ fn names(bytes: &[u8]) -> Result<Vec<String>> {
 }
 
 fn query(program: &Pinned, running: bool, cancelled: &AtomicBool) -> Result<Vec<String>> {
-    if cancelled.load(Ordering::SeqCst) { return Err("WSL discovery cancelled".into()); }
-    program.recheck()?;
+    let context = MetadataContext::new(if running { MetadataPurpose::RunningNames } else { MetadataPurpose::RegisteredNames }, None);
+    if cancelled.load(Ordering::SeqCst) { return Err(format!("{}: WSL discovery cancelled", context.heading())); }
+    program.recheck().map_err(|error| format!("{}: program receiving: {}", context.heading(), context.safe_text(&error)))?;
     let mut command = Command::new(program.as_path());
     command.args(["--list", "--quiet"]);
     if running { command.arg("--running"); }
-    let bytes = metadata_output(program, command, cancelled)?;
-    names(&bytes)
+    let output = metadata_output(program, command, cancelled, context)?;
+    names(&output.stdout).map_err(|error| format!("{}: {error}; exit=success; capture=complete; stderr={}",
+        context.heading(), output.diagnostic_stderr(context)))
 }
 
 /// One owner for finite metadata-child/pipe custody. Output remains private
 /// memory, and cancellation settles the exact creator Child before returning.
-pub(super) fn metadata_output(program: &Pinned, command: Command, cancelled: &AtomicBool) -> Result<Vec<u8>> {
-    metadata_output_impl(program, command, cancelled, true)
+#[derive(Debug)]
+pub(super) struct MetadataOutput { pub(super) stdout: Vec<u8>, stderr: Vec<u8>, redactions: Vec<String> }
+impl MetadataOutput {
+    pub(super) fn diagnostic_stderr(&self, context: MetadataContext<'_>) -> String {
+        context.safe_stderr_extra(&self.stderr, &self.redactions)
+    }
 }
-pub(super) fn metadata_output_natural(program: &Pinned, command: Command, cancelled: &AtomicBool) -> Result<Vec<u8>> {
-    metadata_output_impl(program, command, cancelled, false)
+pub(super) fn metadata_output(program: &Pinned, command: Command, cancelled: &AtomicBool, context: MetadataContext<'_>) -> Result<MetadataOutput> {
+    metadata_output_impl(program, command, cancelled, true, context)
 }
-fn metadata_output_impl(program: &Pinned, command: Command, cancelled: &AtomicBool, native_only: bool) -> Result<Vec<u8>> {
-    metadata_output_with(program, command, cancelled, native_only, start_stdout_reader, Child::try_wait)
+pub(super) fn metadata_output_natural(program: &Pinned, command: Command, cancelled: &AtomicBool, context: MetadataContext<'_>) -> Result<MetadataOutput> {
+    metadata_output_impl(program, command, cancelled, false, context)
+}
+fn metadata_output_impl(program: &Pinned, command: Command, cancelled: &AtomicBool, native_only: bool, context: MetadataContext<'_>) -> Result<MetadataOutput> {
+    metadata_output_with_context(program, command, cancelled, native_only, start_stdout_reader, start_stderr_reader, Child::try_wait, |p| p.recheck(), context)
+}
+
+#[derive(Debug)]
+struct PartialRead { bytes: Vec<u8>, message: String }
+impl std::fmt::Display for PartialRead { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(&self.message) } }
+impl std::error::Error for PartialRead {}
+fn drain<R: Read>(mut stream: R) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    match stream.read_to_end(&mut bytes) {
+        Ok(_) => Ok(bytes),
+        Err(error) => Err(std::io::Error::new(error.kind(), PartialRead { bytes, message: error.to_string() })),
+    }
 }
 
 fn start_stdout_reader(mut stdout: std::process::ChildStdout)
     -> std::io::Result<thread::JoinHandle<std::io::Result<Vec<u8>>>> {
     thread::Builder::new().name("wsl-registration-output".into()).spawn(move || {
-        let mut bytes = Vec::new();
-        stdout.read_to_end(&mut bytes).map(|_| bytes)
+        drain(&mut stdout)
     })
+}
+fn start_stderr_reader(stderr: std::process::ChildStderr)
+    -> std::io::Result<thread::JoinHandle<std::io::Result<Vec<u8>>>> {
+    thread::Builder::new().name("metadata-stderr".into()).spawn(move || drain(stderr))
 }
 
 /// Private injection seam for the existing reader-start and Child-observation
@@ -98,17 +289,47 @@ where
     S: FnOnce(std::process::ChildStdout) -> std::io::Result<thread::JoinHandle<std::io::Result<Vec<u8>>>>,
     O: FnMut(&mut Child) -> std::io::Result<Option<std::process::ExitStatus>>,
 {
-    if cancelled.load(Ordering::SeqCst) { return Err("metadata query cancelled".into()); }
-    if command.get_program() != program.as_path().as_os_str() { return Err("metadata program pin differs".into()); }
-    program.recheck()?;
+    metadata_output_with_context(program, command, cancelled, native_only, start_reader, start_stderr_reader, observe_child, |p| p.recheck(),
+        MetadataContext::new(MetadataPurpose::RegisteredNames, None)).map(|output| output.stdout)
+}
+
+fn metadata_output_with_context<S, T, O, R>(program: &Pinned, mut command: Command, cancelled: &AtomicBool,
+    native_only: bool, start_reader: S, start_stderr: T, mut observe_child: O, recheck_program: R, context: MetadataContext<'_>) -> Result<MetadataOutput>
+where
+    S: FnOnce(std::process::ChildStdout) -> std::io::Result<thread::JoinHandle<std::io::Result<Vec<u8>>>>,
+    T: FnOnce(std::process::ChildStderr) -> std::io::Result<thread::JoinHandle<std::io::Result<Vec<u8>>>>,
+    O: FnMut(&mut Child) -> std::io::Result<Option<std::process::ExitStatus>>,
+    R: FnOnce(&Pinned) -> Result<()>,
+{
+    if cancelled.load(Ordering::SeqCst) { return Err(format!("{}: metadata query cancelled", context.heading())); }
+    if command.get_program() != program.as_path().as_os_str() { return Err(format!("{}: metadata program pin differs", context.heading())); }
+    program.recheck().map_err(|error| format!("{}: program receiving: {}", context.heading(), context.safe_text(&error)))?;
+    let program_name = program.as_path().file_name().and_then(|name| name.to_str()).map(escaped).unwrap_or_else(|| "[name unavailable]".into());
     use std::os::windows::process::CommandExt;
     command.creation_flags(0x0800_0000);
+    // These values are used only for removal from untrusted output. They are
+    // never rendered, and flags or short ordinary arguments are not collected.
+    let mut command_private = Vec::new();
+    for arg in command.get_args().filter_map(|arg| arg.to_str()) {
+        if arg.contains('\\') || arg.starts_with('/') || arg.contains('\n') || arg.contains('$') {
+            command_private.push(arg.to_owned());
+            if arg.contains('\n') { command_private.extend(arg.lines().filter(|line| !line.trim().is_empty()).map(str::to_owned)); }
+        }
+    }
     let stdin = if native_only { Stdio::null() } else { Stdio::piped() };
     let mut child = command.stdin(stdin).stdout(Stdio::piped())
-        .stderr(Stdio::null()).spawn().map_err(|e| io("WSL registration query", e))?;
+        .stderr(Stdio::piped()).spawn().map_err(|e| format!("{}: program={program_name}; spawn: {}", context.heading(), context.safe_text_extra(&e.to_string(), &command_private)))?;
     // Only this job holds the natural helper's lifetime writer. It is never
     // written, inherited as console input, or released on stdout EOF alone.
     let mut input = child.stdin.take();
+    let stderr_started = match child.stderr.take() {
+        Some(stderr) => start_stderr(stderr),
+        None => Err(std::io::Error::other("owned piped stderr absent")),
+    };
+    let (mut stderr_reader, mut stderr_capture) = match stderr_started {
+        Ok(reader) => (Some(reader), None),
+        Err(error) => (None, Some(Captured { bytes: Vec::new(), error: Some(format!("stderr reader: {error}")) })),
+    };
     let started = match child.stdout.take() {
         Some(stdout) => start_reader(stdout),
         None => Err(std::io::Error::other("owned piped stdout absent")),
@@ -119,9 +340,10 @@ where
         Err(error) => {
             drop(input.take());
             if native_only { stop = Some(child.kill()); }
-            (None, Some(Err(io("registration reader", error))))
+            (None, Some(Captured { bytes: Vec::new(), error: Some(format!("stdout reader: {error}")) }))
         }
     };
+    if stderr_capture.is_some() { drop(input.take()); if native_only && stop.is_none() { stop = Some(child.kill()); } }
     let mut cancellation_received = false;
     let mut failure = None;
     let exit = loop {
@@ -134,13 +356,17 @@ where
         // live writer. Collect only a finished reader; retain all other actors.
         if reader.as_ref().is_some_and(|reader| reader.is_finished()) {
             capture = Some(receive_stdout(reader.take().unwrap()));
-            if capture.as_ref().is_some_and(|result| result.is_err()) { drop(input.take()); }
+            if capture.as_ref().is_some_and(|result| result.error.is_some()) { drop(input.take()); }
+        }
+        if stderr_reader.as_ref().is_some_and(|reader| reader.is_finished()) {
+            stderr_capture = Some(receive_stdout(stderr_reader.take().unwrap()));
+            if stderr_capture.as_ref().is_some_and(|result| result.error.is_some()) { drop(input.take()); }
         }
         match observe_child(&mut child) {
             Ok(Some(exit)) => break exit,
             Ok(None) => {},
             Err(error) => {
-                failure.get_or_insert_with(|| format!("registration observation: {error}"));
+                failure.get_or_insert_with(|| format!("child observation: {error}"));
                 drop(input.take());
             }
         }
@@ -150,22 +376,40 @@ where
     // reader remains owned through its real completion inside this job.
     drop(input.take());
     let capture = match reader { Some(reader) => receive_stdout(reader), None => capture.unwrap() };
-    let recheck = program.recheck();
-    if cancellation_received || failure.is_some() || !exit.success() || capture.is_err()
+    let stderr_capture = match stderr_reader { Some(reader) => receive_stdout(reader), None => stderr_capture.unwrap() };
+    let recheck = recheck_program(program);
+    if cancellation_received || failure.is_some() || !exit.success() || capture.error.is_some() || stderr_capture.error.is_some()
         || stop.as_ref().is_some_and(|result| result.is_err()) || recheck.is_err() {
-        let cause = if cancellation_received { "WSL discovery cancelled" }
-            else if capture.is_err() { "WSL registration output failed" }
-            else if failure.is_some() { "WSL registration observation failed" }
-            else if !exit.success() { "WSL registration query failed" }
+        let cause = if cancellation_received { "metadata operation cancelled" }
+            else if capture.error.is_some() || stderr_capture.error.is_some() { "metadata output failed" }
+            else if failure.is_some() { "metadata observation failed" }
+            else if !exit.success() { "metadata query failed" }
             else { "WSL metadata program recheck failed" };
-        return Err(format!("{cause}: {exit}; cancellation={cancellation_received}; stop={stop:?}; observation={failure:?}; capture={:?}; recheck={:?}", capture.as_ref().err(), recheck.err()));
+        // Known private output protocols stay private; causal failure text on
+        // stdout otherwise follows the same redaction and escaping as stderr.
+        let failure_stdout = if !exit.success() {
+            context.failure_stdout(&capture.bytes, &command_private)
+        } else { "[private output withheld]".into() };
+        let stdout_error = capture.error.as_ref().map(|error| context.safe_text_extra(error, &command_private));
+        let stderr_error = stderr_capture.error.as_ref().map(|error| context.safe_text_extra(error, &command_private));
+        let stderr_text = if stderr_capture.error.is_some() && stderr_capture.bytes.is_empty() {
+            "[stderr unavailable or empty; capture failed]".into()
+        } else { context.safe_stderr_extra(&stderr_capture.bytes, &command_private) };
+        let stop_text = context.safe_text_extra(&format!("{stop:?}"), &command_private);
+        let observation = failure.as_ref().map(|error| context.safe_text_extra(error, &command_private));
+        let recheck_error = recheck.err().map(|error| context.safe_text_extra(&error, &command_private));
+        return Err(format!("{} ({cause}): program={program_name}; {exit}; cancellation={cancellation_received}; stop={stop_text}; observation={observation:?}; capture={stdout_error:?}; stderr_capture={stderr_error:?}; stdout_bytes={}; stdout={failure_stdout}; stderr={stderr_text}; recheck={recheck_error:?}", context.heading(), capture.bytes.len()));
     }
-    capture
+    Ok(MetadataOutput { stdout: capture.bytes, stderr: stderr_capture.bytes, redactions: command_private })
 }
 
-fn receive_stdout(reader: thread::JoinHandle<std::io::Result<Vec<u8>>>) -> Result<Vec<u8>> {
-    reader.join().map_err(|_| "WSL registration reader panicked".to_owned())?
-        .map_err(|error| io("WSL registration output", error))
+struct Captured { bytes: Vec<u8>, error: Option<String> }
+fn receive_stdout(reader: thread::JoinHandle<std::io::Result<Vec<u8>>>) -> Captured {
+    match reader.join() {
+        Ok(Ok(bytes)) => Captured { bytes, error: None },
+        Ok(Err(error)) => Captured { bytes: error.get_ref().and_then(|e| e.downcast_ref::<PartialRead>()).map(|e| e.bytes.clone()).unwrap_or_default(), error: Some(error.to_string()) },
+        Err(_) => Captured { bytes: Vec::new(), error: Some("reader panicked; bytes unavailable".into()) },
+    }
 }
 
 fn observe_queries<F>(cancelled: &AtomicBool, mut query_names: F) -> Result<DiscoveryObservation>
@@ -213,6 +457,51 @@ pub(crate) fn registered_distributions_with_cancel(cancelled: &AtomicBool) -> Re
 mod tests {
     use super::*;
     #[test]
+    fn diagnostic_masks_known_values_and_script_excerpt_without_losing_cause() {
+        let context = MetadataContext { purpose: MetadataPurpose::GuestIdentity, distro: Some("Ubuntu"),
+            private_values: &["fixture-secret", "/fixture-home"] };
+        let input = "native error 51 fixture-secret /fixture-home\n+ invoke-secret fixture-secret\n+ CategoryInfo : denied\r\u{1b}";
+        let safe = context.safe_stderr(input.as_bytes());
+        assert!(safe.contains("native error 51") && safe.contains("CategoryInfo") && safe.contains("[source excerpt removed]"));
+        assert!(!safe.contains("fixture-secret") && !safe.contains("/fixture-home") && !safe.contains('\n') && !safe.contains('\u{1b}'));
+        let utf16: Vec<_> = "error 51".encode_utf16().flat_map(u16::to_le_bytes).collect();
+        assert!(context.safe_stderr(&utf16).contains("error 51"));
+        assert!(context.safe_stderr(&[0xff]).contains("undecodable"));
+        assert_eq!(context.safe_stderr(&[]), "[empty]");
+        assert!(context.failure_stdout(b"native error 51\0", &[]).contains("native error 51\\u{0}"));
+        assert_eq!(context.failure_stdout(b"AG_USER_V1\n1000\n/fixture-home", &[]), "[private output withheld]");
+        let wide_error: Vec<_> = "native error 51".encode_utf16().flat_map(u16::to_le_bytes).collect();
+        assert!(context.failure_stdout(&wide_error, &[]).contains("native error 51"));
+        for purpose in [MetadataPurpose::RegisteredNames, MetadataPurpose::RunningNames, MetadataPurpose::GuestIdentity, MetadataPurpose::HelperPath] {
+            let context = MetadataContext::new(purpose, None);
+            assert!(context.failure_stdout(b"native error 51\0", &[]).contains("native error 51\\u{0}"));
+        }
+        let background = MetadataContext::new(MetadataPurpose::BackgroundStateQuery, None);
+        assert!(background.failure_stdout(b"[native error 51]", &[]).contains("native error 51"));
+        assert_eq!(background.failure_stdout(b"[\"private task\"]", &[]), "[private output withheld]");
+        let wide_private: Vec<_> = "AG_USER_V1\n1000\n/fixture-home".encode_utf16().flat_map(u16::to_le_bytes).collect();
+        assert!(private_stdout_payload(MetadataPurpose::GuestIdentity, &wide_private));
+        let input = b"a\0b\0fixture-secret";
+        let safe = context.safe_stderr(input);
+        let alias_units: Vec<_> = b"fixture-secret".chunks_exact(2).map(|p| u16::from_le_bytes([p[0], p[1]])).collect();
+        let alias = String::from_utf16(&alias_units).unwrap();
+        assert!(safe.contains("encoding ambiguous") && safe.contains("a\\u{0}b\\u{0}") && safe.contains("[private]"));
+        assert!(!safe.contains("fixture-secret") && !safe.contains(&alias));
+        let mut bom = vec![0xff, 0xfe];
+        bom.extend("cause fixture-secret".encode_utf16().flat_map(u16::to_le_bytes));
+        let safe = context.safe_stderr(&bom);
+        assert!(safe.contains("cause") && safe.contains("[private]") && !safe.contains("fixture-secret"));
+        let spans = private_byte_spans(b"zabcdx", &["abc".into(), "bcd".into(), "".into()]);
+        assert_eq!(spans, [false, true, true, true, true, false]);
+        let nonascii = MetadataContext { purpose: MetadataPurpose::GuestIdentity, distro: None, private_values: &["é"] };
+        let safe = nonascii.safe_stderr("cause é".as_bytes());
+        assert!(safe.contains("cause") && safe.contains("[private]") && !safe.contains('é'));
+        assert_eq!(context.safe_text("None"), "None");
+        let known = context.safe_text("native cause 91 fixture-secret");
+        assert!(known.contains("native cause 91") && known.contains("[private]") && !known.contains("encoding ambiguous"));
+        assert!(!known.contains("fixture-secret"));
+    }
+    #[test]
     fn exact_unicode_registration_names_and_empty_list() {
         let text = "\u{feff}Ubuntu\r\nДистрибутив с пробелом\r\n";
         let utf16: Vec<_> = text.encode_utf16().flat_map(u16::to_le_bytes).collect();
@@ -239,7 +528,7 @@ mod tests {
             assert_eq!(observation.error.as_deref(), Some("synthetic secondary failure"));
             test_receive_observation(&mut controller, observation);
             let status = controller.snapshot(Some(preferences.clone()));
-            assert!(status.error.as_deref().unwrap().contains("synthetic secondary failure"));
+            assert!(status.error.as_deref().unwrap().contains("Подробности — в журнале"));
             assert_eq!(status.distributions.len(), 2);
             assert!(status.distributions.iter().all(|row| row.registration == crate::wsl_api::RegistrationState::Present && row.running.is_none()));
             assert!(!status.distributions[0].selected);
@@ -268,6 +557,73 @@ mod tests {
         let mut command = Command::new(program.as_path());
         command.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script]);
         command
+    }
+    #[test]
+    #[ignore = "owned Windows metadata actor; Root receives native fixture execution"]
+    fn metadata_drains_both_pipes_before_receiving_nonzero_exit() {
+        let program = fixture_program();
+        let script = "for($i=0;$i -lt 32;$i++){[Console]::Out.Write(('o'*8192));[Console]::Error.Write(('e'*8192))};exit 43";
+        let error = metadata_output(&program, fixture_command(&program, script), &AtomicBool::new(false),
+            MetadataContext::new(MetadataPurpose::FirewallProfileQuery, None)).unwrap_err();
+        assert!(error.contains("FirewallProfileQuery") && error.contains("exit code: 43"));
+        assert!(error.contains(&"e".repeat(32 * 8192)));
+        assert!(error.contains("stdout_bytes=262144"));
+    }
+    #[test]
+    #[ignore = "owned Windows metadata actor; Root receives native fixture execution"]
+    fn metadata_retains_nonzero_cause_and_later_recheck_failure() {
+        let program = fixture_program();
+        let script = "[Console]::Error.Write('actual cause 91'); exit 17";
+        let error = metadata_output_with_context(&program, fixture_command(&program, script), &AtomicBool::new(false),
+            true, start_stdout_reader, start_stderr_reader, Child::try_wait,
+            |_| Err("injected post-exit recheck".into()), MetadataContext::new(MetadataPurpose::FirewallProfileQuery, None)).unwrap_err();
+        assert!(error.contains("exit code: 17") && error.contains("actual cause 91") && error.contains("injected post-exit recheck"));
+    }
+    #[test]
+    #[ignore = "uses pinned Windows system program; does not spawn a child"]
+    fn metadata_cancel_and_pin_mismatch_fail_before_spawn() {
+        let program = fixture_program();
+        let cancelled = AtomicBool::new(true);
+        let error = metadata_output(&program, fixture_command(&program, "exit 0"), &cancelled,
+            MetadataContext::new(MetadataPurpose::RegisteredNames, None)).unwrap_err();
+        assert!(error.contains("cancelled"));
+        let error = metadata_output(&program, Command::new("not-the-pinned-program"), &AtomicBool::new(false),
+            MetadataContext::new(MetadataPurpose::RunningNames, None)).unwrap_err();
+        assert!(error.contains("RunningNames") && error.contains("pin differs"));
+    }
+    #[test]
+    #[ignore = "owned Windows metadata actor; Root receives native fixture execution"]
+    fn stderr_reader_failure_retains_partial_safe_cause_and_settles_child() {
+        let program = fixture_program();
+        let context = MetadataContext { purpose: MetadataPurpose::GuestIdentity, distro: Some("fixture"),
+            private_values: &["fixture-secret"] };
+        let error = metadata_output_with_context(&program, fixture_command(&program, EOF_FIXTURE),
+            &AtomicBool::new(false), false, start_stdout_reader,
+            |_stderr| thread::Builder::new().spawn(move || Err(std::io::Error::other(PartialRead {
+                bytes: b"native cause 91 fixture-secret".to_vec(), message: "injected stderr read failure".into(),
+            }))), Child::try_wait, |p| p.recheck(), context).unwrap_err();
+        assert!(error.contains("exit code: 42") && error.contains("native cause 91") && error.contains("injected stderr read failure"));
+        assert!(!error.contains("fixture-secret"));
+    }
+    #[test]
+    #[ignore = "owned Windows metadata actor; Root receives native fixture execution"]
+    fn stderr_reader_start_failure_still_receives_child_and_stdout() {
+        let program = fixture_program();
+        let error = metadata_output_with_context(&program, fixture_command(&program, EOF_FIXTURE),
+            &AtomicBool::new(false), false, start_stdout_reader,
+            |_| Err(std::io::Error::other("injected stderr start failure")), Child::try_wait, |p| p.recheck(),
+            MetadataContext::new(MetadataPurpose::RunningNames, None)).unwrap_err();
+        assert!(error.contains("exit code: 42") && error.contains("injected stderr start failure") && error.contains("stdout_bytes="));
+    }
+    #[test]
+    #[ignore = "owned Windows metadata actor; Root receives native fixture execution"]
+    fn stderr_reader_panic_still_receives_child() {
+        let program = fixture_program();
+        let error = metadata_output_with_context(&program, fixture_command(&program, EOF_FIXTURE),
+            &AtomicBool::new(false), false, start_stdout_reader,
+            |_stderr| thread::Builder::new().spawn(move || -> std::io::Result<Vec<u8>> { panic!("synthetic stderr panic") }),
+            Child::try_wait, |p| p.recheck(), MetadataContext::new(MetadataPurpose::GuestIdentity, None)).unwrap_err();
+        assert!(error.contains("exit code: 42") && error.contains("reader panicked") && error.contains("stderr_capture=Some"));
     }
     // The synthetic actor's five-second failure bound makes a missing EOF a
     // failing, physically settled test rather than an orphaned test process.
@@ -298,10 +654,10 @@ if (!$read.Wait(5000)) { exit 90 }; if ($read.Result -eq 0) { exit 42 }; exit 43
         let script = r#"$bytes=[byte[]]::new(1); $read=[Console]::OpenStandardInput().ReadAsync($bytes,0,1);
 if ($read.Wait(150)) { exit 41 }; [Console]::Out.Write('LIVE_UNWRITTEN'); exit 0"#;
         let cancel = AtomicBool::new(false);
-        let bytes = metadata_output_natural(&program, fixture_command(&program, script), &cancel).unwrap();
-        assert_eq!(bytes, b"LIVE_UNWRITTEN");
-        let error = metadata_output(&program, fixture_command(&program, script), &cancel).unwrap_err();
-        assert!(error.contains("WSL registration query failed: exit code: 41"), "{error}");
+        let bytes = metadata_output_natural(&program, fixture_command(&program, script), &cancel, MetadataContext::new(MetadataPurpose::GuestIdentity, None)).unwrap();
+        assert_eq!(bytes.stdout, b"LIVE_UNWRITTEN");
+        let error = metadata_output(&program, fixture_command(&program, script), &cancel, MetadataContext::new(MetadataPurpose::RegisteredNames, None)).unwrap_err();
+        assert!(error.contains("metadata query failed") && error.contains("exit code: 41"), "{error}");
     }
 
     #[test]
@@ -316,7 +672,7 @@ if ($read.Wait(150)) { exit 41 }; [Console]::Out.Write('LIVE_UNWRITTEN'); exit 0
                 reader_cancel.store(true, Ordering::SeqCst);
                 reader.read_to_end(&mut bytes).map(|_| bytes)
             }), Child::try_wait).unwrap_err();
-        assert!(error.contains("WSL discovery cancelled: exit code: 42"), "{error}");
+        assert!(error.contains("metadata operation cancelled") && error.contains("exit code: 42"), "{error}");
         assert!(error.contains("stop=None") && error.contains("capture=None"), "{error}");
     }
 
@@ -377,7 +733,7 @@ if ($read.Wait(150)) { exit 41 }; [Console]::Out.Write('LIVE_UNWRITTEN'); exit 0
                 reader_cancel.store(true, Ordering::SeqCst);
                 reader.read_to_end(&mut bytes).map(|_| bytes)
             }), Child::try_wait).unwrap_err();
-        assert!(error.starts_with("WSL discovery cancelled") && error.contains("stop=Some(Ok(()))"), "{error}");
+        assert!(error.contains("metadata operation cancelled") && error.contains("stop=Some(Ok(()))"), "{error}");
     }
 
     #[test]
@@ -396,8 +752,8 @@ if ($read.Wait(150)) { exit 41 }; [Console]::Out.Write('LIVE_UNWRITTEN'); exit 0
         command.args(["-d", &distro, "--exec", "sh", "-c",
             r#"agLauncher=$HOME/.local/share/ag-unlocker/wsl/$1/ag_wsl_launch; agVersion=$2; exec "$agLauncher" --prepare-only --profile 1 1 "$HOME/.antigravity-server/bin/$agVersion/language_server""#,
             "sh", &helper_digest, &version]);
-        let bytes = metadata_output_natural(&program, command, &AtomicBool::new(false)).unwrap();
-        let manifest: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let bytes = metadata_output_natural(&program, command, &AtomicBool::new(false), MetadataContext::new(MetadataPurpose::PrivateServerPreparation, None)).unwrap();
+        let manifest: serde_json::Value = serde_json::from_slice(&bytes.stdout).unwrap();
         assert_eq!(manifest.as_object().unwrap().len(), 8);
         assert_eq!(manifest["schema"], 1);
         assert_eq!(manifest["profile"], "wsl-profile-v1");

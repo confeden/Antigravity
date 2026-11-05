@@ -48,6 +48,8 @@ pub struct TargetApplyResult {
     pub state: WslTargetState,
     /// Redacted user-facing reason, never command arguments or credentials.
     pub detail: Option<String>,
+    /// Privacy-qualified technical failure, forwarded once at completion.
+    pub diagnostic: Option<String>,
 }
 
 /// Ordinary snapshot carried by ops::Status and its existing event channel.

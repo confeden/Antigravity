@@ -38,6 +38,28 @@ mod layout_tests {
     use super::*;
     use crate::wsl_api::{RegisteredDistro, RegistrationFreshness, RegistrationState, WslPreferences, WslTargetState, TargetApplyResult};
 
+    #[test]
+    #[ignore = "owned Windows metadata actor and in-process GUI channel; Root receives native fixture execution"]
+    fn diagnostic_event_is_one_journal_entry_and_uses_copy_rendering() {
+        let (mut app, _commands) = App::for_layout_test(status());
+        let (sender, events) = std::sync::mpsc::channel();
+        app.events = events;
+        let safe = crate::windows_coordinator::test_diagnostic_text();
+        assert!(!crate::ops::test_forward_wsl_diagnostic(sender, safe.clone()));
+        app.drain_events();
+        assert_eq!(app.log.len(), 1);
+        let copied = journal_copy_text(&app.log);
+        assert_eq!(copied, safe);
+        assert!(copied.contains("native error 51") && copied.contains("\\u{0}"));
+        assert!(copied.contains("encoding ambiguous") && copied.contains("a\\u{0}b\\u{0}") && copied.contains("[private]"));
+        assert!(!copied.contains("fixture-secret"));
+        let alias_units: Vec<_> = b"fixture-secret".chunks_exact(2).map(|p| u16::from_le_bytes([p[0], p[1]])).collect();
+        assert!(!copied.contains(&String::from_utf16(&alias_units).unwrap()));
+        let (closed, receiver) = std::sync::mpsc::channel();
+        drop(receiver);
+        assert!(crate::ops::test_forward_wsl_diagnostic(closed, safe));
+    }
+
     fn status() -> crate::ops::Status {
         crate::ops::Status {
             wsl: crate::wsl_api::WslStatus {
@@ -53,6 +75,47 @@ mod layout_tests {
             relay_outdated: false, relay_running: false, rules: false,
             providers: Vec::new(), relay_egress: None,
         }
+    }
+
+    fn history_status() -> crate::ops::Status {
+        let mut value = status();
+        value.wsl.preferences.as_mut().unwrap().distros.push("Debian".into());
+        value.wsl.distributions[0].running = None;
+        value.wsl.distributions.push(RegisteredDistro { name: "Debian".into(), registration: RegistrationState::Present,
+            selected: true, running: Some(false) });
+        value.wsl.results = vec![
+            TargetApplyResult { name: "Ubuntu".into(), state: WslTargetState::Blocked,
+                detail: Some("Не удалось завершить подготовку. Подробности — в журнале.".into()),
+                diagnostic: Some("GuestIdentity: synthetic technical detail".into()) },
+            TargetApplyResult { name: "Debian".into(), state: WslTargetState::ReadyToOpen,
+                detail: Some("Откройте WSL в Antigravity.".into()), diagnostic: None },
+        ];
+        value
+    }
+
+    #[test]
+    fn history_frame_labels_observation_and_apply_without_technical_detail() {
+        fn collect(shape: &egui::epaint::Shape, output: &mut Vec<String>) {
+            match shape {
+                egui::epaint::Shape::Text(text) => output.push(text.galley.job.text.clone()),
+                egui::epaint::Shape::Vec(shapes) => for shape in shapes { collect(shape, output); },
+                _ => {},
+            }
+        }
+        let ctx = egui::Context::default();
+        let (mut app, commands) = App::for_layout_test(history_status());
+        let input = || egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 1600.0))), ..Default::default() };
+        let _ = ctx.run_ui(input(), |ui| wsl_options(&mut app, ui));
+        let output = ctx.run_ui(input(), |ui| wsl_options(&mut app, ui));
+        let mut text = Vec::new();
+        for shape in &output.shapes { collect(&shape.shape, &mut text); }
+        let rendered = text.join("\n");
+        for expected in ["Последняя проверка списка", "Состояние запуска не подтверждено", "Остановлен",
+            "Последнее применение", "Подготовка завершена"] {
+            assert!(rendered.contains(expected), "missing rendered label: {expected}");
+        }
+        assert!(!rendered.contains("synthetic technical detail"));
+        assert!(commands.try_recv().is_err());
     }
 
     fn frame(ctx: &egui::Context, app: &mut App, size: egui::Vec2) -> (Vec<egui::Rect>, Vec<egui::Rect>) {
@@ -79,7 +142,7 @@ mod layout_tests {
             wsl.loading = true;
             wsl.pending = true;
             wsl.error = Some("synthetic error with a longer explanation".into());
-            wsl.results.push(TargetApplyResult { name: "Ubuntu".into(), state: WslTargetState::Failed, detail: Some("synthetic detail".into()) });
+            wsl.results.push(TargetApplyResult { name: "Ubuntu".into(), state: WslTargetState::Failed, detail: Some("synthetic detail".into()), diagnostic: None });
             app.busy = Some("synthetic progress".into());
             let changed = frame(&ctx, &mut app, size);
             assert_eq!(baseline, changed);
@@ -147,7 +210,7 @@ mod layout_tests {
             n
         }
         let case = required("AG_LAYOUT_CASE");
-        assert!(["idle", "busy", "update", "combined", "loading", "error", "results", "cancel", "long"].contains(&case.as_str()), "invalid case");
+        assert!(["idle", "busy", "update", "combined", "loading", "error", "results", "cancel", "long", "history"].contains(&case.as_str()), "invalid case");
         let width = number("AG_LAYOUT_WIDTH", false);
         let height = number("AG_LAYOUT_HEIGHT", false);
         let zoom = number("AG_LAYOUT_ZOOM", false);
@@ -169,10 +232,12 @@ mod layout_tests {
         if case == "loading" { s.wsl.loading = true; }
         if case == "error" { s.wsl.error = Some("Синтетическая ошибка обнаружения".into()); }
         if case == "results" {
-            for name in ["Ubuntu", "Debian"] { s.wsl.results.push(TargetApplyResult { name: name.into(), state: WslTargetState::ReadyToOpen, detail: Some("Подготовка проверена".into()) }); }
+            for name in ["Ubuntu", "Debian"] { s.wsl.results.push(TargetApplyResult { name: name.into(), state: WslTargetState::ReadyToOpen, detail: Some("Откройте WSL в Antigravity.".into()), diagnostic: None }); }
         }
+        if case == "history" { s = history_status(); }
         if case == "cancel" { s.wsl.pending = true; }
         let (mut app, commands) = App::for_layout_test(s);
+        if case == "history" { app.log.push((Level::Err, "GuestIdentity: synthetic technical detail".into())); }
         if case == "busy" || case == "combined" { app.busy = Some("Синтетическая операция".into()); }
         if case == "update" || case == "combined" {
             app.update = Some(crate::update::ReleaseInfo { tag_name: "v99.0.0".into(), html_url: String::new(), name: None, body: None, published_at: None, prerelease: false, draft: false, assets: Vec::new() });
@@ -558,6 +623,9 @@ fn wsl_options(app: &mut App, ui: &mut egui::Ui) {
     if wsl.registration_freshness == RegistrationFreshness::Current && wsl.distributions.is_empty() {
         ui.label("Дистрибутивы WSL не найдены.");
     }
+    if wsl.registration_freshness != RegistrationFreshness::Unobserved && !wsl.distributions.is_empty() {
+        ui.label("Последняя проверка списка");
+    }
     for distro in &wsl.distributions {
         let state = if distro.registration == RegistrationState::Absent {
             Some("Больше не найден")
@@ -565,6 +633,8 @@ fn wsl_options(app: &mut App, ui: &mut egui::Ui) {
             Some("Список ещё не подтверждён")
         } else if distro.running == Some(false) {
             Some("Остановлен")
+        } else if distro.running.is_none() {
+            Some("Состояние запуска не подтверждено")
         } else {
             None
         };
@@ -573,12 +643,18 @@ fn wsl_options(app: &mut App, ui: &mut egui::Ui) {
         }
     }
     if wsl.pending { ui.label("Операция выполняется или её завершение ещё не подтверждено."); }
+    if !wsl.results.is_empty() {
+        let heading = if wsl.results.iter().any(|result| result.state == WslTargetState::Preparing) {
+            "Текущее применение"
+        } else { "Последнее применение" };
+        ui.label(heading);
+    }
     for result in &wsl.results {
         let state = match result.state {
             WslTargetState::Unconfirmed => "Не подтверждено",
             WslTargetState::NotApplied => "Не применено",
             WslTargetState::Preparing => "Подготовка",
-            WslTargetState::ReadyToOpen => "Готово к открытию",
+            WslTargetState::ReadyToOpen => "Подготовка завершена",
             WslTargetState::Blocked => "Заблокировано",
             WslTargetState::Pending => "Выполняется",
             WslTargetState::Failed => "Ошибка",
@@ -1054,6 +1130,9 @@ fn log_line(level: Level, line: &str) -> String {
         line.to_string()
     }
 }
+fn journal_copy_text(log: &[(Level, String)]) -> String {
+    log.iter().map(|(level, line)| log_line(*level, line)).collect::<Vec<_>>().join("\n")
+}
 
 fn log_card(app: &mut App, ui: &mut egui::Ui) {
     egui::CollapsingHeader::new(egui::RichText::new("Журнал").size(13.0).color(theme::MUTED))
@@ -1139,12 +1218,7 @@ fn log_keys(app: &mut App, ui: &mut egui::Ui) {
             asked
         });
         if copy {
-            let text: String = app
-                .log
-                .iter()
-                .map(|(level, line)| log_line(*level, line))
-                .collect::<Vec<_>>()
-                .join("\n");
+            let text = journal_copy_text(&app.log);
             ui.ctx().copy_text(text);
         }
         // Any click, or Escape, gives the selection up — otherwise the next

@@ -14,7 +14,9 @@ pub(crate) mod windows_installation;
 #[path = "discovery.rs"]
 mod discovery;
 pub(crate) use discovery::{registered_distributions, registered_distributions_with_cancel,
-    observe_registered_distributions, DiscoveryObservation, Registration};
+    observe_registered_distributions, DiscoveryObservation, Registration, MetadataContext, MetadataPurpose};
+#[cfg(test)]
+pub(crate) use discovery::test_diagnostic_text;
 #[path = "process_identity.rs"]
 pub(crate) mod process_identity;
 #[path = "vendor_launch.rs"]
@@ -358,7 +360,8 @@ pub(crate) fn desktop_absent_runtime(ps: &Pinned, desktop: &Path, cancel: &Atomi
     let target = desktop.to_str().ok_or("Desktop path encoding")?;
     let command = powershell(ps.as_path(),
         r#"& { $target=$env:AG_COORD_TARGET; $ErrorActionPreference='Stop'; $name=[IO.Path]::GetFileName($target); $p=@(Get-CimInstance Win32_Process | Where-Object {$_.Name -ieq $name}); foreach($x in $p) { if (!$x.ExecutablePath -or $x.ExecutablePath -ieq $target) { throw 'DesktopAlreadyRunningOrUnknown' } }; 'AG_DESKTOP_ABSENT_V1' }"#, &[target]);
-    let result = runtime_metadata(ps, command, cancel, false)?;
+    let context = MetadataContext { purpose: MetadataPurpose::DesktopProcessCheck, distro: None, private_values: &[target] };
+    let result = runtime_metadata(ps, command, cancel, false, context)?;
     if result.trim() != "AG_DESKTOP_ABSENT_V1" { return Err("MaintenanceRequired: закройте Antigravity обычным способом.".into()); }
     Ok(())
 }
@@ -670,10 +673,10 @@ fn discover(
     bytes: usize,
 ) -> Result<Context> {
     let distro = options.text("--distro")?;
-    discover_with(distro, wsl, ps, |command| probe(command, budget, bytes, poll))
+    discover_with(distro, wsl, ps, |_, command, _| probe(command, budget, bytes, poll))
 }
-fn discover_with(distro: &str, wsl: &Path, ps: &Path, mut receive: impl FnMut(Command) -> Result<String>) -> Result<Context> {
-    let context = receive(wsl_command(wsl, distro, DISCOVER, &[]))?;
+fn discover_with(distro: &str, wsl: &Path, ps: &Path, mut receive: impl FnMut(MetadataPurpose, Command, &[&str]) -> Result<String>) -> Result<Context> {
+    let context = receive(MetadataPurpose::GuestNetworkContext, wsl_command(wsl, distro, DISCOVER, &[]), &[])?;
     let mut lines = context.lines();
     if lines.next() != Some("AG_CONTEXT_V1") {
         return Err("NoBind: context schema".into());
@@ -706,21 +709,21 @@ fn discover_with(distro: &str, wsl: &Path, ps: &Path, mut receive: impl FnMut(Co
     // Match the observed Linux next hop to an actual current Windows interface,
     // without assuming adapter alias, fixed IP or distro layout.
     let bind_text = bind.to_string();
-    let adapter = receive(
+    let adapter = receive(MetadataPurpose::HostAdapterQuery,
         powershell(
             ps,
             r#"& { $ErrorActionPreference='Stop'; $target=$env:AG_COORD_TARGET; $ips=@(Get-NetIPAddress -AddressFamily IPv4 | Where-Object {$_.IPAddress -eq $target -and $_.AddressState -eq 'Preferred'}); if($ips.Count -ne 1){throw 'NoBind: Windows interface ambiguity'}; $a=@(Get-NetAdapter -IncludeHidden | Where-Object {$_.ifIndex -eq $ips[0].InterfaceIndex -and $_.Status -eq 'Up'}); if($a.Count -ne 1){throw 'NoBind: Windows adapter unavailable'}; [ordered]@{address=$ips[0].IPAddress; interface=[uint32]$a[0].ifIndex; alias=[string]$a[0].Name; virtual=[bool]$a[0].Virtual; hardware=[bool]$a[0].HardwareInterface; description=[string]$a[0].InterfaceDescription} | ConvertTo-Json -Compress }"#,
             &[&bind_text],
-        ),
+        ), &[&home, &user, &bind_text],
     )?;
     let adapter = receive_adapter(&adapter, bind)?;
-    let route = receive(
+    let route = receive(MetadataPurpose::GuestNetworkContext,
         wsl_command(
             wsl,
             distro,
             "set -eu; ip -4 route get \"$1\"",
             &[&bind_text],
-        ),
+        ), &[&home, &user, &bind_text],
     )?;
     let source = source_route(&route, bind)?;
     if source == bind {
@@ -747,23 +750,28 @@ pub(crate) fn active_firewall_profiles(program: &Pinned, cancel: &AtomicBool) ->
     let mut command = Command::new(program.as_path());
     command.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
         "$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); ConvertTo-Json -InputObject ([uint32](New-Object -ComObject HNetCfg.FwPolicy2).CurrentProfileTypes) -Compress"]);
-    let output = runtime_metadata(program, command, cancel, false)?;
+    let output = runtime_metadata(program, command, cancel, false, MetadataContext::new(MetadataPurpose::FirewallProfileQuery, None))?;
     serde_json::from_str(output.trim()).map_err(|_| "active firewall profile receiving failed".into())
 }
-pub(crate) fn runtime_metadata(program: &Pinned, command: Command, cancel: &AtomicBool, wsl_exec: bool) -> Result<String> {
-    let bytes = if wsl_exec { discovery::metadata_output_natural(program, command, cancel)? }
-        else { discovery::metadata_output(program, command, cancel)? };
-    String::from_utf8(bytes).map_err(|_| "private metadata output encoding".into())
+pub(crate) fn runtime_metadata(program: &Pinned, command: Command, cancel: &AtomicBool, wsl_exec: bool, context: MetadataContext<'_>) -> Result<String> {
+    let output = if wsl_exec { discovery::metadata_output_natural(program, command, cancel, context)? }
+        else { discovery::metadata_output(program, command, cancel, context)? };
+    let stderr = output.diagnostic_stderr(context);
+    String::from_utf8(output.stdout).map_err(|_| format!("{}: private metadata output encoding; exit=success; capture=complete; stderr={stderr}", context.heading()))
+}
+fn discovery_metadata_context<'a>(purpose: MetadataPurpose, distro: &'a str, private_values: &'a [&'a str]) -> MetadataContext<'a> {
+    MetadataContext { purpose, distro: Some(distro), private_values }
 }
 pub(crate) fn discover_runtime_context(wsl: &Pinned, ps: &Pinned, distro: &str, cancel: &AtomicBool) -> Result<Context> {
-    discover_with(distro, wsl.as_path(), ps.as_path(), |command| {
+    discover_with(distro, wsl.as_path(), ps.as_path(), |purpose, command, private_values| {
         let linux = command.get_program() == wsl.as_path().as_os_str();
-        runtime_metadata(if linux { wsl } else { ps }, command, cancel, linux)
+        runtime_metadata(if linux { wsl } else { ps }, command, cancel, linux,
+            discovery_metadata_context(purpose, distro, private_values))
     })
 }
 pub(crate) fn discover_runtime_identity(wsl: &Pinned, distro: &str, cancel: &AtomicBool) -> Result<LinuxIdentity> {
     let output = runtime_metadata(wsl, wsl_command(wsl.as_path(), distro,
-        r#"set -eu; printf '%s\n' AG_USER_V1; id -u; id -g; id -un; printf '%s\n' "$HOME"; uname -m"#, &[]), cancel, true)?;
+        r#"set -eu; printf '%s\n' AG_USER_V1; id -u; id -g; id -un; printf '%s\n' "$HOME"; uname -m"#, &[]), cancel, true, MetadataContext::new(MetadataPurpose::GuestIdentity, Some(distro)))?;
     let mut lines = output.lines();
     if lines.next() != Some("AG_USER_V1") { return Err("default-user metadata schema".into()); }
     let identity = receive_identity(&mut lines)?;
@@ -771,12 +779,13 @@ pub(crate) fn discover_runtime_identity(wsl: &Pinned, distro: &str, cancel: &Ato
     Ok(identity)
 }
 pub(crate) fn provision_runtime_helper(wsl: &Pinned, distro: &str, assets: &windows_installation::PackageAssets,
-    architecture: &str, cancel: &AtomicBool) -> Result<String> {
+    architecture: &str, guest_home: &str, cancel: &AtomicBool) -> Result<String> {
     assets.recheck()?;
     let convert = |path: &Path| -> Result<String> {
         let mut command = Command::new(wsl.as_path());
         command.args(["-d", distro, "--exec", "wslpath", "-a", "--"]).arg(path);
-        let output = runtime_metadata(wsl, command, cancel, true)?;
+        let source_path = path.to_string_lossy();
+        let output = runtime_metadata(wsl, command, cancel, true, MetadataContext { purpose: MetadataPurpose::HelperPath, distro: Some(distro), private_values: &[source_path.as_ref(), guest_home] })?;
         let value = output.trim();
         if value.lines().count() != 1 || !child_environment::valid_launcher(value) { return Err("helper deployment path unavailable".into()); }
         Ok(value.into())
@@ -786,10 +795,11 @@ pub(crate) fn provision_runtime_helper(wsl: &Pinned, distro: &str, assets: &wind
     assets.recheck()?;
     let mut command = Command::new(wsl.as_path());
     command.args(["-d", distro, "--exec", "sh", &installer, &source, assets.helper_digest()]);
-    let output = runtime_metadata(wsl, command, cancel, true)?;
+    let output = runtime_metadata(wsl, command, cancel, true, MetadataContext { purpose: MetadataPurpose::HelperProvision, distro: Some(distro), private_values: &[&source, &installer, guest_home] })?;
     let launcher = output.trim();
     if launcher.lines().count() != 1 || !child_environment::valid_launcher(launcher) { return Err("helper installation receipt invalid".into()); }
-    let receipt = runtime_metadata(wsl, wsl_command(wsl.as_path(), distro, VERIFY_HELPER, &[launcher]), cancel, true)?;
+    let receipt = runtime_metadata(wsl, wsl_command(wsl.as_path(), distro, VERIFY_HELPER, &[launcher]), cancel, true,
+        MetadataContext { purpose: MetadataPurpose::HelperVerify, distro: Some(distro), private_values: &[launcher, guest_home] })?;
     verify_helper(&receipt, assets.helper_digest(), architecture)?;
     assets.recheck()?;
     Ok(launcher.into())
@@ -1352,6 +1362,25 @@ pub fn blocked_diagnostic_fixture(root: &Path, budget: Duration) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn discovery_route_error_masks_received_guest_home() {
+        let mut phase = 0;
+        let error = match discover_with("fixture", Path::new("wsl.exe"), Path::new("powershell.exe"), |purpose, _command, private| {
+            phase += 1;
+            match phase {
+                1 => { assert!(private.is_empty()); Ok("AG_CONTEXT_V1\n1000\n1000\nfixture-user\n/fixture-home-private\nx86_64\nnet:[123]\ndefault via 192.0.2.1 dev eth0\n".into()) },
+                2 => Ok(r#"{"address":"192.0.2.1","interface":47,"alias":"vEthernet (fixture)","virtual":true,"hardware":false,"description":"Hyper-V Virtual Ethernet Adapter"}"#.into()),
+                3 => {
+                    let context = discovery_metadata_context(purpose, "fixture", private);
+                    Err(context.safe_stderr(b"native error 51 /fixture-home-private"))
+                },
+                _ => panic!("unexpected operation"),
+            }
+        }) { Ok(_) => panic!("route failure unexpectedly succeeded"), Err(error) => error };
+        assert_eq!(phase, 3);
+        assert!(error.contains("native error 51"));
+        assert!(!error.contains("/fixture-home-private"));
+    }
     #[test]
     fn explicit_inputs_and_route_ambiguity_fail_closed() {
         assert!(Options::parse(vec![
