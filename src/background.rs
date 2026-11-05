@@ -129,6 +129,8 @@ mod windows_impl {
         pub(crate) relay: bool,
         pub(crate) watchdog: bool,
     }
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum ImageDemand { KeepCompatible, DeliverSelectedImage }
 
     #[derive(serde::Serialize, Debug)]
     pub(crate) enum BackgroundEffect {
@@ -195,6 +197,7 @@ mod windows_impl {
         created_program: Option<CreatedManagedProgram>,
         image: Option<Result<std::sync::Arc<windows_coordinator::process_identity::CurrentImage>, String>>,
         source_leases: Vec<std::sync::Arc<windows_installation::BackgroundLease>>,
+        delivery_selected: bool,
         #[cfg(test)]
         scheduler_fixture: Option<SchedulerFixture>,
     }
@@ -258,8 +261,9 @@ mod windows_impl {
     }
     impl task_scheduler::Receiving for BackgroundRun<'_> {
         fn check_cancel(&mut self) -> Result<(), String> { self.ready() }
-        fn before_retirement(&mut self) -> Result<(), String> {
+        fn before_retirement(&mut self, participants: &task_scheduler::TransitionParticipants<'_>) -> Result<(), String> {
             self.ready()?;
+            check_selected_delivery_now(self, participants)?;
             if !self.restoration_pending {
                 self.record("exactInstanceRetirementGrantPending")?;
                 self.ready()?;
@@ -302,7 +306,7 @@ mod windows_impl {
             Err(error) => { received.persistence_errors.push(error.clone()); received.result = Err(error); return received; }
         };
         received.diagnostic_journal = Some(diagnostic.journal_reference());
-        let mut run = BackgroundRun { received, cancelled, diagnostic, lease: Some(&lease), program_directory: directory, selected_program, primary_unwind: None, restoring: false, created_directory: None, created_program: None, image, source_leases: Vec::new(),
+        let mut run = BackgroundRun { received, cancelled, diagnostic, lease: Some(&lease), program_directory: directory, selected_program, primary_unwind: None, restoring: false, created_directory: None, created_program: None, image, source_leases: Vec::new(), delivery_selected: false,
             #[cfg(test)] scheduler_fixture: None };
         run.received.result = run.ready().and_then(|_| action(&mut run));
         if cancelled.load(Ordering::SeqCst) {
@@ -715,6 +719,67 @@ mod windows_impl {
         Ok(generation_for_update(&dns_forwarder::checked_installed_version_observation(), runtime)? < dns_forwarder::RELAY_VERSION)
     }
 
+    struct Inspection<'a>(&'a AtomicBool);
+    impl task_scheduler::Receiving for Inspection<'_> {
+        fn check_cancel(&mut self) -> Result<(), String> {
+            if self.0.load(Ordering::SeqCst) { Err("Cancelled: background inspection".into()) } else { Ok(()) }
+        }
+        fn before_retirement(&mut self, _: &task_scheduler::TransitionParticipants<'_>) -> Result<(), String> { Err("read-only inspection cannot retire tasks".into()) }
+        fn receive(&mut self, _: task_scheduler::Event) -> Result<(), String> { Ok(()) }
+    }
+    pub(crate) fn selected_delivery_required(cancelled: &AtomicBool,
+        image: std::sync::Arc<windows_coordinator::process_identity::CurrentImage>) -> Result<bool, String> {
+        let locations = windows_installation::background_locations()?;
+        let inputs = windows_installation::background_inputs_selected(locations.managed_root(),
+            locations.managed_directory(), image, &dns_forwarder::log_dir())?;
+        let context = windows_coordinator::receive_for_background(&inputs)?;
+        let lease = windows_installation::background_lease(inputs, context)?;
+        let source = lease.source_bytes()?;
+        let scheduler = task_scheduler::Scheduler::connect()?;
+        let version = dns_forwarder::read_version_checked(lease.context()).map_err(|error| error.to_string())?;
+        let metadata = version.value();
+        let legacy = if scheduler.references_program(locations.legacy_program())? {
+            Some(windows_installation::legacy_background_input(&locations)?
+                .ok_or("OwnershipRequired: selected legacy task has no received legacy program")?)
+        } else { None };
+        let program = match fs::symlink_metadata(locations.managed_program()) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                None
+            }
+            Err(e) => return Err(format!("installed executable metadata: {e}")),
+            Ok(_) => Some(windows_installation::checked_background_path(&lease, locations.managed_program(), PathKind::File)?),
+        };
+        let programs = task_scheduler::Programs { managed: program.as_ref(), legacy: legacy.as_ref() };
+        let selected = scheduler.receive(&["relay", "watchdog"], &programs, &mut Inspection(cancelled))?;
+        let report = crate::gate::read_checked()?;
+        let participants = selected.transition_participants(&programs)?;
+        let runtime = transition_runtime_generation(&participants, report.as_ref());
+        if selected.has_legacy() {
+            if let Some(program) = &program {
+                selected.managed_binding(program)?.ok_or("OccupiedStateHold: managed image has no current qualified task/program binding")?.revalidate()?;
+            }
+            current_image_decision(&metadata, runtime, false, ImageDemand::DeliverSelectedImage, Some(false))?;
+            version.revalidate().map_err(|error| error.to_string())?;
+            lease.source_bytes()?;
+            return Ok(true);
+        }
+        let Some(program) = program.as_ref() else {
+            let tasks = checked_task_state_with_cancel(cancelled)?;
+            if tasks.relay_enabled || tasks.watchdog_enabled { return Err("OwnershipRequired: registered background role references an absent program".into()); }
+            reject_newer_generation(&metadata, runtime)?;
+            return Ok(false);
+        };
+        let binding = selected.managed_binding(program)?.ok_or("OccupiedStateHold: managed image has no current qualified task/program binding")?;
+        let bytes = program.read_snapshot()?;
+        binding.revalidate()?;
+        let decision = current_image_decision(&metadata, runtime, false, ImageDemand::DeliverSelectedImage,
+            Some(bytes.as_slice() == source))?;
+        version.revalidate().map_err(|error| error.to_string())?;
+        lease.source_bytes()?;
+        binding.revalidate()?;
+        Ok(decision == CurrentImageDecision::UpdateRequired)
+    }
+
     /// True when the logon task exists. Says nothing about whether the relay is
     /// running right now - `is_running` answers that.
     pub fn is_enabled() -> bool {
@@ -745,7 +810,7 @@ mod windows_impl {
         uncancelled_receiving("enableRelay", enable_inner)
     }
     fn enable_inner(received: &mut BackgroundRun<'_>) -> Result<(), String> {
-        let program = ensure_program(received, None)?;
+        let program = ensure_program(received, None, ImageDemand::KeepCompatible)?;
         let receipt = scheduler("relay", true, &program, received)?;
         require_running(&receipt, "relay")?;
         await_relay_health(&receipt, &program, received)
@@ -799,7 +864,7 @@ mod windows_impl {
     }
     pub(crate) fn ensure_installed_with_receiving() -> BackgroundReceiving {
         uncancelled_receiving("ensureInstalled", |received| {
-            ensure_program(received, None).map(|_| ())
+            ensure_program(received, None, ImageDemand::KeepCompatible).map(|_| ())
         })
     }
 
@@ -889,9 +954,19 @@ mod windows_impl {
                 // restoration still runs under the existing transition latch.
                 if received.cancelled.load(Ordering::SeqCst) { received.cancellation_received = true; }
                 else if errors.is_empty() {
-                    let (value, primary_errors) = invoke_primary(received, |run| primary(run, &program, &mut replacement));
-                    primary_value = value;
-                    errors.extend(primary_errors);
+                    if received.delivery_selected {
+                        let check = match &selected {
+                            Some(selected) => selected.transition_participants(&programs)
+                                .and_then(|participants| check_selected_delivery_now(received, &participants)),
+                            None => Err("OwnershipRequired: selected transition participants were not received".into()),
+                        };
+                        if let Err(error) = check { errors.push(error); }
+                    }
+                    if errors.is_empty() {
+                        let (value, primary_errors) = invoke_primary(received, |run| primary(run, &program, &mut replacement));
+                        primary_value = value;
+                        errors.extend(primary_errors);
+                    }
                 }
             }
             Err(error) => errors.push(error),
@@ -1024,20 +1099,47 @@ mod windows_impl {
         report.filter(|report| !report.is_stale() && report.version != 0 && Path::new(&report.exe) == program)
             .map(|report| report.version)
     }
+    fn transition_runtime_generation(participants: &task_scheduler::TransitionParticipants<'_>,
+        report: Option<&crate::gate::Report>) -> Option<u32> {
+        projected_runtime_generation(participants.program_paths(), report)
+    }
+    fn projected_runtime_generation<'a>(mut paths: impl Iterator<Item = &'a Path>, report: Option<&crate::gate::Report>) -> Option<u32> {
+        paths.find_map(|path| runtime_generation(report, path))
+    }
+    fn selected_retirement_decision<'a>(paths: impl Iterator<Item = &'a Path>, report: Option<&crate::gate::Report>,
+        metadata: &Result<Option<u32>, String>, record: impl FnOnce(BackgroundEffect) -> Result<(), String>) -> Result<(), String> {
+        let mut paths = paths.peekable();
+        let has_participant = paths.peek().is_some();
+        let runtime = projected_runtime_generation(paths, report);
+        record(BackgroundEffect::GenerationObserved { metadata: metadata.clone(), runtime })?;
+        if !has_participant { return reject_newer_generation(metadata, runtime); }
+        current_image_decision(metadata, runtime, false, ImageDemand::DeliverSelectedImage, Some(false)).map(|_| ())
+    }
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum CurrentImageDecision { ReuseCurrent, UpdateRequired }
-    fn current_image_decision(metadata: &Result<Option<u32>, String>, runtime: Option<u32>, compatible: bool)
+    fn reject_newer_generation(metadata: &Result<Option<u32>, String>, runtime: Option<u32>) -> Result<(), String> {
+        if runtime.is_some_and(|v| v > dns_forwarder::RELAY_VERSION) ||
+            matches!(metadata, Ok(Some(v)) if *v > dns_forwarder::RELAY_VERSION) {
+            return Err("UpdatePending: installed generation is newer; downgrade was not admitted".into());
+        }
+        Ok(())
+    }
+    fn current_image_decision(metadata: &Result<Option<u32>, String>, runtime: Option<u32>, compatible: bool,
+        demand: ImageDemand, same_bytes: Option<bool>)
         -> Result<CurrentImageDecision, String> {
-        if compatible { return Ok(CurrentImageDecision::ReuseCurrent); }
+        if demand == ImageDemand::KeepCompatible && compatible { return Ok(CurrentImageDecision::ReuseCurrent); }
+        if demand == ImageDemand::DeliverSelectedImage { reject_newer_generation(metadata, runtime)?; }
         let generation = generation_for_update(metadata, runtime)?;
         if generation > dns_forwarder::RELAY_VERSION {
             return Err("UpdatePending: installed generation is newer; downgrade was not admitted".into());
         }
-        Ok(if generation == dns_forwarder::RELAY_VERSION { CurrentImageDecision::ReuseCurrent }
+        Ok(if generation == dns_forwarder::RELAY_VERSION &&
+            (demand == ImageDemand::KeepCompatible || same_bytes.ok_or("selected image comparison was not received")?) { CurrentImageDecision::ReuseCurrent }
             else { CurrentImageDecision::UpdateRequired })
     }
     fn receive_current_image_decision(received: &mut BackgroundRun<'_>, program: &CheckedPath,
-        selected: &task_scheduler::TaskSet<'_>, metadata: &Result<Option<u32>, String>) -> Result<CurrentImageDecision, String> {
+        programs: &task_scheduler::Programs<'_>, selected: &task_scheduler::TaskSet<'_>, metadata: &Result<Option<u32>, String>, demand: ImageDemand)
+        -> Result<(CurrentImageDecision, Option<std::sync::Arc<windows_installation::BackgroundLease>>), String> {
         let binding = selected.managed_binding(program)?
             .ok_or("OccupiedStateHold: managed image has no current qualified task/program binding")?;
         binding.revalidate()?;
@@ -1048,12 +1150,17 @@ mod windows_impl {
         received.effect(BackgroundEffect::CurrentProgramReceived { program_native_id: program.native_id(),
             sha256: hex::encode(sha2::Sha256::digest(&bytes)) })?;
         let report = crate::gate::read_checked()?;
-        let runtime = runtime_generation(report.as_ref(), program.as_path());
+        let runtime = if demand == ImageDemand::DeliverSelectedImage {
+            transition_runtime_generation(&selected.transition_participants(programs)?, report.as_ref())
+        } else { runtime_generation(report.as_ref(), program.as_path()) };
         received.effect(BackgroundEffect::GenerationObserved { metadata: metadata.clone(), runtime })?;
         let compatible = received.relay_compatible()?;
-        let decision = current_image_decision(metadata, runtime, compatible)?;
-        if compatible { received.effect(BackgroundEffect::CompatibleNoop)?; }
-        Ok(decision)
+        let source = if demand == ImageDemand::DeliverSelectedImage { Some(receive_copy_source(received)?) } else { None };
+        let same_bytes = source.as_ref().map(|lease| lease.source_bytes().map(|source| source == bytes.as_slice())).transpose()?;
+        binding.revalidate()?;
+        let decision = current_image_decision(metadata, runtime, compatible, demand, same_bytes)?;
+        if compatible && decision == CurrentImageDecision::ReuseCurrent { received.effect(BackgroundEffect::CompatibleNoop)?; }
+        Ok((decision, source))
     }
     fn receive_version<'context>(received: &mut BackgroundRun<'context>) -> Result<dns_forwarder::VersionPlan<'context>, String> {
         match dns_forwarder::read_version_checked(received.context()) {
@@ -1104,6 +1211,20 @@ mod windows_impl {
             });
         }
         Ok(())
+    }
+    fn recheck_delivery_transition(received: &mut BackgroundRun<'_>, selected: &task_scheduler::TaskSet<'_>,
+        programs: &task_scheduler::Programs<'_>, version: &dns_forwarder::VersionPlan<'_>) -> Result<(), String> {
+        let participants = selected.transition_participants(programs)?;
+        check_selected_delivery_now(received, &participants)?;
+        revalidate_generation(received, version)
+    }
+    fn check_selected_delivery_now(received: &mut BackgroundRun<'_>, participants: &task_scheduler::TransitionParticipants<'_>) -> Result<(), String> {
+        if !received.delivery_selected { return Ok(()); }
+        received.ready()?;
+        let version = receive_version(received)?;
+        let report = crate::gate::read_checked()?;
+        selected_retirement_decision(participants.program_paths(), report.as_ref(), &version.value(), |effect| received.effect(effect))?;
+        revalidate_generation(received, &version)
     }
     fn apply_program_update(received: &mut BackgroundRun<'_>, program: &CheckedPath,
         source_lease: &windows_installation::BackgroundLease, same_bytes: bool,
@@ -1214,7 +1335,7 @@ mod windows_impl {
     }
 
     fn migrate_legacy(received: &mut BackgroundRun<'_>, desired: BackgroundDesired,
-        version: dns_forwarder::VersionPlan<'_>) -> Result<CheckedPath, String> {
+        version: dns_forwarder::VersionPlan<'_>, demand: ImageDemand) -> Result<CheckedPath, String> {
         let locations = windows_installation::background_locations()?;
         let legacy = windows_installation::legacy_background_input(&locations)?
             .ok_or("OwnershipRequired: selected legacy task has no received legacy program")?;
@@ -1230,17 +1351,31 @@ mod windows_impl {
         drop(before);
         let metadata = version.value();
         let (managed, update) = match existing {
-            Some(managed) => match receive_current_image_decision(received, &managed, &selected, &metadata)? {
-                CurrentImageDecision::ReuseCurrent => (managed, None),
-                CurrentImageDecision::UpdateRequired => {
-                    let lease = receive_copy_source(received)?;
+            Some(managed) => match receive_current_image_decision(received, &managed,
+                &task_scheduler::Programs { managed: Some(&managed), legacy: Some(&legacy) }, &selected, &metadata, demand)? {
+                (CurrentImageDecision::ReuseCurrent, _) => {
+                    if demand == ImageDemand::DeliverSelectedImage { revalidate_generation(received, &version)?; }
+                    (managed, None)
+                },
+                (CurrentImageDecision::UpdateRequired, source) => {
+                    let lease = match source { Some(lease) => lease, None => receive_copy_source(received)? };
                     let same_bytes = managed.read_snapshot()?.as_slice() == lease.source_bytes()?;
                     revalidate_generation(received, &version)?;
                     (managed, Some((lease, same_bytes, version)))
                 }
             },
             None => {
+                if demand == ImageDemand::DeliverSelectedImage {
+                    recheck_delivery_transition(received, &selected,
+                        &task_scheduler::Programs { managed: None, legacy: Some(&legacy) }, &version)?;
+                }
                 let lease = receive_copy_source(received)?;
+                if demand == ImageDemand::DeliverSelectedImage {
+                    let programs = task_scheduler::Programs { managed: None, legacy: Some(&legacy) };
+                    let participants = selected.transition_participants(&programs)?;
+                    check_selected_delivery_now(received, &participants)?;
+                    revalidate_generation(received, &version)?;
+                }
                 let managed = create_managed_image(received, &lease)?;
                 lease.source_bytes()?;
                 record_generation(received, version)?;
@@ -1249,6 +1384,10 @@ mod windows_impl {
         };
         let programs = task_scheduler::Programs { managed: Some(&managed), legacy: Some(&legacy) };
         for lease in &received.source_leases { lease.source_bytes()?; }
+        if demand == ImageDemand::DeliverSelectedImage {
+            let current_version = receive_version(received)?;
+            recheck_delivery_transition(received, &selected, &programs, &current_version)?;
+        }
         // All fallible definition updates/readbacks finish while OLD retained
         // instances continue. Neither a warning nor a path-only match is Ready.
         if let Err(error) = selected.update_paths(&programs, received) {
@@ -1277,7 +1416,7 @@ mod windows_impl {
     /// any collision, and actual identity/bytes are independently read back
     /// before the scheduler may observe the executable. No source-byte mismatch
     /// can authorize stopping an existing task or overwriting its image.
-    fn ensure_program(received: &mut BackgroundRun<'_>, desired: Option<BackgroundDesired>) -> Result<CheckedPath, String> {
+    fn ensure_program(received: &mut BackgroundRun<'_>, desired: Option<BackgroundDesired>, demand: ImageDemand) -> Result<CheckedPath, String> {
         received.ready()?;
         // Receive the actual nonsecret generation leaf even on the no-op path.
         // This one plan, preimage and writer lease survive any chosen update.
@@ -1291,21 +1430,27 @@ mod windows_impl {
                 let before = received.task_state()?;
                 BackgroundDesired { relay: before.relay_enabled, watchdog: before.watchdog_enabled }
             }};
-            return migrate_legacy(received, desired, version);
+            return migrate_legacy(received, desired, version, demand);
         }
         match fs::symlink_metadata(&destination) {
             Ok(_) => {
                 let installed = windows_installation::checked_background_path(received.lease()?, &destination, PathKind::File)?;
                 let known = task_scheduler::Programs { managed: Some(&installed), legacy: None };
                 let selected = scheduler.receive(&["relay", "watchdog"], &known, received)?;
-                let decision = receive_current_image_decision(received, &installed, &selected, &metadata)?;
-                drop(selected);
-                drop(known);
-                if decision == CurrentImageDecision::ReuseCurrent { return Ok(installed); }
+                let (decision, source) = receive_current_image_decision(received, &installed, &known, &selected, &metadata, demand)?;
+                if decision == CurrentImageDecision::ReuseCurrent {
+                    if demand == ImageDemand::DeliverSelectedImage { revalidate_generation(received, &version)?; }
+                    return Ok(installed);
+                }
                 let before = received.task_state()?;
-                let source_lease = receive_copy_source(received)?;
+                let source_lease = match source { Some(lease) => lease, None => receive_copy_source(received)? };
                 let same_bytes = installed.read_snapshot()?.as_slice() == source_lease.source_bytes()?;
                 revalidate_generation(received, &version)?;
+                if demand == ImageDemand::DeliverSelectedImage {
+                    recheck_delivery_transition(received, &selected, &known, &version)?;
+                }
+                drop(selected);
+                drop(known);
                 let desired = desired.unwrap_or(BackgroundDesired { relay: before.relay_enabled, watchdog: before.watchdog_enabled });
                 let (primary, outcome) = owned_transition(received, installed, desired,
                     |run, program, replacement| apply_program_update(run, program, &source_lease, same_bytes, version, replacement));
@@ -1323,7 +1468,15 @@ mod windows_impl {
         if tasks.relay_enabled || tasks.watchdog_enabled {
             return Err("OwnershipRequired: existing background task references an absent program; preserve the task".into());
         }
+        if demand == ImageDemand::DeliverSelectedImage { reject_newer_generation(&metadata, None)?; }
         let source_lease = receive_copy_source(received)?;
+        if demand == ImageDemand::DeliverSelectedImage {
+            let programs = task_scheduler::Programs { managed: None, legacy: None };
+            let selected = scheduler.receive(&["relay", "watchdog"], &programs, received)?;
+            let participants = selected.transition_participants(&programs)?;
+            check_selected_delivery_now(received, &participants)?;
+            revalidate_generation(received, &version)?;
+        }
         let installed = create_managed_image(received, &source_lease)?;
         source_lease.source_bytes()?;
         record_generation(received, version)?;
@@ -1354,7 +1507,7 @@ mod windows_impl {
     }
     pub(crate) fn enable_watchdog_with_receiving() -> BackgroundReceiving {
         uncancelled_receiving("enableWatchdog", |received| {
-            let program = ensure_program(received, None)?;
+            let program = ensure_program(received, None, ImageDemand::KeepCompatible)?;
             let receipt = scheduler("watchdog", true, &program, received)?;
             require_running(&receipt, "watchdog")
         })
@@ -1376,12 +1529,14 @@ mod windows_impl {
 
     /// One full profile operation: the caller supplies both authoritative role
     /// values, including unchanged roles omitted from an Option-valued delta.
-    pub(crate) fn reconcile_with_receiving(desired: BackgroundDesired, cancelled: &AtomicBool,
+    pub(crate) fn reconcile_with_receiving(desired: BackgroundDesired, demand: ImageDemand, cancelled: &AtomicBool,
         image: Result<std::sync::Arc<windows_coordinator::process_identity::CurrentImage>, String>) -> BackgroundReceiving {
         receiving("reconcileBackgroundProfile", cancelled, Some(image), |received| {
+            received.delivery_selected = demand == ImageDemand::DeliverSelectedImage;
             if desired.relay || desired.watchdog {
-                let program = ensure_program(received, Some(desired))?;
+                let program = ensure_program(received, Some(desired), demand)?;
                 for (wanted, role) in [(desired.watchdog, "watchdog"), (desired.relay, "relay")] {
+                    for lease in &received.source_leases { lease.source_bytes()?; }
                     if wanted {
                         let started = scheduler(role, true, &program, received)?;
                         require_running(&started, role)?;
@@ -1389,6 +1544,7 @@ mod windows_impl {
                     } else {
                         disable_role(role, received)?;
                     }
+                    for lease in &received.source_leases { lease.source_bytes()?; }
                 }
                 Ok(())
             } else {
@@ -1479,7 +1635,7 @@ mod windows_impl {
             let mut received = BackgroundRun {
                 received: empty_receiving("syntheticNativeCaptureOnly"), cancelled: &cancelled,
                 diagnostic: BackgroundDiagnostic::begin("syntheticNativeCaptureOnly", directory.clone(), None).unwrap(),
-                lease: None, program_directory: directory.clone(), selected_program: directory.join("synthetic-unused-program"), primary_unwind: None, restoring: false, created_directory: None, created_program: None, image: None, source_leases: Vec::new(), scheduler_fixture: None,
+                lease: None, program_directory: directory.clone(), selected_program: directory.join("synthetic-unused-program"), primary_unwind: None, restoring: false, created_directory: None, created_program: None, image: None, source_leases: Vec::new(), delivery_selected: false, scheduler_fixture: None,
             };
             // Exceeds Core's 640-character presentation limit. This helper does
             // not connect to Task Scheduler or change product/user state.
@@ -1516,7 +1672,7 @@ mod windows_impl {
                     diagnostic: BackgroundDiagnostic::begin("syntheticSourceCaptureFailure", directory.clone(), None).unwrap(),
                     lease: None, program_directory: directory.join("unused-program"), selected_program: directory.join("unused-program/ag_dns.exe"),
                     primary_unwind: None, restoring: false, created_directory: None, created_program: None,
-                    image: Some(Ok(image.clone())), source_leases: Vec::new(), scheduler_fixture: None,
+                    image: Some(Ok(image.clone())), source_leases: Vec::new(), delivery_selected: false, scheduler_fixture: None,
                 };
                 windows_installation::fail_next_source_capture_revalidation();
                 let cause = match receive_copy_source(&mut run) { Ok(_) => panic!("controlled source failure missing"), Err(cause) => cause };
@@ -1571,7 +1727,7 @@ mod windows_impl {
                 let mut received = BackgroundRun {
                     received: empty_receiving("syntheticTransitionModelOnly"), cancelled: &cancelled,
                     diagnostic: BackgroundDiagnostic::begin("syntheticTransitionModelOnly", directory.clone(), None).unwrap(),
-                    lease: None, program_directory: directory.clone(), selected_program: path.clone(), primary_unwind: None, restoring: false, created_directory: None, created_program: None, image: None, source_leases: Vec::new(),
+                    lease: None, program_directory: directory.clone(), selected_program: path.clone(), primary_unwind: None, restoring: false, created_directory: None, created_program: None, image: None, source_leases: Vec::new(), delivery_selected: false,
                     scheduler_fixture: Some(SchedulerFixture { relay_present: true, watchdog_present: true,
                         cancel_after_retire: case == "cancel-after-retire", fail_after_retire: case == "sink-after-stop", replies, calls: Vec::new(), program_native_ids: Vec::new() }),
                 };
@@ -1634,18 +1790,36 @@ mod windows_impl {
             // This SAME decision is called for mixed and fully Managed task
             // sets. Desired GUI bytes are deliberately not an authority input.
             for metadata in [Ok(Some(dns_forwarder::RELAY_VERSION)), Ok(Some(44))] {
-                let decision = current_image_decision(&metadata, None, false).unwrap();
+                let decision = current_image_decision(&metadata, None, false, ImageDemand::KeepCompatible, None).unwrap();
                 assert_eq!(decision, if metadata == Ok(Some(dns_forwarder::RELAY_VERSION)) {
                     CurrentImageDecision::ReuseCurrent
                 } else { CurrentImageDecision::UpdateRequired });
             }
-            assert_eq!(current_image_decision(&Ok(None), Some(dns_forwarder::RELAY_VERSION), false).unwrap(), CurrentImageDecision::ReuseCurrent);
-            assert_eq!(current_image_decision(&Err("unavailable synthetic metadata".into()), None, true).unwrap(), CurrentImageDecision::ReuseCurrent);
+            assert_eq!(current_image_decision(&Ok(None), Some(dns_forwarder::RELAY_VERSION), false, ImageDemand::KeepCompatible, None).unwrap(), CurrentImageDecision::ReuseCurrent);
+            assert_eq!(current_image_decision(&Err("unavailable synthetic metadata".into()), None, true, ImageDemand::KeepCompatible, None).unwrap(), CurrentImageDecision::ReuseCurrent);
             for unknown in [Ok(None), Ok(Some(0)), Err("malformed synthetic metadata".into())] {
-                assert!(current_image_decision(&unknown, None, false).is_err());
+                assert!(current_image_decision(&unknown, None, false, ImageDemand::KeepCompatible, None).is_err());
             }
-            assert!(current_image_decision(&Ok(Some(dns_forwarder::RELAY_VERSION + 1)), None, false).is_err());
+            assert!(current_image_decision(&Ok(Some(dns_forwarder::RELAY_VERSION + 1)), None, false, ImageDemand::KeepCompatible, None).is_err());
             assert!(require_owned_occupancy(OccupancyOwnership::Unproved).is_err(), "generation/equal bytes never adopt an occupied image");
+        }
+
+        #[test]
+        fn selected_delivery_obeys_generation_and_source_comparison() {
+            let g = dns_forwarder::RELAY_VERSION;
+            let decide = |metadata, runtime, same| current_image_decision(&metadata, runtime, true,
+                ImageDemand::DeliverSelectedImage, same);
+            assert_eq!(decide(Ok(Some(g)), Some(g), Some(true)).unwrap(), CurrentImageDecision::ReuseCurrent);
+            assert_eq!(decide(Ok(Some(g)), Some(g), Some(false)).unwrap(), CurrentImageDecision::UpdateRequired);
+            assert!(decide(Ok(Some(g + 1)), Some(g), Some(true)).is_err());
+            assert!(decide(Ok(Some(g)), Some(g + 1), Some(true)).is_err());
+            assert_eq!(decide(Ok(Some(g - 1)), Some(g), Some(true)).unwrap(), CurrentImageDecision::ReuseCurrent);
+            assert_eq!(decide(Ok(Some(g)), Some(g - 1), Some(true)).unwrap(), CurrentImageDecision::UpdateRequired);
+            for metadata in [Ok(None), Ok(Some(0)), Err("metadata unavailable".into())] {
+                assert_eq!(decide(metadata.clone(), Some(g), Some(true)).unwrap(), CurrentImageDecision::ReuseCurrent);
+                assert!(decide(metadata, None, Some(true)).is_err());
+            }
+            assert!(decide(Ok(Some(g)), Some(g), None).is_err());
         }
 
         #[test]
@@ -1654,7 +1828,9 @@ mod windows_impl {
             let root = PathBuf::from(env::var_os("AG_BACKGROUND_FIXTURE_ROOT").expect("explicit owned fixture root required"));
             windows_installation::WindowsLocalPath::parse(root.as_os_str()).unwrap();
             for update in [false, true] {
-                let decision = current_image_decision(&Ok(Some(if update { 44 } else { dns_forwarder::RELAY_VERSION })), None, false).unwrap();
+                let decision = current_image_decision(&Ok(Some(dns_forwarder::RELAY_VERSION)), None, true,
+                    if update { ImageDemand::DeliverSelectedImage } else { ImageDemand::KeepCompatible },
+                    update.then_some(false)).unwrap();
                 let make_program = |bytes: &[u8]| {
                     let path = root.join(format!("{}-current-image-model.bin", windows_installation::new_request_id().unwrap()));
                     let mut output = windows_installation::create_background_diagnostic_file(&path, None).unwrap();
@@ -1675,7 +1851,7 @@ mod windows_impl {
                     received: empty_receiving("syntheticCurrentImageModelOnly"), cancelled: &cancelled,
                     diagnostic: BackgroundDiagnostic::begin("syntheticCurrentImageModelOnly", root.clone(), None).unwrap(),
                     lease: None, program_directory: root.clone(), selected_program: program.as_path().to_path_buf(),
-                    primary_unwind: None, restoring: false, created_directory: None, created_program: None, image: None, source_leases: Vec::new(),
+                    primary_unwind: None, restoring: false, created_directory: None, created_program: None, image: None, source_leases: Vec::new(), delivery_selected: false,
                     scheduler_fixture: Some(SchedulerFixture { relay_present: true, watchdog_present: true, cancel_after_retire: false,
                         fail_after_retire: false, replies, calls: Vec::new(), program_native_ids: Vec::new() }),
                 };

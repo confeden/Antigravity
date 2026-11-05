@@ -45,7 +45,7 @@ pub(crate) struct DefinitionView {
 pub(crate) enum Event { Call(Call), Definition(DefinitionView), DefinitionsReadyForRetirement, InstanceRetired(InstanceView), RoleRunning { role: String, instance: InstanceView } }
 pub(crate) trait Receiving {
     fn check_cancel(&mut self) -> Result<()>;
-    fn before_retirement(&mut self) -> Result<()>;
+    fn before_retirement(&mut self, participants: &TransitionParticipants<'_>) -> Result<()>;
     fn receive(&mut self, event: Event) -> Result<()>;
 }
 
@@ -73,12 +73,12 @@ fn require_clean(call: &Call) -> Result<()> {
     Err(format!("{} {} returned HRESULT {:?}/ErrorInfo {:?}; no readiness or next retirement grant", call.operation, call.role, call.returned_hresult, call.error_info))
 }
 fn invoke<T>(receiving: &mut impl Receiving, operation: &'static str, role: &str, instance: Option<String>,
-    stop: bool, action: impl FnOnce() -> (HRESULT, T, bool)) -> Result<T> {
+    participants: Option<&TransitionParticipants<'_>>, action: impl FnOnce() -> (HRESULT, T, bool)) -> Result<T> {
     receiving.check_cancel()?;
     let pending = Call { operation, role: role.into(), instance, returned_hresult: None, output_returned: false, error_info: ErrorInfo::NotQueried };
     receiving.receive(Event::Call(pending.clone()))?;
+    if let Some(participants) = participants { receiving.before_retirement(participants)?; }
     clear_error_info()?;
-    if stop { receiving.before_retirement()?; }
     let (hr, output, output_returned) = action();
     let info = capture_error_info();
     let actual = Call { returned_hresult: Some(hr.0), output_returned, error_info: info, ..pending };
@@ -115,9 +115,20 @@ impl Programs<'_> {
 }
 struct Instance { native: IRunningTask, view: InstanceView }
 struct Qualified {
-    native: IRegisteredTask, definition: ITaskDefinition, view: DefinitionView, retained: Vec<Instance>,
+    native: IRegisteredTask, definition: ITaskDefinition, original: DefinitionView, view: DefinitionView,
+    update_acknowledged: bool, retained: Vec<Instance>,
 }
 pub(crate) struct TaskSet<'a> { scheduler: &'a Scheduler, tasks: Vec<Qualified>, migration_ready: bool }
+pub(crate) struct TransitionParticipants<'a> { tasks: &'a [Qualified] }
+fn transition_association_paths<'a>(associations: impl Iterator<Item = (&'a DefinitionView, &'a DefinitionView)>)
+    -> impl Iterator<Item = &'a Path> {
+    associations.flat_map(|(original, current)| [original.program.as_path(), current.program.as_path()])
+}
+impl TransitionParticipants<'_> {
+    pub(crate) fn program_paths(&self) -> impl Iterator<Item = &Path> {
+        transition_association_paths(self.tasks.iter().map(|task| (&task.original, &task.view)))
+    }
+}
 /// Only a current independently qualified Managed definition can construct
 /// this occupied-program binding. A path, ACL or matching bytes cannot.
 pub(crate) struct ManagedBinding<'a> {
@@ -253,7 +264,7 @@ impl Scheduler {
         }
         let view = DefinitionView { role: role.into(), program, origin, xml, security, principal: user, logon: logon.0,
             instances: retained.iter().map(|instance| instance.view.clone()).collect() };
-        Ok(Qualified { native: task, definition, view, retained })
+        Ok(Qualified { native: task, definition, original: view.clone(), view, update_acknowledged: false, retained })
     }
     fn register(&self, role: &str, definition: &ITaskDefinition, flags: i32, principal: &str, logon: TASK_LOGON_TYPE,
         security: &str, receiving: &mut impl Receiving) -> Result<IRegisteredTask> {
@@ -261,7 +272,7 @@ impl Scheduler {
         let user = VARIANT::from(principal);
         let password = VARIANT::default();
         let sddl = VARIANT::from(security);
-        let task = invoke(receiving, "RegisterTaskDefinition", role, None, false, || {
+        let task = invoke(receiving, "RegisterTaskDefinition", role, None, None, || {
             let mut raw = std::ptr::null_mut();
             let hr = unsafe { (Interface::vtable(&self.folder).RegisterTaskDefinition)(
                 Interface::as_raw(&self.folder), name.as_ptr().cast_mut().cast(), Interface::as_raw(definition), flags,
@@ -305,7 +316,7 @@ impl Scheduler {
         if current.view.xml != task.view.xml || current.view.security != task.view.security { return Err("OwnershipRequired: selected definition changed before Run".into()); }
         if !current.retained.is_empty() { return Err("OwnershipRequired: Run requires positive zero-instance receiving".into()); }
         let parameters = VARIANT::default();
-        let instance = invoke(receiving, "Run", &task.view.role, None, false, || {
+        let instance = invoke(receiving, "Run", &task.view.role, None, None, || {
             let mut raw = std::ptr::null_mut();
             let hr = unsafe { (Interface::vtable(&current.native).Run)(Interface::as_raw(&current.native), std::mem::transmute_copy(&parameters), &mut raw) };
             let present = !raw.is_null();
@@ -327,7 +338,7 @@ impl Scheduler {
     fn initialize_definition(&self, role: &str, definition: &ITaskDefinition, program: &Path, receiving: &mut impl Receiving) -> Result<()> {
         macro_rules! set { ($object:expr,$method:ident,$value:expr) => {{
             let object = &$object; let value = $value;
-            invoke(receiving, stringify!($method), role, None, false, || {
+            invoke(receiving, stringify!($method), role, None, None, || {
                 let hr = unsafe { (Interface::vtable(object).$method)(Interface::as_raw(object), value) }; (hr, (), false)
             })?;
         }}; }
@@ -347,14 +358,14 @@ impl Scheduler {
         set!(settings, SetRestartCount, 3);
         set_text!(settings, SetRestartInterval, "PT1M");
         let triggers = unsafe { definition.Triggers() }.map_err(|error| err("fresh triggers", error))?;
-        let trigger = invoke(receiving, "CreateLogonTrigger", role, None, false, || {
+        let trigger = invoke(receiving, "CreateLogonTrigger", role, None, None, || {
             let mut raw = std::ptr::null_mut();
             let hr = unsafe { (Interface::vtable(&triggers).Create)(Interface::as_raw(&triggers), TASK_TRIGGER_LOGON, &mut raw) };
             let present = !raw.is_null(); (hr, if present { Some(unsafe { ITrigger::from_raw(raw) }) } else { None }, present)
         })?.ok_or("fresh logon trigger output absent")?;
         set!(trigger, SetEnabled, VARIANT_BOOL::from(true));
         let actions = unsafe { definition.Actions() }.map_err(|error| err("fresh actions", error))?;
-        let action = invoke(receiving, "CreateExecAction", role, None, false, || {
+        let action = invoke(receiving, "CreateExecAction", role, None, None, || {
             let mut raw = std::ptr::null_mut();
             let hr = unsafe { (Interface::vtable(&actions).Create)(Interface::as_raw(&actions), TASK_ACTION_EXEC, &mut raw) };
             let present = !raw.is_null(); (hr, if present { Some(unsafe { IAction::from_raw(raw) }) } else { None }, present)
@@ -368,6 +379,29 @@ impl Scheduler {
 }
 
 impl TaskSet<'_> {
+    pub(crate) fn transition_participants<'a>(&'a self, programs: &Programs<'_>) -> Result<TransitionParticipants<'a>> {
+        revalidate_selected_instances(self.scheduler, &self.tasks, programs)?;
+        for task in &self.tasks {
+            if programs.classify(&task.original.program)? != task.original.origin ||
+                programs.classify(&task.view.program)? != task.view.origin ||
+                task.original.role != task.view.role || task.original.security != task.view.security ||
+                task.original.principal != task.view.principal || task.original.logon != task.view.logon {
+                return Err("OwnershipRequired: transition participant association changed".into());
+            }
+            if !task.update_acknowledged && (task.original.xml != task.view.xml || task.original.origin != task.view.origin) {
+                return Err("OwnershipRequired: transition definition changed without acknowledged update".into());
+            }
+            if task.update_acknowledged && (task.original.origin != Origin::Legacy || task.view.origin != Origin::Managed) {
+                return Err("OwnershipRequired: acknowledged transition origins differ".into());
+            }
+            for instance in &task.original.instances {
+                if !task.retained.iter().any(|held| held.view.guid == instance.guid && held.view.path == instance.path) {
+                    return Err("OwnershipRequired: original task instance association changed".into());
+                }
+            }
+        }
+        Ok(TransitionParticipants { tasks: &self.tasks })
+    }
     pub(crate) fn managed_binding<'a>(&'a self, program: &'a CheckedPath) -> Result<Option<ManagedBinding<'a>>> {
         let mut definitions = Vec::new();
         for task in &self.tasks {
@@ -487,6 +521,7 @@ impl TaskSet<'_> {
                 // Preserve the OLD retained instances and their original
                 // image association; only registered definition facts change.
                 task.view = DefinitionView { instances: task.retained.iter().map(|instance| instance.view.clone()).collect(), ..after.view };
+                task.update_acknowledged = true;
             }
             Ok(())
         }, |tasks| revalidate_selected_instances(scheduler, tasks, programs))?;
@@ -508,7 +543,7 @@ impl TaskSet<'_> {
             }
         }
         let mut retired = Vec::new();
-        for task in &mut self.tasks {
+        for task in &self.tasks {
             for old in &task.retained {
                 let active = running(&task.native)?.into_iter().map(|instance|
                     text(unsafe { instance.InstanceGuid() }.map_err(|error| err("retained instance lookup", error))?))
@@ -517,7 +552,8 @@ impl TaskSet<'_> {
                 unsafe { old.native.Refresh() }.map_err(|error| err("refresh retained old instance", error))?;
                 let observed = instance_view(&old.native, role_name(&task.view.role)?.0)?;
                 if observed.guid != old.view.guid || observed.path != old.view.path { return Err("OwnershipRequired: retained native task-instance identity changed".into()); }
-                invoke(receiving, "StopExactInstance", &task.view.role, Some(old.view.guid.clone()), true, || {
+                let participants = self.transition_participants(programs)?;
+                invoke(receiving, "StopExactInstance", &task.view.role, Some(old.view.guid.clone()), Some(&participants), || {
                     let hr = unsafe { (Interface::vtable(&old.native).Stop)(Interface::as_raw(&old.native)) }; (hr, (), false)
                 })?;
                 loop {
@@ -539,7 +575,7 @@ impl TaskSet<'_> {
             let current = this.scheduler.qualify(&task.view.role, this.scheduler.find(role_name(&task.view.role)?.0)?.ok_or("definition absent before removal")?, programs)?;
             if current.view.xml != task.view.xml || current.view.security != task.view.security || !current.retained.is_empty() { return Err("OwnershipRequired: changed/running task before removal".into()); }
             let name = BSTR::from(role_name(&task.view.role)?.0);
-            invoke(receiving, "DeleteQualifiedTask", &task.view.role, None, false, || {
+            invoke(receiving, "DeleteQualifiedTask", &task.view.role, None, None, || {
                 let hr = unsafe { (Interface::vtable(&this.scheduler.folder).DeleteTask)(Interface::as_raw(&this.scheduler.folder), name.as_ptr().cast_mut().cast(), 0) }; (hr, (), false)
             })?;
             if this.scheduler.find(role_name(&task.view.role)?.0)?.is_some() { return Err("PreparationIncomplete: removed task still exists".into()); }
@@ -553,12 +589,12 @@ fn prepare_action_update(definition: &ITaskDefinition, target: &Path, security: 
     let actions = unsafe { definition.Actions() }.map_err(|error| err("update actions", error))?;
     let action: IExecAction = unsafe { actions.get_Item(1) }.map_err(|error| err("update Exec", error))?.cast().map_err(|error| err("update Exec interface", error))?;
     let path = BSTR::from_wide(&target.as_os_str().encode_wide().collect::<Vec<_>>());
-    invoke(receiving, "SetDetachedActionPath", role, None, false, || {
+    invoke(receiving, "SetDetachedActionPath", role, None, None, || {
         let hr = unsafe { (Interface::vtable(&action).SetPath)(Interface::as_raw(&action), path.as_ptr().cast_mut().cast()) }; (hr, (), false)
     })?;
     let registration = unsafe { definition.RegistrationInfo() }.map_err(|error| err("update registration info", error))?;
     let descriptor = VARIANT::from(security);
-    invoke(receiving, "SetDetachedRegistrationSecurityDescriptor", role, None, false, || {
+    invoke(receiving, "SetDetachedRegistrationSecurityDescriptor", role, None, None, || {
         let hr = unsafe { (Interface::vtable(&registration).SetSecurityDescriptor)(Interface::as_raw(&registration), std::mem::transmute_copy(&descriptor)) }; (hr, (), false)
     })?;
     bstr(|value| unsafe { definition.XmlText(value) })
@@ -810,7 +846,7 @@ mod tests {
         struct Fixture { cancelled: bool, ready: bool, stops: usize, trace: Rc<RefCell<Vec<String>>> }
         impl Receiving for Fixture {
             fn check_cancel(&mut self) -> Result<()> { if self.cancelled { Err("synthetic cancellation".into()) } else { Ok(()) } }
-            fn before_retirement(&mut self) -> Result<()> {
+            fn before_retirement(&mut self, _: &TransitionParticipants<'_>) -> Result<()> {
                 if !self.ready { return Err("not ReadyForRetirement".into()); }
                 self.stops += 1;
                 self.trace.borrow_mut().push("stop".into());
@@ -850,7 +886,7 @@ mod tests {
                 if case == "association-mismatch" { Err("synthetic old-instance association changed".into()) } else { Ok(()) }
             });
             assert!(callbacks.iter().all(|count| *count <= 1), "one update/readback callback per selected role");
-            if result.is_ok() { fixture.before_retirement().unwrap(); }
+            if result.is_ok() { fixture.before_retirement(&TransitionParticipants { tasks: &[] }).unwrap(); }
             if case == "success" {
                 assert_eq!(callbacks, [1, 1]);
                 assert_eq!(&*trace.borrow(), &["update:relay", "readback:relay", "update:watchdog", "readback:watchdog", "associations", "ready", "stop"]);
@@ -859,10 +895,63 @@ mod tests {
                 assert!(result.is_err(), "{case}");
                 assert!(!fixture.ready, "{case}: incomplete update batch cannot authorize retirement");
                 assert_eq!(fixture.stops, 0, "{case}: zero Stop");
-                assert!(fixture.before_retirement().is_err(), "{case}: native retirement guard remains closed");
+                assert!(fixture.before_retirement(&TransitionParticipants { tasks: &[] }).is_err(), "{case}: native retirement guard remains closed");
             }
             if case == "first-error" || case == "cancel-between" { assert_eq!(callbacks, [1, 0]); }
         }
+        // Pure common-owner projection: real task qualification and native Stop
+        // are intentionally outside this fixture's authority.
+        let original = DefinitionView { role: "relay".into(), program: PathBuf::from("synthetic-legacy-A"), origin: Origin::Legacy,
+            xml: "legacy-definition".into(), security: "same-security".into(), principal: "same-principal".into(),
+            logon: TASK_LOGON_S4U.0, instances: vec![task_instance_observation("synthetic-guid".into(),
+                format!("\\{TASK_NAME}"), Ok("action".into()), TASK_STATE_RUNNING.0, TASK_NAME).unwrap()] };
+        let mut current = [original.clone()];
+        let trace = Rc::new(RefCell::new(Vec::new()));
+        let mut fixture = Fixture { cancelled: false, ready: false, stops: 0, trace: trace.clone() };
+        receive_task_update_batch(&mut current, &mut fixture, |view, _| {
+            trace.borrow_mut().push("update".into());
+            view.program = PathBuf::from("synthetic-managed-B");
+            view.origin = Origin::Managed;
+            view.xml = "received-managed-definition".into();
+            trace.borrow_mut().push("readback".into());
+            Ok(())
+        }, |_| { trace.borrow_mut().push("associations".into()); Ok(()) }).unwrap();
+        assert_eq!(current[0].origin, Origin::Managed);
+        assert_eq!(original.instances[0].image, "Unknown");
+        let report = crate::gate::Report { at: u64::MAX, version: crate::dns_forwarder::RELAY_VERSION + 1,
+            exe: "synthetic-legacy-A".into(), ..Default::default() };
+        let metadata = Ok(Some(crate::dns_forwarder::RELAY_VERSION));
+        let projection = || transition_association_paths(std::iter::once((&original, &current[0])));
+        assert_eq!(projection().collect::<Vec<_>>(), [original.program.as_path(), current[0].program.as_path()]);
+        let guard = super::super::selected_retirement_decision(projection(), Some(&report), &metadata, |_| Ok(()));
+        if guard.is_ok() { fixture.before_retirement(&TransitionParticipants { tasks: &[] }).unwrap(); }
+        assert!(guard.unwrap_err().contains("newer"));
+        assert_eq!(fixture.stops, 0);
+        assert_eq!(&*trace.borrow(), &["update", "readback", "associations", "ready"]);
+        let mut replaced = original.clone();
+        replaced.program = PathBuf::from("different-original");
+        let lost_original = transition_association_paths(std::iter::once((&replaced, &current[0])));
+        assert!(super::super::selected_retirement_decision(lost_original, Some(&report), &metadata, |_| Ok(())).is_ok(),
+            "the countercase shows that replacing the original loses the newer veto");
+        // A freshly admitted Managed definition carries no Legacy history. This
+        // countercase would miss the veto, demonstrating why the retained pair matters.
+        let fresh = || transition_association_paths(std::iter::once((&current[0], &current[0])));
+        assert!(!fresh().any(|path| path == original.program.as_path()));
+        assert!(super::super::selected_retirement_decision(fresh(), Some(&report), &metadata, |_| Ok(())).is_ok());
+        for prior_stops in [0, 1] {
+            let mut effects = Vec::new();
+            let mut primary_calls = 0;
+            let fresh_check = super::super::selected_retirement_decision(projection(), Some(&report), &metadata,
+                |effect| { effects.push(effect); Ok(()) });
+            if fresh_check.is_ok() { primary_calls += 1; }
+            assert!(fresh_check.unwrap_err().contains("newer"));
+            assert_eq!(primary_calls, 0, "{prior_stops} earlier Stops must not grant primary");
+            assert!(matches!(effects.as_slice(), [super::super::BackgroundEffect::GenerationObserved { metadata: Ok(Some(value)), runtime: Some(runtime) }]
+                if *value == crate::dns_forwarder::RELAY_VERSION && *runtime == crate::dns_forwarder::RELAY_VERSION + 1));
+        }
+        let failed_retention = super::super::selected_retirement_decision(projection(), Some(&report), &metadata,
+            |_| Err("synthetic evidence retention failure".into()));
+        assert_eq!(failed_retention.unwrap_err(), "synthetic evidence retention failure");
     }
     #[test]
     #[ignore = "controlled in-memory native SDK definitions only; never registers/runs/stops a task or writes task files"]
@@ -871,7 +960,7 @@ mod tests {
         struct Capture { events: Vec<Event> }
         impl Receiving for Capture {
             fn check_cancel(&mut self) -> Result<()> { Ok(()) }
-            fn before_retirement(&mut self) -> Result<()> { panic!("detached definition fixture cannot grant Stop") }
+            fn before_retirement(&mut self, _: &TransitionParticipants<'_>) -> Result<()> { panic!("detached definition fixture cannot grant Stop") }
             fn receive(&mut self, event: Event) -> Result<()> { self.events.push(event); Ok(()) }
         }
         let scheduler = Scheduler::connect().unwrap();
@@ -883,7 +972,7 @@ mod tests {
         let captured_security = "O:SYG:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)";
         let mut prepared_xml = Vec::new();
         for embedded in [false, true] {
-            let definition = invoke(&mut capture, "FixtureNewDetachedDefinition", "relay", None, false, || {
+            let definition = invoke(&mut capture, "FixtureNewDetachedDefinition", "relay", None, None, || {
                 let mut raw = std::ptr::null_mut();
                 let hr = unsafe { (Interface::vtable(&scheduler.service).NewTask)(Interface::as_raw(&scheduler.service), 0, &mut raw) };
                 let present = !raw.is_null();
@@ -893,7 +982,7 @@ mod tests {
             let registration = unsafe { definition.RegistrationInfo() }.unwrap();
             if embedded {
                 let descriptor = VARIANT::from(captured_security);
-                invoke(&mut capture, "FixtureEmbedCapturedSecurityDescriptor", "relay", None, false, || {
+                invoke(&mut capture, "FixtureEmbedCapturedSecurityDescriptor", "relay", None, None, || {
                     let hr = unsafe { (Interface::vtable(&registration).SetSecurityDescriptor)(Interface::as_raw(&registration), std::mem::transmute_copy(&descriptor)) };
                     (hr, (), false)
                 }).unwrap();
