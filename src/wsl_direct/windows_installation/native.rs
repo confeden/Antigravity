@@ -706,10 +706,29 @@ fn sid_text(sid: *mut c_void) -> Result<String> {
     String::from_utf16(unsafe { std::slice::from_raw_parts(text, n) })
         .map_err(|_| "SID text encoding".into())
 }
+fn validate_captured_identity_descriptor(descriptor: &[u8]) -> Result<()> {
+    // GetSecurityDescriptorOwner/Group expect a complete self-relative header
+    // and SID components. Check their bounds before passing captured bytes to FFI.
+    if descriptor.len() < 20 || descriptor[0] != 1 ||
+        u16::from_le_bytes([descriptor[2], descriptor[3]]) & 0x8000 == 0 {
+        return Err("captured security descriptor is absent or invalid".into());
+    }
+    for field in [4, 8] {
+        let offset = u32::from_le_bytes(descriptor[field..field + 4].try_into().unwrap()) as usize;
+        let sid = descriptor.get(offset..).filter(|_| offset >= 20)
+            .ok_or("captured owner/group is absent or invalid")?;
+        // SID revision 1 permits at most 15 subauthorities (Windows SID format).
+        if sid.len() < 8 || sid[0] != 1 || sid[1] > 15 || sid.len() < 8 + 4 * usize::from(sid[1]) {
+            return Err("captured owner/group is absent or invalid".into());
+        }
+    }
+    Ok(())
+}
 fn private_descriptor_with_identity(captured: Option<&[u8]>) -> Result<(LocalMemory, u32)> {
     let mut token = token_user()?;
     let user = sid_text(user_sid(&mut token)?)?;
     let identity = if let Some(captured) = captured {
+        validate_captured_identity_descriptor(captured)?;
         let mut captured = captured.to_vec();
         let mut owner = std::ptr::null_mut();
         let mut group = std::ptr::null_mut();
@@ -1425,6 +1444,53 @@ mod filesystem_path_tests {
         assert_ne!(unsafe { GetSecurityDescriptorGroup(normal_sd.as_mut_ptr().cast(), &mut normal_group, &mut defaulted) }, 0);
         assert_eq!(unsafe { EqualSid(group, normal_group) }, 0, "fixture group must differ from normal private creation");
         drop(normal);
+        // Exercise the actual shared replacement-file constructor with the
+        // received non-default group, including both backup and stage callers.
+        let backup_path = root.join("replacement-backup");
+        let stage_path = root.join("replacement-stage");
+        let target_path = root.join("replacement-target");
+        let displaced_path = root.join("replacement-displaced");
+        let backup = create_replacement_file(&backup_path, &before.bytes, &before.identity)?;
+        let stage = create_replacement_file(&stage_path, b"candidate", &before.identity)?;
+        create_replacement_file(&target_path, &before.bytes, &before.identity)?;
+        let identity_matches = |left: &[u8], right: &[u8]| -> Result<bool> {
+            let mut left = left.to_vec();
+            let mut right = right.to_vec();
+            for get in [GetSecurityDescriptorOwner, GetSecurityDescriptorGroup] {
+                let mut l = std::ptr::null_mut();
+                let mut r = std::ptr::null_mut();
+                let mut defaulted = 0;
+                if unsafe { get(left.as_mut_ptr().cast(), &mut l, &mut defaulted) } == 0 ||
+                    unsafe { get(right.as_mut_ptr().cast(), &mut r, &mut defaulted) } == 0 ||
+                    l.is_null() || r.is_null() || unsafe { EqualSid(l, r) } == 0 { return Ok(false); }
+            }
+            Ok(true)
+        };
+        assert!(identity_matches(&backup.identity.security_descriptor, &before.identity.security_descriptor)?);
+        assert!(identity_matches(&stage.identity.security_descriptor, &before.identity.security_descriptor)?);
+        let mut missing = before.identity.clone();
+        missing.security_descriptor.clear();
+        let missing_path = root.join("replacement-missing-identity");
+        assert!(create_replacement_file(&missing_path, b"no write", &missing).is_err());
+        assert!(matches!(fs::symlink_metadata(&missing_path), Err(error) if error.kind() == std::io::ErrorKind::NotFound));
+        let mut malformed = before.identity.clone();
+        malformed.security_descriptor[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
+        let malformed_path = root.join("replacement-malformed-identity");
+        assert!(create_replacement_file(&malformed_path, b"no write", &malformed).is_err());
+        assert!(matches!(fs::symlink_metadata(&malformed_path), Err(error) if error.kind() == std::io::ErrorKind::NotFound));
+        let mut called = None;
+        replace_native_file(&target_path, &stage_path, &displaced_path, &mut called)?;
+        assert_eq!(called, Some(true));
+        let replaced = read_path(&target_path, READ | DELETE)?;
+        assert!(identity_matches(&replaced.identity.security_descriptor, &before.identity.security_descriptor)?);
+        let access = OpenOptions::new().access_mode(0x0006_0000).share_mode(READ | DELETE)
+            .custom_flags(OPEN_REPARSE).open(NativeFsPath::from_path(&target_path)?.as_path())
+            .map_err(|error| io("replacement fixture DACL handle", error))?;
+        restore_received_dacl(&access, &before.identity.security_descriptor)?;
+        drop(access);
+        let replaced = read_path(&target_path, READ | DELETE)?;
+        assert_eq!(replaced.bytes, b"candidate");
+        assert_eq!(replaced.identity.security_descriptor, before.identity.security_descriptor);
         let result = write_nonsecret_metadata_checked(&target, b"45", Some(&context));
         write_private(&root.join("actual-write-result.json"), &json(&result)?)?;
         let evidence = result.map_err(|error|error.to_string())?;
@@ -2079,7 +2145,7 @@ pub(super) fn create_replacement_file(
     metadata: &FileIdentity,
 ) -> Result<SourceSnapshot, String> {
     {
-        let mut file = create_owned_file(path)?;
+        let mut file = create_owned_file_with_identity(path, Some(&metadata.security_descriptor))?;
         identity(&file)?;
         file.write_all(bytes).map_err(|e| io("stage write", e))?;
         let basic = BasicInformation {
