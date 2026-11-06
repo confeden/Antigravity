@@ -1,0 +1,7 @@
+/.scratch/
+/work-items/
+target/
+__pycache__/
+*.pyc
+/wsl/ag_wsl_launch
+/wsl/helper.sha256

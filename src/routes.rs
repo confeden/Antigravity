@@ -571,6 +571,25 @@ pub fn order(usable: impl Fn(Kind) -> bool) -> Vec<Kind> {
     order_with(&s, cfg!(target_os = "windows"), usable)
 }
 
+/// Orders current health evidence using the caller's already captured settings.
+/// The settings values are fixed for one connection; route health remains live.
+pub(crate) fn order_for_profile(
+    debug_route: &str,
+    own_first: bool,
+    usable: impl Fn(Kind) -> bool,
+) -> Vec<Kind> {
+    if let Some(k) = forced(debug_route) {
+        return if usable(k) { vec![k] } else { Vec::new() };
+    }
+    let pinned = if own_first {
+        [Kind::Own, Kind::Group]
+    } else {
+        [Kind::Group, Kind::Own]
+    };
+    let s = snapshot_with_pinned(pinned);
+    order_with(&s, cfg!(target_os = "windows"), usable)
+}
+
 /// The route a diagnostic run pinned in `settings.json` (`debug_route`).
 fn forced(name: &str) -> Option<Kind> {
     Some(match name.trim().to_ascii_lowercase().as_str() {
@@ -602,6 +621,10 @@ struct Snapshot {
 
 /// What the table holds right now, without holding it.
 fn snapshot() -> Snapshot {
+    snapshot_with_pinned(pinned_now())
+}
+
+fn snapshot_with_pinned(pinned: [Kind; 2]) -> Snapshot {
     match TABLE.lock() {
         Ok(t) => Snapshot {
             samples: t.samples,
@@ -614,7 +637,7 @@ fn snapshot() -> Snapshot {
             stumbled: t.stumbled,
             silent: t.silent,
             leader: t.leader,
-            pinned: pinned_now(),
+            pinned,
         },
         Err(_) => Snapshot {
             samples: [None; N],
@@ -627,7 +650,7 @@ fn snapshot() -> Snapshot {
             stumbled: [None; N],
             silent: [None; N],
             leader: None,
-            pinned: pinned_now(),
+            pinned,
         },
     }
 }

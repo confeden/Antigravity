@@ -155,7 +155,9 @@ pub const LISTEN_PORT: u16 = 53;
 ///     added, and an address that fails sits out of the DoH walk for a while
 ///     (`doh::plan`). An older relay still spends 2.5 s of every walk on two
 ///     dead addresses - the slow start of the 400 bypass.
-pub const RELAY_VERSION: u32 = 44;
+/// 46 = the Windows watchdog receives changed WSL Desktop archives through the
+///     installation owner; older background images do not contain this path.
+pub const RELAY_VERSION: u32 = 46;
 
 /// Written where an unelevated relay can write and an unelevated unlocker can
 /// read. Absent means a relay from before versioning, i.e. older than anything.
@@ -220,7 +222,7 @@ static EGRESS_CACHE: Mutex<Option<(u32, Instant, Duration)>> = Mutex::new(None);
 /// writable for it.
 #[cfg(target_os = "windows")]
 pub fn log_dir() -> PathBuf {
-    PathBuf::from(std::env::var("LOCALAPPDATA").unwrap_or_default()).join("AGUnlocker")
+    PathBuf::from(std::env::var("LOCALAPPDATA").unwrap_or_default()).join(crate::user_state_location::WINDOWS_STATE_LEAF)
 }
 
 /// On Linux the per-user state dir follows the XDG base-dir spec
@@ -250,11 +252,70 @@ pub fn version_path() -> PathBuf {
 /// by the relay itself at startup: the installer's write is what makes the
 /// answer correct the moment an upgrade finishes, and the relay's write is what
 /// keeps it honest if the exe ever gets there some other way.
+#[cfg(not(target_os = "windows"))]
 pub fn record_version() {
     if let Some(dir) = version_path().parent() {
         fs::create_dir_all(dir).ok();
     }
     fs::write(version_path(), RELAY_VERSION.to_string()).ok();
+}
+
+/// One received Windows nonsecret generation file. The native plan retains
+/// actual file/preimage/security and its writer lease through a chosen update;
+/// parsing never replaces missing/malformed input with older-version proof.
+#[cfg(target_os = "windows")]
+pub(crate) struct VersionPlan<'context> {
+    native: crate::windows_coordinator::windows_installation::NonsecretMetadataPlan<'context>,
+    parsed: Result<Option<u32>, String>,
+}
+#[cfg(target_os = "windows")]
+impl VersionPlan<'_> {
+    pub(crate) fn value(&self) -> Result<Option<u32>, String> { self.parsed.clone() }
+    pub(crate) fn evidence(&self) -> serde_json::Value { self.native.evidence() }
+    pub(crate) fn revalidate(&self) -> Result<(), crate::windows_coordinator::windows_installation::MetadataFailure> {
+        self.native.revalidate()
+    }
+}
+#[cfg(target_os = "windows")]
+pub(crate) fn read_version_checked<'context>(context: Option<&'context crate::windows_coordinator::windows_installation::AncestorAccessContext>) -> Result<VersionPlan<'context>,
+    crate::windows_coordinator::windows_installation::MetadataFailure> {
+    let native = crate::windows_coordinator::windows_installation::read_nonsecret_metadata_checked(&version_path(), context)?;
+    let parsed = match native.bytes() {
+        None => Ok(None),
+        Some(bytes) => std::str::from_utf8(bytes).map_err(|_| "relay generation is not UTF-8".to_string())
+            .and_then(parse_version_checked).map(Some),
+    };
+    Ok(VersionPlan { native, parsed })
+}
+#[cfg(target_os = "windows")]
+pub(crate) fn record_version_checked(plan: VersionPlan<'_>) -> Result<serde_json::Value,
+    crate::windows_coordinator::windows_installation::MetadataFailure> {
+    plan.native.write_checked(RELAY_VERSION.to_string().as_bytes())
+}
+#[cfg(target_os = "windows")]
+fn with_current_version_plan<T>(action: impl FnOnce(VersionPlan<'_>) -> Result<T, String>) -> Result<T, String> {
+    let path = version_path();
+    let inputs = crate::windows_coordinator::windows_installation::diagnostic_inputs(
+        path.parent().ok_or("relay generation parent absent")?)?;
+    let context = crate::windows_coordinator::receive_for_diagnostic(&inputs)?;
+    let plan = read_version_checked(context.as_ref()).map_err(|error| format!("{error}; actual={}", error.evidence))?;
+    action(plan)
+}
+
+/// Startup keeps serving DNS if only its diagnostic generation stamp failed;
+/// the error is visible through the existing relay log and standard error.
+#[cfg(target_os = "windows")]
+pub fn record_version() {
+    let actual = with_current_version_plan(|plan| {
+        record_version_checked(plan).map(|_| ()).map_err(|error| {
+            format!("{error}; actual={}", error.evidence)
+        })
+    });
+    if let Err(error) = actual {
+        let message = format!("relay generation metadata failed: {error}");
+        eprintln!("{message}");
+        log(&message);
+    }
 }
 
 /// The relay generation currently installed. `0` for a relay old enough not to
@@ -267,7 +328,30 @@ pub fn installed_version() -> u32 {
 /// by us and never edited, so a value that will not parse means something else
 /// wrote it, and "reinstall" is the right answer to that too.
 fn parse_version(raw: Option<&str>) -> u32 {
-    raw.and_then(|s| s.trim().parse().ok()).unwrap_or(0)
+    raw.and_then(|s| parse_version_checked(s).ok()).unwrap_or(0)
+}
+
+fn parse_version_checked(raw: &str) -> Result<u32, String> {
+    raw.trim().parse().map_err(|e| format!("invalid relay version: {e}"))
+}
+
+/// Fresh version evidence: only an absent version file means a pre-versioned relay.
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn checked_installed_version() -> Result<u32, String> {
+    match fs::read_to_string(version_path()) {
+        Ok(raw) => parse_version_checked(&raw),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(e) => Err(format!("read relay version: {e}")),
+    }
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn checked_installed_version_observation() -> Result<Option<u32>, String> {
+    with_current_version_plan(|plan| plan.value())
+}
+#[cfg(target_os = "windows")]
+pub(crate) fn checked_installed_version() -> Result<u32, String> {
+    checked_installed_version_observation().map(|value| value.unwrap_or(0))
 }
 
 /// Local wall-clock `HH:MM:SS` for a log line.
@@ -1205,7 +1289,17 @@ fn spawn_proxy_env_maintainer() {
             // The port that answered is the one named: the proxy may have moved
             // while this waited (P26), and only our own listener counts - not a
             // program of someone else's answering on the default port.
-            let Some(port) = proxy::wait_for_our_listener(PROXY_START_BUDGET) else {
+            #[cfg(target_os = "windows")]
+            let received_listener = proxy::wait_for_our_listener(PROXY_START_BUDGET);
+            #[cfg(not(target_os = "windows"))]
+            let received_listener: Result<Option<u16>, String> = Ok(proxy::wait_for_our_listener(PROXY_START_BUDGET));
+            let port = match received_listener {
+                Ok(Some(port)) => port,
+                Err(error) => {
+                    log_proxy(&format!("{} не изменена: получение собственного слушателя завершилось ошибкой: {}", var, error));
+                    return;
+                }
+                Ok(None) => {
                 // It keeps trying (`proxy::run`, P53): an antivirus exception
                 // or a closed program frees the port without a restart, and the
                 // variable follows the listener up - still only once it answers.
@@ -1217,7 +1311,8 @@ fn spawn_proxy_env_maintainer() {
                     ));
                     waiting_said = true;
                 }
-                continue;
+                    continue;
+                }
             };
             waiting_said = false;
             let url = proxy::url_at(port);
@@ -1486,6 +1581,9 @@ mod tests {
         assert_eq!(parse_version(Some("")), 0);
         assert_eq!(parse_version(Some("не число")), 0);
         assert_eq!(parse_version(Some(" 7 \r\n")), 7);
+        assert_eq!(parse_version_checked(" 7 \r\n").unwrap(), 7);
+        assert!(parse_version_checked("").is_err());
+        assert!(parse_version_checked("not a number").is_err());
         assert!(parse_version(None) < RELAY_VERSION);
     }
 

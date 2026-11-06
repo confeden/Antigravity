@@ -25,7 +25,7 @@ pub const PATCH_ROOT_FLAG: &str = "--patch-root";
 pub const UNPATCH_ROOT_FLAG: &str = "--unpatch-root";
 
 /// What taking the patch off one install did, file by file.
-#[derive(Debug, Default, PartialEq)]
+#[derive(Debug, Default, PartialEq, serde::Serialize)]
 pub struct Reverted {
     pub files: usize,
     pub errors: Vec<String>,
@@ -39,7 +39,32 @@ pub struct Reverted {
 /// the proxy variable) are not here: they belong to the user, not to the
 /// install, and the root helper must not touch them.
 pub fn revert_files(inst: &Path) -> Reverted {
+    revert_files_run(inst, false)
+}
+
+pub(crate) fn revert_files_checked(inst: &Path) -> Result<Reverted, Reverted> {
+    let out = revert_files_run(inst, true);
+    if !out.errors.is_empty() {
+        return Err(out);
+    }
+    Ok(out)
+}
+
+fn revert_files_run(inst: &Path, stop_on_failure: bool) -> Reverted {
     let mut out = Reverted::default();
+    #[cfg(windows)]
+    let canonical = match crate::windows_coordinator::windows_installation::canonical_installed(inst) {
+        Ok(value) => value,
+        Err(error) => { out.errors.push(error); return out; },
+    };
+    #[cfg(not(windows))]
+    let canonical = false;
+    if stop_on_failure {
+        match crate::patch_binary::unpatch_all_binaries_checked(inst) {
+            Ok(files) => out.files += files,
+            Err(error) => { out.files += error.completed; out.errors.push(error.cause); return out; },
+        }
+    } else {
     for (label, res) in crate::patch_binary::unpatch_all_binaries(inst) {
         match res {
             Ok(0) => {}
@@ -47,6 +72,37 @@ pub fn revert_files(inst: &Path) -> Reverted {
             Err(e) => out.errors.push(format!("{label}: {e}")),
         }
     }
+    }
+    // A canonical Desktop operation is NativeBinaryOnly here. Archive/hook
+    // revert belongs to its versioned installation owner, never this leaf.
+    if canonical { return out; }
+    if stop_on_failure {
+        match crate::patch_ide::unpatch_ide_js_checked(inst) {
+            Ok(results) => for (label, result) in results {
+                match result {
+                    crate::patch_ide::JsRestore::Unchanged => {},
+                    crate::patch_ide::JsRestore::BackupRestored => out.files += 1,
+                    crate::patch_ide::JsRestore::MarkerOnly => {
+                        out.files += 1;
+                        out.warnings.push(format!("{label}: бэкапа нет, снят только маркер"));
+                    },
+                }
+            },
+            Err(error) => {
+                for (label, result) in error.completed {
+                    match result {
+                        crate::patch_ide::JsRestore::Unchanged => {},
+                        crate::patch_ide::JsRestore::BackupRestored => out.files += 1,
+                        crate::patch_ide::JsRestore::MarkerOnly => {
+                            out.files += 1;
+                            out.warnings.push(format!("{label}: бэкапа нет, снят только маркер"));
+                        },
+                    }
+                }
+                out.errors.push(error.cause); return out;
+            },
+        }
+    } else {
     for (label, res) in crate::patch_ide::unpatch_ide_js(inst) {
         match res {
             Ok(true) => out.files += 1,
@@ -56,8 +112,10 @@ pub fn revert_files(inst: &Path) -> Reverted {
             Err(e) => out.errors.push(format!("{label}: {e}")),
         }
     }
+    }
     if let Err(e) = crate::restore_pristine_asar(&inst.join("resources")) {
-        out.warnings.push(format!("app.asar не восстановлен: {e}"));
+        if stop_on_failure { out.errors.push(format!("app.asar не восстановлен: {e}")); }
+        else { out.warnings.push(format!("app.asar не восстановлен: {e}")); }
     }
     out
 }

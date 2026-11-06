@@ -17,6 +17,7 @@
 //! set (src/upstream.rs:286).
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 #[cfg(not(test))]
@@ -28,6 +29,8 @@ const FILE_NAME: &str = "settings.json";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    /// WSL intent; None preserves the distinction for older settings files.
+    pub wsl: Option<crate::wsl_api::WslPreferences>,
     /// Switch 1: the client patch that lifts the account-region block.
     pub client_patch: bool,
 
@@ -148,6 +151,7 @@ impl Default for Settings {
         // switches are there to turn things *off*, not to make the user
         // assemble a working setup out of parts.
         Self {
+            wsl: None,
             client_patch: false,
             auto_patch: true,
             group_key: String::new(),
@@ -322,6 +326,37 @@ fn path() -> Option<PathBuf> {
     Some(dir.join(FILE_NAME))
 }
 
+/// Bind handoff to the bytes actually persisted by this settings owner.
+pub(crate) fn saved_intent_sha256(expected: &Settings) -> Result<[u8; 32], String> {
+    let path = path().ok_or_else(|| "settings path unavailable".to_owned())?;
+    let bytes = std::fs::read(path).map_err(|e| format!("settings read failed: {e}"))?;
+    saved_intent_hash(&bytes, expected)
+}
+
+fn saved_intent_hash(bytes: &[u8], expected: &Settings) -> Result<[u8; 32], String> {
+    let serialized = serde_json::to_string_pretty(expected)
+        .map_err(|e| format!("settings serialization failed: {e}"))?;
+    if bytes != serialized.as_bytes() {
+        return Err("saved settings do not match current intent".into());
+    }
+    Ok(Sha256::digest(bytes).into())
+}
+
+/// Receive exactly the saved settings bound by the handoff, without fallback.
+pub(crate) fn receive_saved_intent(expected_sha256: &[u8; 32]) -> Result<Settings, String> {
+    let path = path().ok_or_else(|| "settings path unavailable".to_owned())?;
+    let bytes = std::fs::read(path).map_err(|e| format!("settings read failed: {e}"))?;
+    receive_intent_bytes(&bytes, expected_sha256)
+}
+
+fn receive_intent_bytes(bytes: &[u8], expected_sha256: &[u8; 32]) -> Result<Settings, String> {
+    let actual: [u8; 32] = Sha256::digest(bytes).into();
+    if &actual != expected_sha256 {
+        return Err("saved settings changed during handoff".into());
+    }
+    serde_json::from_slice(bytes).map_err(|e| format!("saved settings are invalid: {e}"))
+}
+
 /// The settings as a *serving* process must read them.
 ///
 /// The relay resolves on a hot path — one call per DNS query, one per CONNECT —
@@ -350,6 +385,11 @@ fn cached() -> Settings {
     {
         cached_from_disk()
     }
+}
+
+/// One serving-settings snapshot for a connection's route selection.
+pub(crate) fn routing_snapshot() -> Settings {
+    cached()
 }
 
 #[cfg(not(test))]
@@ -462,6 +502,40 @@ pub fn builtin_exits_enabled() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn handoff_binds_saved_bytes_and_rejects_invalid_data() {
+        let expected = Settings { license_key: "synthetic".into(), dns: false, ..Settings::default() };
+        let bytes = serde_json::to_vec_pretty(&expected).unwrap();
+        let hash = saved_intent_hash(&bytes, &expected).unwrap();
+        let received = receive_intent_bytes(&bytes, &hash).unwrap();
+        assert_eq!(received.license_key, "synthetic");
+        assert!(!received.dns);
+        assert!(saved_intent_hash(b"{}", &expected).is_err());
+        assert!(receive_intent_bytes(b"{}", &hash).is_err());
+        let invalid = b"{";
+        let invalid_hash: [u8; 32] = Sha256::digest(invalid).into();
+        assert!(receive_intent_bytes(invalid, &invalid_hash).is_err());
+        let empty_hash: [u8; 32] = Sha256::digest([]).into();
+        assert!(receive_intent_bytes(b"", &empty_hash).is_err());
+    }
+
+    #[test]
+    fn wsl_omission_and_explicit_choice_preserve_other_settings() {
+        let old = r#"{"license_key":"old-key","dns":false,"own_proxy":"example"}"#;
+        let mut settings: Settings = serde_json::from_str(old).unwrap();
+        assert!(settings.wsl.is_none());
+        settings.wsl = Some(crate::wsl_api::WslPreferences {
+            enabled: false,
+            distros: vec!["Ubuntu".into()],
+        });
+        let saved = serde_json::to_string(&settings).unwrap();
+        let restored: Settings = serde_json::from_str(&saved).unwrap();
+        assert_eq!(restored.wsl, settings.wsl);
+        assert_eq!(restored.license_key, "old-key");
+        assert!(!restored.dns);
+        assert_eq!(restored.own_proxy, "example");
+    }
 
     #[test]
     fn a_missing_file_reads_as_the_defaults_not_an_error() {

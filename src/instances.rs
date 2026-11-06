@@ -1,12 +1,8 @@
-//! One window at a time: a newer copy closes the older ones when it starts.
+//! One Settings writer at a time. Windows internal roles never acquire it.
 //!
-//! Two windows of different versions share one settings file, one service and
-//! one set of switches, and each re-applies its own idea of them on every
-//! refresh - an older one put its relay and route state back under the newer
-//! one, and the model did not answer until the old window was closed by hand
-//! (field report, 2026-10-15). Only *windows* are matched: the services run
-//! under other names (`ag_dns.exe` on Windows, `ag_proxy` on Linux) and carry a
-//! flag, and the pkexec helper carries one too, so none of them is touched.
+//! The Windows main thread retains a cooperative current-user native lease.
+//! Internal gateway/runtime roles dispatch before this owner is constructed.
+//! Linux retains its established process-selection behavior below.
 
 /// Whether a process image name is a copy of the unlocker window: the exe this
 /// one runs as, or any other release of it (`AG_<version>.exe` on Windows).
@@ -33,6 +29,7 @@ fn is_service_args(args: &[String]) -> bool {
 
 /// Closes every other copy of the window. Best effort and silent: a copy that
 /// refuses to die (another user's, a higher integrity level) is left running.
+#[cfg(not(target_os = "windows"))]
 pub fn close_others() {
     let Ok(me) = std::env::current_exe() else {
         return;
@@ -45,34 +42,21 @@ pub fn close_others() {
 }
 
 #[cfg(target_os = "windows")]
-mod platform {
-    use std::process::Command;
+#[path = "gui_instance.rs"]
+mod gui_instance;
+#[cfg(target_os = "windows")]
+pub(crate) use gui_instance::{
+    receive_replacement, request_elevation, ElevationProgress, GuiApplyContinuation, GuiRetirementInputRef,
+    GuiCurrentExpectation, GuiReplacementAction, GuiReplacementReady, GuiReplacementTarget, ReceivedReplacement,
+    GuiTargetExpectation, GuiTargetKind, GUI_REPLACEMENT_FLAG,
+};
 
-    use super::is_window_name;
-
-    pub fn close_others(own: &str) {
-        let mut cmd = Command::new("tasklist");
-        cmd.args(["/FO", "CSV", "/NH"]);
-        let Ok(out) = crate::utils::no_window(&mut cmd).output() else {
-            return;
-        };
-        let me = std::process::id();
-        for line in String::from_utf8_lossy(&out.stdout).lines() {
-            let mut cols = line.split("\",\"").map(|c| c.trim_matches('"'));
-            let (Some(name), Some(pid)) = (cols.next(), cols.next()) else {
-                continue;
-            };
-            let Ok(pid) = pid.parse::<u32>() else {
-                continue;
-            };
-            if pid == me || !is_window_name(name, own) {
-                continue;
-            }
-            let mut kill = Command::new("taskkill");
-            kill.args(["/F", "/PID", &pid.to_string()]);
-            let _ = crate::utils::no_window(&mut kill).output();
-        }
-    }
+#[cfg(target_os = "windows")]
+pub fn acquire_gui_writer(
+) -> Result<crate::windows_coordinator::windows_installation::SettingsWriterLease, String> {
+    let lease = crate::windows_coordinator::windows_installation::admit_settings_writer()?;
+    gui_instance::receive_visible_gui_conflicts()?;
+    Ok(lease)
 }
 
 #[cfg(not(target_os = "windows"))]

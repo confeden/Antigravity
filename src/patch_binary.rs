@@ -1,3 +1,8 @@
+pub(crate) use crate::binary_profile::{count_occurrences, field_signatures, proxy_var_original, replace_all};
+#[allow(unused_imports)]
+pub(crate) use crate::binary_profile::{prepare_profile, PatchProfile, ProfileError, ProfilePreparation};
+
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -22,63 +27,34 @@ use std::time::Duration;
 // The literals live inside obfstr! blocks so they don't show up as plain
 // strings in this binary.
 
-fn replace_all(data: &mut [u8], from: &[u8], to: &[u8]) -> usize {
-    debug_assert_eq!(from.len(), to.len());
-    if data.len() < from.len() {
-        return 0;
-    }
-    let mut count = 0;
-    let mut i = 0;
-    while i + from.len() <= data.len() {
-        if &data[i..i + from.len()] == from {
-            data[i..i + to.len()].copy_from_slice(to);
-            count += 1;
-            i += from.len();
-        } else {
-            i += 1;
-        }
-    }
-    count
-}
-
-fn count_occurrences(data: &[u8], needle: &[u8]) -> usize {
-    if data.len() < needle.len() {
-        return 0;
-    }
-    (0..=data.len() - needle.len())
-        .filter(|&i| &data[i..i + needle.len()] == needle)
-        .count()
-}
-
 /// Writes the binary back atomically: a sibling temp on the same directory, then
 /// a rename over the target. A crash or power loss mid-write leaves either the
 /// old binary or the new one, never a truncated 135 MB executable that would fail
-/// to launch. A running executable is locked on Windows, so the owning process is
-/// killed and the write retried only if the first attempt actually fails.
+/// to launch. A locked Windows image requires a normal close; this module owns
+/// no creator process handle and cannot terminate a process by image name.
 fn write_binary(bin_path: &Path, data: &[u8]) -> Result<(), String> {
-    if write_atomic(bin_path, data).is_ok() {
-        return Ok(());
+    #[cfg(windows)]
+    let canonical_guard = crate::windows_coordinator::windows_installation::admit_native_binary(bin_path,
+        binary_targets, crate::windows_coordinator::receive_saved_context)?;
+    match write_atomic(bin_path, data) {
+        Ok(()) => {
+            #[cfg(windows)]
+            canonical_guard.recheck().map_err(|error| format!("Файл заменён, но каноническая проверка не завершилась: {error}"))?;
+            return Ok(());
+        },
+        Err(error) => {
+            #[cfg(windows)]
+            return Err(format!("Файл не заменён; закройте использующее его приложение обычным способом: {error}"));
+            #[cfg(not(windows))]
+            let _ = error;
+        }
     }
+    #[cfg(not(windows))]
+    {
     kill_holder(bin_path);
     thread::sleep(Duration::from_millis(500));
     write_atomic(bin_path, data).map_err(|e| e.to_string())
-}
-
-/// Kills whatever process holds `bin_path` open so the write can be retried.
-/// Windows locks a running image; Linux does not (a rename-over succeeds while
-/// the old inode keeps running), so this is a belt-and-braces retry helper there.
-#[cfg(target_os = "windows")]
-pub fn kill_holder(bin_path: &Path) {
-    let file_name = bin_path
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_string();
-    let mut cmd = Command::new("taskkill");
-    cmd.args(["/F", "/IM", &file_name])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    crate::utils::no_window(&mut cmd).output().ok();
+    }
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -182,41 +158,29 @@ fn write_atomic(bin_path: &Path, data: &[u8]) -> std::io::Result<()> {
     }
 }
 
-/// The field name rewrites stored in obfuscated literals.
-pub(crate) fn field_signatures() -> ([u8; 10], [u8; 10]) {
-    obfstr::obfstr! {
-        let from = "ineligible";
-        let to = "inexigible";
+enum RewriteFailure { MissingSignature, Io(String) }
+impl std::fmt::Display for RewriteFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self { Self::MissingSignature => f.write_str("Сигнатура не найдена"), Self::Io(error) => f.write_str(error) }
     }
-    let mut f = [0u8; 10];
-    let mut t = [0u8; 10];
-    f.copy_from_slice(from.as_bytes());
-    t.copy_from_slice(to.as_bytes());
-    (f, t)
-}
-
-/// The original proxy variable name stored in an obfuscated literal.
-pub(crate) fn proxy_var_original() -> [u8; 11] {
-    obfstr::obfstr! {
-        let proxy_from = "https_proxy";
-    }
-    let mut p = [0u8; 11];
-    p.copy_from_slice(proxy_from.as_bytes());
-    p
 }
 
 fn rewrite(bin_path: &Path, from: &[u8], to: &[u8]) -> Result<usize, String> {
-    let mut data = fs::read(bin_path).map_err(|e| e.to_string())?;
+    rewrite_result(bin_path, from, to).map_err(|error| error.to_string())
+}
+
+fn rewrite_result(bin_path: &Path, from: &[u8], to: &[u8]) -> Result<usize, RewriteFailure> {
+    let mut data = fs::read(bin_path).map_err(|e| RewriteFailure::Io(e.to_string()))?;
     let replaced = replace_all(&mut data, from, to);
     if replaced == 0 {
         // Nothing to do - report whether the target state is already in place.
         return if count_occurrences(&data, to) > 0 {
             Ok(0)
         } else {
-            Err("Сигнатура не найдена".to_string())
+            Err(RewriteFailure::MissingSignature)
         };
     }
-    write_binary(bin_path, &data)?;
+    write_binary(bin_path, &data).map_err(RewriteFailure::Io)?;
     Ok(replaced)
 }
 
@@ -278,7 +242,7 @@ pub fn unpatch_binary(bin_path: &Path) -> Result<usize, String> {
 ///
 /// Same length as the name it replaces, so this is the same class of edit as the
 /// eligibility rename: no relocation moves, no size change, byte-exact revert.
-pub const PROXY_VAR_NEW: &str = "AG_LS_PROXY";
+pub use crate::binary_profile::PROXY_VAR_NEW;
 
 /// Points the language server's proxy lookup at [`PROXY_VAR_NEW`].
 ///
@@ -286,8 +250,11 @@ pub const PROXY_VAR_NEW: &str = "AG_LS_PROXY";
 /// binary is already renamed, `Err` only when neither name is present, which
 /// callers report rather than treat as a failed patch.
 pub fn patch_proxy_var(bin_path: &Path) -> Result<usize, String> {
+    patch_proxy_var_result(bin_path).map_err(|error| error.to_string())
+}
+fn patch_proxy_var_result(bin_path: &Path) -> Result<usize, RewriteFailure> {
     let old_bytes = proxy_var_original();
-    rewrite(bin_path, &old_bytes, PROXY_VAR_NEW.as_bytes())
+    rewrite_result(bin_path, &old_bytes, PROXY_VAR_NEW.as_bytes())
 }
 
 /// Puts the standard name back.
@@ -351,7 +318,17 @@ pub fn repatch_if_needed(bin_path: &Path) -> RepatchOutcome {
         // yet. Killing a running language server mid-session for that is a worse
         // outcome than waiting; the file settles and the next poll retries.
         if proxy > 0 {
-            let _ = write_atomic(bin_path, &data);
+            #[cfg(windows)]
+            let canonical_guard = match crate::windows_coordinator::windows_installation::admit_native_binary(bin_path,
+                binary_targets, crate::windows_coordinator::receive_saved_context) {
+                Ok(guard) => guard,
+                Err(error) => return RepatchOutcome::Failed(error),
+            };
+            if let Err(error) = write_atomic(bin_path, &data) {
+                return RepatchOutcome::Failed(format!("Добавочное изменение не записано: {error}"));
+            }
+            #[cfg(windows)]
+            if let Err(error) = canonical_guard.recheck() { return RepatchOutcome::Failed(error); }
         }
         return RepatchOutcome::AlreadyPatched;
     }
@@ -459,30 +436,10 @@ pub fn binary_targets(inst: &Path) -> Vec<PathBuf> {
 /// console to print to and reports the step in the log pane itself. The one
 /// second afterwards is functional, not cosmetic — `taskkill` returns before the
 /// image handle is actually released.
+#[cfg(not(windows))]
 pub fn kill_affected_processes() {
     kill_platform_processes();
     thread::sleep(Duration::from_millis(1000));
-}
-
-/// Stops the language server / CLI so their files can be replaced. Never the
-/// editor shell itself - that would lose the user's unsaved work (D9).
-#[cfg(target_os = "windows")]
-fn kill_platform_processes() {
-    let processes = [
-        "Antigravity.exe",
-        "Antigravity CLI.exe",
-        "Antigravity IDE.exe",
-        "agy.exe",
-        "language_server.exe",
-        "language_server_windows_x64.exe",
-    ];
-    for p in processes.iter() {
-        let mut cmd = Command::new("taskkill");
-        cmd.args(["/F", "/IM", p])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        crate::utils::no_window(&mut cmd).output().ok();
-    }
 }
 
 /// The Linux/macOS side. The language server is the process holding the file
@@ -539,6 +496,19 @@ impl BinarySummary {
 }
 
 pub fn patch_all_binaries(inst: &Path) -> BinarySummary {
+    patch_binary_batch(inst, false)
+}
+
+pub(crate) fn patch_all_binaries_checked(inst: &Path) -> Result<BinarySummary, String> {
+    let summary = patch_binary_batch(inst, true);
+    if summary.failed > 0 || summary.proxy_var_retryable {
+        return Err(format!("Нативный пакет остановлен: успешно/без изменений {}, ошибки {}, канал прокси {}; {}",
+            summary.ok, summary.failed, summary.proxy_var, summary.last_error.as_deref().unwrap_or("причина не получена")));
+    }
+    Ok(summary)
+}
+
+fn patch_binary_batch(inst: &Path, stop_on_failure: bool) -> BinarySummary {
     let mut summary = BinarySummary {
         ok: 0,
         failed: 0,
@@ -561,18 +531,23 @@ pub fn patch_all_binaries(inst: &Path) -> BinarySummary {
             Err(e) => {
                 summary.failed += 1;
                 summary.last_error = Some(format!("{}: {}", label, e));
+                if stop_on_failure { return summary; }
             }
         }
         // Additive and separately judged: a binary whose proxy literal is not
         // where this build expects it is still unlocked, so it never touches
         // `failed`. `Ok(0)` is "already renamed", which counts as carrying it.
-        match patch_proxy_var(&bin) {
+        match patch_proxy_var_result(&bin) {
             Ok(_) => summary.proxy_var += 1,
             // `rewrite` says "Сигнатура не найдена" for a literal that is not
             // there and anything else for an I/O problem. Only the second is
             // worth telling the user to retry.
-            Err(e) if !e.contains("Сигнатура") => summary.proxy_var_retryable = true,
-            Err(_) => {}
+            Err(RewriteFailure::Io(error)) => {
+                summary.proxy_var_retryable = true;
+                summary.last_error = Some(format!("{label}: {error}"));
+                if stop_on_failure { return summary; }
+            },
+            Err(RewriteFailure::MissingSignature) => {}
         }
     }
     summary
@@ -736,6 +711,40 @@ pub fn inspect_install(install: &std::path::Path) -> InstallState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn checked_native_io_failure_stops_before_the_next_binary() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let root = crate::wsl_discovery_contract_cases::fixture_dir("native-first-failure");
+        let state = root.join("state");
+        let install = root.join("install");
+        fs::create_dir(&state).unwrap();
+        fs::create_dir(&install).unwrap();
+        let previous = std::env::var_os("AG_LEGACY_NATIVE_GUARD_TEST_BASE");
+        struct RestoreEnv(Option<std::ffi::OsString>);
+        impl Drop for RestoreEnv {
+            fn drop(&mut self) { unsafe { match &self.0 {
+                Some(value) => std::env::set_var("AG_LEGACY_NATIVE_GUARD_TEST_BASE", value),
+                None => std::env::remove_var("AG_LEGACY_NATIVE_GUARD_TEST_BASE"),
+            } } }
+        }
+        unsafe { std::env::set_var("AG_LEGACY_NATIVE_GUARD_TEST_BASE", &state); }
+        let _restore = RestoreEnv(previous);
+        let first = install.join("agy.exe");
+        let second = install.join("agy");
+        let (original, _) = field_signatures();
+        let mut bytes = original.to_vec();
+        bytes.extend_from_slice(&proxy_var_original());
+        fs::write(&first, &bytes).unwrap();
+        fs::write(&second, &bytes).unwrap();
+        let held = fs::OpenOptions::new().read(true).share_mode(1 | 2).open(&first).unwrap();
+        let failure = patch_all_binaries_checked(&install).err().expect("actual sharing failure required");
+        assert!(failure.contains("Файл не заменён"), "must reach the native write, not fail admission: {failure}");
+        assert_eq!(fs::read(&first).unwrap(), bytes);
+        assert_eq!(fs::read(&second).unwrap(), bytes, "later native binary must remain unchanged");
+        drop(held);
+    }
 
     /// What this machine's installs look like right now, read-only.
     ///
@@ -1163,6 +1172,25 @@ mod tests {
 /// clean revert. The window has no console for the difference to appear on
 /// either.
 pub fn unpatch_all_binaries(inst: &Path) -> Vec<(String, Result<usize, String>)> {
+    unpatch_binary_batch(inst, false)
+}
+
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct NativeUndoFailure { pub(crate) completed: usize, pub(crate) cause: String }
+
+pub(crate) fn unpatch_all_binaries_checked(inst: &Path) -> Result<usize, NativeUndoFailure> {
+    let mut completed = 0;
+    for (label, result) in unpatch_binary_batch(inst, true) {
+        match result {
+            Ok(0) => {},
+            Ok(_) => completed += 1,
+            Err(error) => return Err(NativeUndoFailure { completed, cause: format!("{label}: {error}") }),
+        }
+    }
+    Ok(completed)
+}
+
+fn unpatch_binary_batch(inst: &Path, stop_on_failure: bool) -> Vec<(String, Result<usize, String>)> {
     let mut results = Vec::new();
     for bin in binary_targets(inst) {
         let label = bin
@@ -1174,8 +1202,27 @@ pub fn unpatch_all_binaries(inst: &Path) -> Vec<(String, Result<usize, String>)>
         // our variable, and a revert that failed halfway should at least leave
         // the language server on the stock proxy channel. Silent - a build that
         // never carried it is not an error to report.
-        unpatch_proxy_var(&bin).ok();
-        results.push((label, unpatch_binary(&bin)));
+        let original = proxy_var_original();
+        let (proxy, proxy_error) = match rewrite_result(&bin, PROXY_VAR_NEW.as_bytes(), &original) {
+            Ok(count) => (count, None),
+            Err(RewriteFailure::MissingSignature) => (0, None),
+            Err(RewriteFailure::Io(error)) => (0, Some(error)),
+        };
+        if stop_on_failure {
+            if let Some(error) = proxy_error {
+                results.push((label, Err(format!("Канал прокси не восстановлен: {error}"))));
+                break;
+            }
+        }
+        let result = match (proxy_error, unpatch_binary(&bin)) {
+            (None, Ok(count)) => Ok(if count == 0 && proxy > 0 { 1 } else { count }),
+            (None, Err(error)) => Err(format!("Канал прокси: {proxy} замен; основной откат не завершён: {error}")),
+            (Some(proxy_error), Ok(count)) => Err(format!("Основной откат: {count} замен; канал прокси не восстановлен: {proxy_error}")),
+            (Some(proxy_error), Err(error)) => Err(format!("Канал прокси: {proxy_error}; основной откат: {error}")),
+        };
+        let failed = result.is_err();
+        results.push((label, result));
+        if stop_on_failure && failed { break; }
     }
     results
 }

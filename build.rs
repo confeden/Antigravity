@@ -71,6 +71,17 @@ fn token_for(seed: &str, sep: &str, version: &str) -> String {
 }
 
 fn main() {
+    // One explicit package input pins the existing sibling Linux helper. A
+    // public build may omit it; runtime then reports package-incomplete rather
+    // than trusting a helper and mutable manifest to certify one another.
+    println!("cargo:rerun-if-env-changed=AG_WSL_HELPER_SHA256");
+    if let Some(value) = env::var_os("AG_WSL_HELPER_SHA256") {
+        let value = value.into_string().expect("AG_WSL_HELPER_SHA256 must be text");
+        let value = value.trim().to_ascii_lowercase();
+        assert!(value.len() == 64 && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "AG_WSL_HELPER_SHA256 must be one SHA-256 digest");
+        println!("cargo:rustc-env=AG_WSL_EXPECTED_HELPER_SHA256={value}");
+    }
     println!("cargo:rerun-if-changed=src/canary.rs");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=AG_FULL_VERSION");

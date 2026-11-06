@@ -15,6 +15,7 @@ mod widgets;
 
 use eframe::egui;
 use std::sync::mpsc::{channel, Receiver};
+use std::sync::Arc;
 
 use crate::gate;
 use crate::ops::{self, Cmd, Event, Level, Status, Worker};
@@ -40,6 +41,11 @@ enum Screen {
 
 pub struct App {
     screen: Screen,
+    shutdown_request_frame: Option<u64>,
+    shutdown_ready: bool,
+    shutdown_close_sent: bool,
+    shutdown_error: Option<String>,
+    lifetime: Arc<ops::GuiLifetime>,
     key_input: String,
     key_rejected: bool,
     /// Cleared after the first frame gives the key field focus, so a paste needs
@@ -107,7 +113,32 @@ pub struct App {
 }
 
 impl App {
-    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    #[cfg(test)]
+    fn for_layout_test(status: Status) -> (Self, std::sync::mpsc::Receiver<Cmd>) {
+        let lifetime = Arc::new(ops::GuiLifetime::default());
+        let (worker, commands) = ops::layout_test_worker(lifetime.clone());
+        let (_, update_rx) = channel();
+        let (_, events) = channel();
+        let (_, gate_rx) = channel();
+        (Self {
+            screen: Screen::Main,
+            shutdown_request_frame: None, shutdown_ready: false, shutdown_close_sent: false,
+            shutdown_error: None, lifetime,
+            key_input: String::new(), key_rejected: false, key_needs_focus: false,
+            key_next_attempt: None, key_attempts: Vec::new(),
+            key_cooldown: std::time::Duration::from_millis(100),
+            update: None, update_rx, worker, events, status: Some(status),
+            gate: gate::View::default(), gate_at: std::time::Instant::now(), gate_rx,
+            log: Vec::new(), log_all_selected: false, busy: None,
+            own_proxy_input: String::new(), custom_dns_input: String::new(),
+            group_key_input: String::new(), group_key_sent: String::new(),
+            providers_local: Vec::new(), providers_reordering: false,
+            path_dialog: None, path_dialog_error: None, report_saved: None,
+            report_clipboard_at: None, frames: 0,
+        }, commands)
+    }
+
+    fn new(cc: &eframe::CreationContext<'_>, lifetime: Arc<ops::GuiLifetime>) -> Self {
         theme::apply(&cc.egui_ctx);
 
         let (up_tx, update_rx) = channel();
@@ -119,7 +150,7 @@ impl App {
         // never sees.
         let (ev_tx, events) = channel();
         let ctx = cc.egui_ctx.clone();
-        let worker = ops::spawn(ev_tx, Box::new(move || ctx.request_repaint()));
+        let worker = ops::spawn(ev_tx, Box::new(move || ctx.request_repaint()), lifetime.clone());
 
         // Its own thread and its own channel rather than a command on the
         // worker's queue: the worker can be minutes deep in a patch run, and
@@ -141,6 +172,11 @@ impl App {
         }
         Self {
             screen,
+            shutdown_request_frame: None,
+            shutdown_ready: false,
+            shutdown_close_sent: false,
+            shutdown_error: None,
+            lifetime,
             key_input: String::new(),
             key_rejected: false,
             key_needs_focus: true,
@@ -204,11 +240,7 @@ impl App {
     /// nothing happens and the window stays as it was.
     fn request_elevation(&self) {
         #[cfg(target_os = "windows")]
-        {
-            if crate::utils::relaunch_elevated() {
-                std::process::exit(0);
-            }
-        }
+        self.worker.send(Cmd::RequestElevation);
     }
 
     fn drain_events(&mut self) {
@@ -254,6 +286,7 @@ impl App {
                     self.status = Some(*status);
                 }
                 Event::Busy(what) => self.busy = what,
+                Event::ShutdownReady => self.shutdown_ready = true,
             }
         }
     }
@@ -275,6 +308,31 @@ impl eframe::App for App {
             renderer::confirm();
         }
         self.drain_events();
+        if ui.ctx().input(|i| i.viewport().close_requested()) && !self.shutdown_close_sent {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            let frame = ui.ctx().cumulative_frame_nr();
+            if self.shutdown_request_frame != Some(frame) {
+                self.shutdown_request_frame = Some(frame);
+                self.lifetime.request_shutdown();
+            }
+        }
+        if self.shutdown_ready && !self.shutdown_close_sent {
+            match self.lifetime.poll_close() {
+                Ok(true) => {
+                    self.shutdown_close_sent = true;
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                Ok(false) => ui.ctx().request_repaint_after(std::time::Duration::from_millis(100)),
+                Err(error) => {
+                    if self.shutdown_error.as_ref() != Some(&error) {
+                        self.log.push((Level::Err, format!("Не удалось завершить работу: {error}")));
+                        self.busy = Some(format!("Не удалось завершить работу: {error}"));
+                        self.shutdown_error = Some(error);
+                    }
+                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+                }
+            }
+        }
 
         // The root `Ui` eframe hands over carries no margin and no background of
         // its own; `central_panel` is what puts the window colour behind it.
@@ -327,7 +385,7 @@ impl eframe::App for App {
 /// to the next one in this process; a panic or a crash inside a driver moves to
 /// it on the next start (see `renderer`). Falling back costs nothing at runtime
 /// and is the difference between "it starts on other PCs" and a support thread.
-pub fn run() -> Result<(), String> {
+pub fn run(lifetime: Arc<ops::GuiLifetime>) -> Result<(), String> {
     fn options(kind: renderer::Kind) -> eframe::NativeOptions {
         eframe::NativeOptions {
             viewport: {
@@ -353,10 +411,11 @@ pub fn run() -> Result<(), String> {
     let mut kind = Some(renderer::first());
     while let Some(k) = kind {
         renderer::attempting(k);
+        let app_lifetime = lifetime.clone();
         match eframe::run_native(
             &title(),
             options(k),
-            Box::new(|cc| Ok(Box::new(App::new(cc)))),
+            Box::new(move |cc| Ok(Box::new(App::new(cc, app_lifetime)))),
         ) {
             Ok(()) => return Ok(()),
             // No display to open a window on at all: no X server or Wayland
@@ -372,7 +431,12 @@ pub fn run() -> Result<(), String> {
                     without_source_location(&e.to_string())
                 ));
             }
-            Err(e) => failures.push(format!("{}: {e}", k.label())),
+            Err(e) => {
+                failures.push(format!("{}: {e}", k.label()));
+                if !lifetime.can_retry_renderer() {
+                    return Err(format!("окно завершилось после начала работы; повторный запуск интерфейса не выполняется ({})", failures.join("; ")));
+                }
+            },
         }
         kind = k.next();
     }
@@ -391,10 +455,6 @@ fn without_source_location(msg: &str) -> &str {
         .unwrap_or(msg)
 }
 
-/// The licence screen, always - except in a *debug* build started with
-/// `AG_UNLOCKER_DEV_SKIP_KEY` set, so the main screen can be looked at while it
-/// is being worked on. Compiled out of every release build (`build_rust.py`
-/// builds release), so a shipped exe has no way past the key.
 fn first_screen(settings: &Settings) -> Screen {
     #[cfg(debug_assertions)]
     if std::env::var_os("AG_UNLOCKER_DEV_SKIP_KEY").is_some() {

@@ -191,59 +191,62 @@ fn lacks_global_ipv6() -> bool {
     }
 }
 
-fn set_ipv4_precedence(precedence: &str) {
+fn set_ipv4_precedence(precedence: &str) -> Result<(), String> {
     let mut cmd = Command::new("netsh");
-    cmd.args([
-        "interface",
-        "ipv6",
-        "set",
-        "prefixpolicy",
-        IPV4_PREFIX,
-        precedence,
-        "4",
-    ]);
-    // Bounded like everything else on this path: `netsh` is a child process and
-    // a child process can stop answering.
-    bounded_output(no_window(&mut cmd), HELPER_LIMIT);
-}
-
-/// Restores the default IPv4/IPv6 precedence, but only if the current value is
-/// the one this tool sets. A precedence the user (or another tool) chose is
-/// left untouched.
-fn restore_ipv4_precedence() {
-    let out = powershell(
-        "(Get-NetPrefixPolicy -ErrorAction SilentlyContinue | \
-         Where-Object { $_.Prefix -eq '::ffff:0:0/96' }).Precedence",
-    );
-    let is_ours = out.map_or(false, |o| {
-        String::from_utf8_lossy(&o.stdout).trim() == IPV4_PREFIX_PREFERRED_PRECEDENCE
-    });
-    if is_ours {
-        set_ipv4_precedence(IPV4_PREFIX_DEFAULT_PRECEDENCE);
+    cmd.args(["interface", "ipv6", "set", "prefixpolicy", IPV4_PREFIX, precedence, "4"]);
+    let output = bounded_output(no_window(&mut cmd), HELPER_LIMIT)
+        .ok_or("set IPv4 precedence: helper unavailable or timed out; effect may be partial")?;
+    if !output.status.success() {
+        return Err("set IPv4 precedence: command failed; effect may be partial".into());
     }
+    Ok(())
 }
 
-/// Linux has no NRPT and no relay installed yet, so there is nothing to remove;
-/// the undo menus must not spawn doomed helpers or error here.
+fn restore_ipv4_precedence() -> Result<(), String> {
+    let script = format!("$ErrorActionPreference='Stop'; $p=@(Get-NetPrefixPolicy -ErrorAction Stop | \
+        Where-Object {{ $_.Prefix -eq '{}' }} | ForEach-Object {{ $_.Precedence }}); \
+        ConvertTo-Json -InputObject $p -Compress; 'AG_END'", IPV4_PREFIX);
+    let out = powershell(&script).ok_or("query IPv4 precedence: helper unavailable or timed out")?;
+    if !out.status.success() { return Err("query IPv4 precedence: command failed".into()); }
+    let values = parse_precedence(&out.stdout)?;
+    if values.len() > 1 { return Err("query IPv4 precedence: ambiguous results".into()); }
+    if values.first().is_some_and(|v| v.to_string() == IPV4_PREFIX_PREFERRED_PRECEDENCE) {
+        set_ipv4_precedence(IPV4_PREFIX_DEFAULT_PRECEDENCE)?;
+    }
+    Ok(())
+}
+
+fn parse_precedence(stdout: &[u8]) -> Result<Vec<u32>, String> {
+    let text = std::str::from_utf8(stdout).map_err(|_| "IPv4 precedence: invalid UTF-8")?;
+    let json = text.trim().strip_suffix("\nAG_END").ok_or("IPv4 precedence: incomplete output")?.trim();
+    serde_json::from_str(json).map_err(|e| format!("IPv4 precedence: invalid output: {e}"))
+}
+
 #[cfg(not(target_os = "windows"))]
 pub fn remove_dns_nrpt() {}
 
 #[cfg(target_os = "windows")]
 pub fn remove_dns_nrpt() {
-    restore_ipv4_precedence();
-    // The pinned addresses only exist to serve these rules, so they go together.
-    hosts_pin::remove_entries().ok();
-    egress::remove_legacy_routes();
+    if let Err(e) = remove_dns_nrpt_checked() { eprintln!("{e}"); }
+}
 
+#[cfg(target_os = "windows")]
+pub(crate) fn remove_dns_nrpt_checked() -> Result<(), String> {
+    restore_ipv4_precedence().map_err(|e| format!("DNS precedence: {e}; effect may be partial"))?;
+    hosts_pin::remove_entries().map_err(|e| format!("DNS hosts cleanup: {e}; effect may be partial"))?;
     let cmd = format!(
-        "$tags=@({}); Get-DnsClientNrptRule -ErrorAction SilentlyContinue | \
+        "$ErrorActionPreference='Stop'; $tags=@({}); Get-DnsClientNrptRule -ErrorAction Stop | \
          Where-Object {{ $tags -contains $_.Comment }} | \
-         Remove-DnsClientNrptRule -Force -ErrorAction SilentlyContinue; \
-         Clear-DnsClientCache -ErrorAction SilentlyContinue",
-        ps_string_list(&all_tags())
+         Remove-DnsClientNrptRule -Force -ErrorAction Stop; \
+         Clear-DnsClientCache -ErrorAction Stop; 'AG_DONE'", ps_string_list(&all_tags())
     );
-    powershell(&cmd);
+    let output = powershell(&cmd);
     invalidate_cache();
+    let output = output.ok_or("DNS NRPT cleanup: helper unavailable or timed out; effect may be partial")?;
+    if !output.status.success() || std::str::from_utf8(&output.stdout).ok().map(str::trim) != Some("AG_DONE") {
+        return Err("DNS NRPT cleanup: command failed or incomplete; effect may be partial".into());
+    }
+    Ok(())
 }
 
 /// Namespaces currently installed under our tag, lowercased.
@@ -261,6 +264,38 @@ fn installed_namespaces() -> Vec<String> {
             .collect(),
         None => Vec::new(),
     }
+}
+
+/// Fresh, failure-transparent evidence for privilege preflight.
+#[cfg(target_os = "windows")]
+pub(crate) struct NrptState {
+    pub(crate) core_applied: bool,
+    pub(crate) owned_rules_present: bool,
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn checked_nrpt_state() -> Result<NrptState, String> {
+    let script = format!(
+        "$ErrorActionPreference='Stop'; $tags=@({}); $current='{}'; \
+         $rules=@(Get-DnsClientNrptRule | Where-Object {{ $tags -contains $_.Comment }}); \
+         $names=@($rules | Where-Object {{ $_.Comment -eq $current }} | ForEach-Object {{ $_.Namespace }}); \
+         $result=@{{ names=$names; owned=($rules.Count -gt 0) }}; \
+         ConvertTo-Json -InputObject $result -Compress; 'AG_END'",
+        ps_string_list(&all_tags()), AG_NRPT_TAG
+    );
+    let output = powershell(&script).ok_or("NRPT query unavailable or timed out")?;
+    if !output.status.success() { return Err("NRPT query failed".into()); }
+    let text = std::str::from_utf8(&output.stdout).map_err(|_| "NRPT query invalid UTF-8")?;
+    let json = text.trim().strip_suffix("\nAG_END").ok_or("NRPT query incomplete")?.trim();
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Wire { names: Vec<String>, owned: bool }
+    let wire: Wire = serde_json::from_str(json).map_err(|e| format!("invalid NRPT query: {e}"))?;
+    if wire.names.iter().any(|n| n.trim().is_empty()) { return Err("empty NRPT namespace".into()); }
+    Ok(NrptState {
+        core_applied: AG_NRPT_CORE.iter().all(|ns| wire.names.iter().any(|n| n.trim().trim_end_matches('.').eq_ignore_ascii_case(ns))),
+        owned_rules_present: wire.owned,
+    })
 }
 
 /// No NRPT layer on Linux yet, so no rules are ever applied. Returning false
@@ -517,7 +552,7 @@ pub fn setup_dns_nrpt() -> Result<DnsOutcome, String> {
 #[cfg(target_os = "windows")]
 pub fn setup_dns_nrpt() -> Result<DnsOutcome, String> {
     // Remove any of our previous rules to keep a clean idempotent state.
-    remove_dns_nrpt();
+    remove_dns_nrpt_checked().map_err(|e| format!("DNS setup cleanup: {e}"))?;
 
     let egress = egress::detect();
     let via_relay = background::is_enabled();
@@ -600,7 +635,7 @@ pub fn setup_dns_nrpt() -> Result<DnsOutcome, String> {
     }
 
     if lacks_global_ipv6() {
-        set_ipv4_precedence(IPV4_PREFIX_PREFERRED_PRECEDENCE);
+        let _ = set_ipv4_precedence(IPV4_PREFIX_PREFERRED_PRECEDENCE);
     }
 
     // Fallback for a machine without the relay. With a tunnel up the rules alone
@@ -786,6 +821,16 @@ pub fn refresh_pinned_hosts() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn precedence_query_requires_complete_valid_result() {
+        assert_eq!(parse_precedence(b"[]\r\nAG_END\r\n").unwrap(), Vec::<u32>::new());
+        assert_eq!(parse_precedence(b"[46]\nAG_END").unwrap(), vec![46]);
+        assert!(parse_precedence(b"").is_err());
+        assert!(parse_precedence(b"[46]").is_err());
+        assert!(parse_precedence(b"[x]\nAG_END").is_err());
+        assert!(parse_precedence(b"null\nAG_END").is_err());
+    }
     use std::net::Ipv4Addr;
 
     /// The stand-down is announced on its own and nothing else is printed with
