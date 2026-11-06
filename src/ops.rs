@@ -2078,7 +2078,7 @@ fn apply(ctx: &mut Ctx, cap: Cap, on: bool) -> Result<(), String> {
 /// still receive cancellation and close requests.
 #[cfg(windows)]
 #[derive(Debug)]
-pub(crate) enum ApplyPlanError { Cancelled, Receiving(String), GatewayRecoveryRequired(GatewayApplyRecovery) }
+pub(crate) enum ApplyPlanError { Cancelled, Receiving(String), GatewayRecoveryRequired(GatewayApplyRecovery), VendorMetadataRecoveryRequired(VendorApplyRecovery) }
 #[cfg(windows)]
 pub(crate) struct GatewayApplyRecovery {
     pub(crate) observation: crate::windows_coordinator::windows_installation::GatewayPendingObservation,
@@ -2092,12 +2092,26 @@ impl std::fmt::Debug for GatewayApplyRecovery {
     }
 }
 #[cfg(windows)]
+pub(crate) struct VendorApplyRecovery {
+    pub(crate) observation: crate::windows_coordinator::windows_installation::VendorPendingObservation,
+    pub(crate) target: crate::instances::GuiReplacementTarget,
+    pub(crate) bound: crate::windows_coordinator::windows_installation::BoundInstallation,
+    pub(crate) saved_sha256: [u8; 32],
+}
+#[cfg(windows)]
+impl std::fmt::Debug for VendorApplyRecovery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VendorApplyRecovery").field("observation", &self.observation).finish_non_exhaustive()
+    }
+}
+#[cfg(windows)]
 impl From<String> for ApplyPlanError { fn from(value: String) -> Self { Self::Receiving(value) } }
 #[cfg(windows)]
 impl std::fmt::Display for ApplyPlanError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self { Self::Cancelled => f.write_str("Применение отменено."), Self::Receiving(error) => f.write_str(error),
-            Self::GatewayRecoveryRequired(_) => f.write_str("RecoveryRequired: selected Desktop has an exact Pending gateway prerequisite") }
+            Self::GatewayRecoveryRequired(_) => f.write_str("RecoveryRequired: selected Desktop has an exact Pending gateway prerequisite"),
+            Self::VendorMetadataRecoveryRequired(_) => f.write_str("RecoveryRequired: selected Desktop has an exact Pending vendor metadata prerequisite") }
     }
 }
 
@@ -2238,13 +2252,33 @@ fn gui_current_expectation(observation: crate::windows_coordinator::windows_inst
     Ok(match observation {
         Current::Absent => Gui::Absent {},
         Current::Settled { slot_id, current_sha256 } => Gui::Present { slot_id, current_sha256 },
-        Current::GatewayPending(_) => return Err("RecoveryRequired: continuation target has unresolved Current".into()),
+        Current::GatewayPending(_) | Current::VendorPending(_) => return Err("RecoveryRequired: continuation target has unresolved Current".into()),
         Current::VendorReplacement(value) => Gui::VendorUpdate { slot_id: value.slot_id,
             prior_current_sha256: value.prior_current_sha256, new_parent_id: value.new_parent_id,
             new_resources_id: value.new_resources_id, new_archive_id: value.new_archive_id,
             new_executable_sha256: value.new_executable_sha256, new_archive_sha256: value.new_archive_sha256,
             new_binding_sha256: value.new_binding_sha256 },
     })
+}
+
+// Read-only prerequisite receiving precedes every selected-image/native plan.
+// It takes no package capability; the adapter later revalidates this exact data.
+#[cfg(windows)]
+pub(crate) fn receive_desktop_apply_current(bound: crate::windows_coordinator::windows_installation::BoundInstallation,
+    target: &crate::instances::GuiReplacementTarget, saved_sha256: [u8; 32])
+    -> Result<crate::instances::GuiCurrentExpectation, ApplyPlanError> {
+    use crate::windows_coordinator::windows_installation as owner;
+    if target.kind != crate::instances::GuiTargetKind::Desktop || bound.native_root_id() != target.native_root_id
+        || bound.native_executable_id() != target.anchor_native_id || !owner::same_windows_path(bound.executable().as_path(), &target.anchor_path)? {
+        return Err("RecoveryRequired: Apply target anchor changed before prerequisite receiving".to_owned().into());
+    }
+    match owner::observe_apply_current(&bound)? {
+        owner::ApplyCurrentObservation::GatewayPending(observation) => Err(ApplyPlanError::GatewayRecoveryRequired(
+            GatewayApplyRecovery { observation, target: target.clone(), bound })),
+        owner::ApplyCurrentObservation::VendorPending(observation) => Err(ApplyPlanError::VendorMetadataRecoveryRequired(
+            VendorApplyRecovery { observation, target: target.clone(), bound, saved_sha256 })),
+        observation => gui_current_expectation(observation).map_err(ApplyPlanError::from),
+    }
 }
 
 #[cfg(windows)]
@@ -2286,11 +2320,7 @@ pub(crate) fn receive_all_target_apply_plan(wanted: Settings, cancel: &AtomicBoo
         let current = if layout.kind == crate::InstallationKind::Desktop {
             let mut bound = owner::BoundInstallation::open(anchor.as_path())?;
             if let Some(context) = coordinator::receive_saved_context(&bound)? { bound.attach_ancestor_context(context)?; }
-            match owner::observe_apply_current(&bound)? {
-                owner::ApplyCurrentObservation::GatewayPending(observation) => return Err(ApplyPlanError::GatewayRecoveryRequired(
-                    GatewayApplyRecovery { observation, target, bound })),
-                observation => gui_current_expectation(observation)?,
-            }
+            receive_desktop_apply_current(bound, &target, saved_sha256)?
         } else { GuiCurrentExpectation::NotApplicable {} };
         let expectation = GuiTargetExpectation { target, current };
         if let Some(prior) = targets.iter().find(|prior| prior.root.native_id() == root.native_id()) {
@@ -2517,6 +2547,21 @@ fn apply_acknowledged(ctx: &mut Ctx, wanted: Settings, cancellation: &AtomicBool
                                 // Same acknowledged intent and discovery owner;
                                 // no native/profile effect before a full new plan.
                             }
+                            Err(ApplyPlanError::VendorMetadataRecoveryRequired(prerequisite)) => {
+                                if let Err(error) = receive_pending_prerequisite_once(&mut attempted, &prerequisite.observation.slot_id,
+                                    &prerequisite.observation.operation_id, prerequisite.observation.current_sha256, cancellation) { break Err(error); }
+                                match crate::wsl_runtime::recover_apply_vendor_metadata(prerequisite.bound, &prerequisite.target,
+                                    &prerequisite.observation, &wanted, prerequisite.saved_sha256, cancellation) {
+                                    Ok(outcome) => { ctx.log(Level::Ok, outcome.clone()); recovery_results.push(outcome); }
+                                    Err(error) => {
+                                        let received = format!("vendor metadata prerequisite {:?}; {error}", prerequisite.observation);
+                                        ctx.log(Level::Err, received.clone()); recovery_results.push(received);
+                                        break Err(error);
+                                    }
+                                }
+                                // Only this recorded operation settled. A new
+                                // whole plan still owns package/readers/UAC.
+                            }
                             Err(error) => break Err(error.to_string()),
                         }
                     }
@@ -2570,9 +2615,14 @@ fn receive_gateway_prerequisite_once(
     observation: &crate::windows_coordinator::windows_installation::GatewayPendingObservation,
     cancellation: &AtomicBool,
 ) -> Result<(), String> {
-    if cancellation.load(Ordering::SeqCst) { return Err("Cancelled: gateway prerequisite not started".into()); }
-    if !attempted.insert((observation.slot_id.clone(), observation.operation_id.clone(), observation.current_sha256)) {
-        return Err("RecoveryRequired: the same Pending gateway prerequisite remains unresolved; no automatic retry".into());
+    receive_pending_prerequisite_once(attempted, &observation.slot_id, &observation.operation_id, observation.current_sha256, cancellation)
+}
+#[cfg(windows)]
+fn receive_pending_prerequisite_once(attempted: &mut std::collections::BTreeSet<(String, String, [u8; 32])>,
+    slot_id: &str, operation_id: &str, current_sha256: [u8; 32], cancellation: &AtomicBool) -> Result<(), String> {
+    if cancellation.load(Ordering::SeqCst) { return Err("Cancelled: Pending prerequisite not started".into()); }
+    if !attempted.insert((slot_id.to_owned(), operation_id.to_owned(), current_sha256)) {
+        return Err("RecoveryRequired: the same Pending prerequisite remains unresolved; no automatic retry".into());
     }
     Ok(())
 }
@@ -3664,6 +3714,12 @@ mod tests {
         let mut fresh_positive_apply = std::collections::BTreeSet::new();
         cancel.store(false, Ordering::SeqCst);
         receive_gateway_prerequisite_once(&mut fresh_positive_apply, &pending, &cancel).unwrap();
+        let vendor = crate::windows_coordinator::windows_installation::VendorPendingObservation {
+            slot_id: "d".repeat(32), operation_id: "e".repeat(32), current_sha256: [9; 32],
+        };
+        receive_pending_prerequisite_once(&mut attempted, &vendor.slot_id, &vendor.operation_id, vendor.current_sha256, &cancel).unwrap();
+        assert!(receive_pending_prerequisite_once(&mut attempted, &vendor.slot_id, &vendor.operation_id, vendor.current_sha256, &cancel).unwrap_err().contains("same Pending"));
+        assert!(gui_current_expectation(crate::windows_coordinator::windows_installation::ApplyCurrentObservation::VendorPending(vendor)).is_err());
     }
     #[test]
     fn refresh_waits_for_owned_native_settlement_and_coalesces() {

@@ -1927,10 +1927,17 @@ pub(crate) struct GatewayPendingObservation {
     pub(crate) current_sha256: [u8; 32],
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct VendorPendingObservation {
+    pub(crate) slot_id: String,
+    pub(crate) operation_id: String,
+    pub(crate) current_sha256: [u8; 32],
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ApplyCurrentObservation {
     Absent,
     Settled { slot_id: String, current_sha256: [u8; 32] },
     GatewayPending(GatewayPendingObservation),
+    VendorPending(VendorPendingObservation),
     VendorReplacement(VendorUpdateObservation),
 }
 
@@ -1999,6 +2006,16 @@ pub(crate) fn observe_apply_current(bound: &BoundInstallation) -> Result<ApplyCu
     let (current, digest) = receive_current(&slot)?;
     let gateway_pending = current.mode == Mode::Pending && current.active_operation.as_ref().is_some_and(|operation|
         matches!(operation.kind, OperationKind::ConfigureGatewayRules | OperationKind::RetireGatewayRules));
+    let vendor_pending = current.mode == Mode::Pending && current.active_operation.as_ref().is_some_and(|operation|
+        operation.kind == OperationKind::VendorUpdate);
+    if vendor_pending {
+        let operation = current.active_operation.as_ref().unwrap();
+        runtime_upgrade::receive_vendor_pending_target(&slot, &current, operation, bound)?;
+        let current_sha256 = hex::decode(digest).map_err(|_| "current digest encoding")?.try_into().map_err(|_| "current digest length")?;
+        return Ok(ApplyCurrentObservation::VendorPending(VendorPendingObservation {
+            slot_id: current.slot_id, operation_id: operation.id.clone(), current_sha256,
+        }));
+    }
     if matches!(current.mode, Mode::Bootstrap | Mode::Pending) && !gateway_pending {
         return Err("RecoveryRequired: continuation target has unresolved Current".into());
     }
@@ -2019,7 +2036,7 @@ fn strict_current_expectation(observation: ApplyCurrentObservation) -> Result<Op
     match observation {
         ApplyCurrentObservation::Absent => Ok(None),
         ApplyCurrentObservation::Settled { slot_id, current_sha256 } => Ok(Some((slot_id, current_sha256))),
-        ApplyCurrentObservation::GatewayPending(_) => Err("RecoveryRequired: continuation target has unresolved Current".into()),
+        ApplyCurrentObservation::GatewayPending(_) | ApplyCurrentObservation::VendorPending(_) => Err("RecoveryRequired: continuation target has unresolved Current".into()),
         ApplyCurrentObservation::VendorReplacement(_) => Err("UpdatePending: continuation target incarnation differs".into()),
     }
 }
@@ -2036,6 +2053,8 @@ mod apply_current_projection_tests {
         assert_eq!(strict_current_expectation(ApplyCurrentObservation::Settled { slot_id: "a".repeat(32), current_sha256: [7;32] }).unwrap(), Some(("a".repeat(32), [7;32])));
         let pending = GatewayPendingObservation { slot_id: "a".repeat(32), operation_id: "b".repeat(32), current_sha256: [8;32] };
         assert!(strict_current_expectation(ApplyCurrentObservation::GatewayPending(pending)).unwrap_err().contains("unresolved Current"));
+        let pending = VendorPendingObservation { slot_id: "a".repeat(32), operation_id: "c".repeat(32), current_sha256: [9;32] };
+        assert!(strict_current_expectation(ApplyCurrentObservation::VendorPending(pending)).unwrap_err().contains("unresolved Current"));
         let id = ObjectId { volume: 1, file: [2; 16] };
         let vendor = VendorUpdateObservation { slot_id: "a".repeat(32), prior_current_sha256: [3; 32],
             new_parent_id: id.clone(), new_resources_id: id.clone(), new_archive_id: id,

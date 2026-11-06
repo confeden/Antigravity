@@ -139,6 +139,535 @@ pub(super) struct VendorUpdateOutcome {
     retirement_final_checks: Vec<EvidenceRef>,
 }
 
+// Private, vendor-only evidence. These records never impersonate StepOutcome.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum GroupFrameKind { GroupResolutionIntent, GroupCallIntent, GroupCallResult, GroupReadback, VendorGroupMetadataResolution }
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct GroupObject { target: TargetState, native_id: ObjectId }
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct GroupResolutionIntentV1 {
+    schema: u32,
+    kind: GroupFrameKind,
+    slot_id: String,
+    operation_id: String,
+    pending_current: EvidenceRef,
+    vendor_intent: EvidenceRef,
+    step_intent: EvidenceRef,
+    failure: EvidenceRef,
+    actor_user: Vec<u8>,
+    postimage: GroupObject,
+    original_backup: GroupObject,
+    displaced_backup: GroupObject,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct GroupCallIntentV1 {
+    schema: u32,
+    kind: GroupFrameKind,
+    resolution_intent: EvidenceRef,
+    ordinal: u64,
+    #[serde(deserialize_with = "required_option")]
+    previous_not_called: Option<EvidenceRef>,
+    pre_call: GroupObject,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "camelCase", rename_all_fields = "camelCase", deny_unknown_fields)]
+enum GroupCallStatus { NotCalled { cause: String }, Returned { win_error: u32 } }
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct GroupCallResultV1 { schema: u32, kind: GroupFrameKind, call_intent: EvidenceRef, outcome: GroupCallStatus }
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "camelCase", rename_all_fields = "camelCase", deny_unknown_fields)]
+enum GroupReadbackState { Captured { object: GroupObject }, Unavailable { cause: String } }
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct GroupReadbackV1 {
+    schema: u32,
+    kind: GroupFrameKind,
+    resolution_intent: EvidenceRef,
+    #[serde(deserialize_with = "required_option")]
+    call_result: Option<EvidenceRef>,
+    observed: GroupReadbackState,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct GroupAttemptRefs {
+    intent: EvidenceRef,
+    #[serde(deserialize_with = "required_option")]
+    result: Option<EvidenceRef>,
+    #[serde(deserialize_with = "required_option")]
+    readback: Option<EvidenceRef>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase", deny_unknown_fields)]
+enum GroupResolutionProof {
+    ReturnedAndVerified { result: EvidenceRef, readback: EvidenceRef },
+    ObservedDesired { readback: EvidenceRef },
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct VendorGroupMetadataResolutionV1 {
+    schema: u32,
+    kind: GroupFrameKind,
+    slot_id: String,
+    operation_id: String,
+    vendor_intent: EvidenceRef,
+    step_intent: EvidenceRef,
+    failure: EvidenceRef,
+    resolution_intent: EvidenceRef,
+    attempts: Vec<GroupAttemptRefs>,
+    proof: GroupResolutionProof,
+    postimage: GroupObject,
+    applied: archive_install::AppliedArchive,
+}
+struct VendorReceivedApply {
+    intent: EvidenceRef,
+    target: TargetState,
+    native_id: ObjectId,
+    applied: Option<archive_install::AppliedArchive>,
+}
+impl From<StepOutcome> for VendorReceivedApply {
+    fn from(step: StepOutcome) -> Self {
+        Self { intent: step.intent, target: step.target, native_id: step.native_id, applied: step.applied }
+    }
+}
+
+struct GroupFailureInput {
+    step_ref: EvidenceRef,
+    failure_ref: EvidenceRef,
+    step: StepIntent,
+    postimage: TargetState,
+    original_backup: TargetState,
+    displaced_backup: TargetState,
+    target_path: PathBuf,
+}
+fn recorded_group_object(value: &archive_install::FileObservation) -> Result<TargetState> {
+    match value {
+        archive_install::FileObservation::Present { identity, digest } => Ok(TargetState { metadata: identity.clone(), digest: digest.clone() }),
+        _ => Err("RecoveryRequired: recorded group-resolution object unavailable".into()),
+    }
+}
+fn preserved_basic(a: &FileIdentity, source: &FileIdentity) -> bool {
+    a.volume == source.volume && a.attributes == source.attributes && a.creation == source.creation && a.write == source.write
+}
+fn post_fields(a: &TargetState, failed: &TargetState, source: &TargetState, candidate: &[u8]) -> bool {
+    a.metadata.index == failed.metadata.index && a.metadata.volume == failed.metadata.volume
+        && a.metadata.size == failed.metadata.size && a.metadata.size == candidate.len() as u64
+        && a.digest == failed.digest && a.digest == hash(candidate) && preserved_basic(&a.metadata, &source.metadata)
+}
+fn known_vendor_group_failure(failure: &ActualFailure) -> bool {
+    failure.phase == "metadata-preservation" && failure.replace_result == Some(true)
+}
+fn receive_group_failure(slot: &CheckedPath, vendor_ref: &EvidenceRef, vendor: &VendorUpdateIntent) -> Result<GroupFailureInput> {
+    let dir = operation_dir(slot, vendor_ref)?;
+    if optional_reference(slot, &dir.join("apply-v2-outcome.json"))?.is_some() {
+        return Err("RecoveryRequired: normal outcome conflicts with group resolution".into());
+    }
+    let step_ref = optional_reference(slot, &dir.join("apply-v2-intent.json"))?.ok_or("group resolution step intent absent")?;
+    let failure_ref = optional_reference(slot, &dir.join("apply-v2-failure.json"))?.ok_or("group resolution actual failure absent")?;
+    let step: StepIntent = decode(&reference(slot, &step_ref)?)?;
+    let failure: ActualFailure = decode(&reference(slot, &failure_ref)?)?;
+    let pristine = reference(slot, &vendor.pristine)?;
+    let candidate = reference(slot, &vendor.candidate)?;
+    if !known_vendor_group_failure(&failure)
+        || step.schema != 3 || step.step != "apply-v2" || step.operation_id != vendor.operation_id
+        || step.reverted.is_some() || step.layout != vendor.apply_layout
+        || step.source.digest != vendor.new_binding.archive_digest || step.source.metadata != vendor.new_binding.archive_metadata
+        || step.source_native_id != vendor.new_binding.archive || reference(slot, &step.preimage)? != pristine
+        || hash(&pristine) != step.source.digest {
+        return Err("RecoveryRequired: not the exact known vendor metadata failure".into());
+    }
+    let layout = &step.layout;
+    let target_path = failure.recovery.target.0.clone();
+    validate_path(&target_path)?;
+    let postimage = recorded_group_object(&failure.recovery.target.1)?;
+    let stages = failure.recovery.staged.as_ref().ok_or("recorded stage absent")?;
+    let original = failure.recovery.original_backup.as_ref().ok_or("recorded original backup absent")?;
+    let displaced = failure.recovery.displaced_backup.as_ref().ok_or("recorded displaced backup absent")?;
+    let original_backup = recorded_group_object(&original.1)?;
+    let displaced_backup = recorded_group_object(&displaced.1)?;
+    let paths = [&layout.staged, &layout.original_backup, &layout.displaced_backup];
+    for (i, path) in paths.iter().enumerate() {
+        validate_path(path)?;
+        if path.parent() != Some(layout.workspace.as_path()) || **path == target_path || paths[..i].contains(path) {
+            return Err("RecoveryRequired: group-resolution layout conflict".into());
+        }
+    }
+    if stages.0 != layout.staged || !matches!(stages.1, archive_install::FileObservation::Missing)
+        || original.0 != layout.original_backup || displaced.0 != layout.displaced_backup
+        || !post_fields(&postimage, &postimage, &step.source, &candidate)
+        || displaced_backup != step.source || original_backup.digest != step.source.digest
+        || original_backup.metadata.size != step.source.metadata.size || !preserved_basic(&original_backup.metadata, &step.source.metadata)
+        || postimage.metadata.security_descriptor == step.source.metadata.security_descriptor {
+        return Err("RecoveryRequired: recorded failed postimage/backup field authority conflict".into());
+    }
+    Ok(GroupFailureInput { step_ref, failure_ref, step, postimage, original_backup, displaced_backup, target_path })
+}
+fn validate_group_capture(input: &GroupFailureInput, captured: &GroupResolutionIntentV1, candidate: &[u8], post: &GroupObject) -> Result<bool> {
+    if post.native_id != captured.postimage.native_id || post.native_id.volume != input.step.source_native_id.volume
+        || !post_fields(&post.target, &input.postimage, &input.step.source, candidate) {
+        return Err("RecoveryRequired: group-resolution postimage object/content/basic fields differ".into());
+    }
+    native::receive_group_metadata(&post.target.metadata.security_descriptor, &input.postimage.metadata.security_descriptor,
+        &input.step.source.metadata.security_descriptor, &captured.actor_user)
+}
+fn receive_group_intent(slot: &CheckedPath, value: &EvidenceRef, vendor_ref: &EvidenceRef,
+    vendor: &VendorUpdateIntent, input: &GroupFailureInput) -> Result<GroupResolutionIntentV1> {
+    let frame: GroupResolutionIntentV1 = decode(&reference(slot, value)?)?;
+    let dir = operation_dir(slot, vendor_ref)?;
+    let pending_bytes = reference(slot, &frame.pending_current)?;
+    let pending: Current = decode(&pending_bytes)?;
+    current_shape(&pending, &vendor.slot_id)?;
+    let op = pending.active_operation.as_ref().ok_or("group-resolution retained Pending absent")?;
+    if frame.schema != 1 || frame.kind != GroupFrameKind::GroupResolutionIntent
+        || frame.slot_id != vendor.slot_id || frame.operation_id != vendor.operation_id
+        || frame.vendor_intent != *vendor_ref || frame.step_intent != input.step_ref || frame.failure != input.failure_ref
+        || optional_reference(slot, &dir.join("group-metadata-intent.json"))?.as_ref() != Some(value)
+        || pending.mode != Mode::Pending || op.id != frame.operation_id || op.intent != *vendor_ref || op.kind != OperationKind::VendorUpdate
+        || frame.original_backup.target != input.original_backup || frame.displaced_backup.target != input.displaced_backup
+        || frame.displaced_backup.native_id != input.step.source_native_id
+        || frame.original_backup.native_id.volume != input.step.source_native_id.volume
+        || frame.postimage.native_id == frame.displaced_backup.native_id || frame.postimage.native_id == frame.original_backup.native_id
+        || frame.original_backup.native_id == frame.displaced_backup.native_id {
+        return Err("RecoveryRequired: group-resolution intent binding conflict".into());
+    }
+    receive_vendor_pending(slot, &pending, op)?;
+    validate_group_capture(input, &frame, &reference(slot, &vendor.candidate)?, &frame.postimage)?;
+    Ok(frame)
+}
+fn capture_group_object(path: &Path) -> Result<(SourceSnapshot, GroupObject)> {
+    let _parents = parents(path)?;
+    let mut file = open_regular(path, READ | DELETE)?;
+    let snapshot = read_checked(&mut file, path)?;
+    let captured = GroupObject { target: object_state(&snapshot), native_id: object_id(&file)? };
+    Ok((snapshot, captured))
+}
+fn capture_group_handle(handle: &mut native::GroupMetadataHandle) -> Result<(SourceSnapshot, GroupObject)> {
+    let (snapshot, native_id) = handle.readback()?;
+    let captured = GroupObject { target: object_state(&snapshot), native_id };
+    Ok((snapshot, captured))
+}
+fn receive_group_actual(bound: &BoundInstallation, slot: &CheckedPath, vendor: &VendorUpdateIntent,
+    input: &GroupFailureInput, frame: &GroupResolutionIntentV1) -> Result<(SourceSnapshot, GroupObject, bool)> {
+    bound.revalidate_context()?;
+    bound.exe.recheck()?;
+    if !same_windows_path(&bound.archive.path, &input.target_path)? || bound.parent.object != vendor.new_binding.parent || bound.root.object != vendor.new_binding.root
+        || bound.resources.object != vendor.new_binding.resources || bound.exe.object != vendor.new_binding.executable
+        || hash(&bound.exe.read_snapshot()?) != vendor.new_binding.executable_digest || current_token_user_sid()? != frame.actor_user {
+        return Err("RecoveryRequired: group-resolution selected context/actor changed".into());
+    }
+    let layout = native_layout(bound, &input.step.layout, frame.postimage.native_id.clone())?;
+    layout.workspace.recheck()?;
+    if layout.workspace.object.volume != frame.postimage.native_id.volume || !matches!(archive_install::observe(&layout.paths.staged), archive_install::FileObservation::Missing) {
+        return Err("RecoveryRequired: group-resolution workspace/stage changed".into());
+    }
+    let (original_bytes, original) = capture_group_object(&layout.paths.original_backup)?;
+    let (displaced_bytes, displaced) = capture_group_object(&layout.paths.displaced_backup)?;
+    let pristine = reference(slot, &vendor.pristine)?;
+    if original != frame.original_backup || displaced != frame.displaced_backup || original_bytes.bytes != pristine || displaced_bytes.bytes != pristine {
+        return Err("RecoveryRequired: group-resolution retained backup changed".into());
+    }
+    let (snapshot, post) = capture_group_object(&bound.archive.path)?;
+    let candidate = reference(slot, &vendor.candidate)?;
+    if snapshot.bytes != candidate { return Err("RecoveryRequired: group-resolution candidate bytes changed".into()); }
+    let desired = validate_group_capture(input, frame, &candidate, &post)?;
+    vendor.deployment.receive_host(slot)?;
+    Ok((snapshot, post, desired))
+}
+
+fn save_group_frame<T: Serialize>(authority: &Authority, dir: &Path, name: &str, frame: &T) -> Result<EvidenceRef> {
+    #[cfg(test)]
+    group_checkpoint(&format!("save:{name}"))?;
+    let bytes = json(frame)?;
+    let value = authority.save(dir, name, &bytes)?;
+    if reference(&authority.slot, &value)? != bytes { return Err("group evidence independent readback differs".into()); }
+    Ok(value)
+}
+fn group_call_name(ordinal: u64, part: &str) -> String { format!("group-call-{ordinal}-{part}.json") }
+
+// Only the last attempt may be incomplete. A later attempt requires the actual
+// previous NotCalled terminal, never unchanged bytes or a missing result.
+fn receive_group_attempts(slot: &CheckedPath, dir: &Path, resolution: &EvidenceRef,
+    input: &GroupFailureInput, frame: &GroupResolutionIntentV1, candidate: &[u8]) -> Result<Vec<GroupAttemptRefs>> {
+    let mut files = std::collections::BTreeMap::<u64, std::collections::BTreeSet<String>>::new();
+    for entry in fs::read_dir(NativeFsPath::from_path(dir)?.as_path()).map_err(|e| io("group attempt inventory", e))? {
+        let name = entry.map_err(|e| io("group attempt entry", e))?.file_name();
+        let Some(name) = name.to_str() else { return Err("group attempt name encoding".into()); };
+        if !name.starts_with("group-") { continue; }
+        if matches!(name, "group-metadata-intent.json" | "group-metadata-resolution.json" | "group-final-readback.json") { continue; }
+        let (number, part) = name.strip_prefix("group-call-").and_then(|v| v.split_once('-')).ok_or("unknown group evidence file")?;
+        let ordinal: u64 = number.parse().map_err(|_| "group call ordinal invalid")?;
+        let part = part.strip_suffix(".json").ok_or("group call frame suffix invalid")?;
+        if ordinal == 0 || !matches!(part, "intent" | "result" | "readback") || group_call_name(ordinal, part) != name {
+            return Err("RecoveryRequired: unknown group call position".into());
+        }
+        files.entry(ordinal).or_default().insert(part.to_owned());
+    }
+    let mut attempts = Vec::new();
+    let mut previous_not_called = None;
+    let mut next = 1u64;
+    for (ordinal, parts) in files {
+        if ordinal != next || (ordinal > 1 && previous_not_called.is_none()) || !parts.contains("intent") {
+            return Err("RecoveryRequired: group call lineage hole/conflict or forbidden replay".into());
+        }
+        let intent_ref = optional_reference(slot, &dir.join(group_call_name(ordinal, "intent")))?.ok_or("group call intent absent")?;
+        let call: GroupCallIntentV1 = decode(&reference(slot, &intent_ref)?)?;
+        if call.schema != 1 || call.kind != GroupFrameKind::GroupCallIntent || call.resolution_intent != *resolution
+            || call.ordinal != ordinal || call.previous_not_called != previous_not_called
+            || validate_group_capture(input, frame, candidate, &call.pre_call)? {
+            return Err("RecoveryRequired: group call intent/actor/preimage conflict".into());
+        }
+        let result_ref = optional_reference(slot, &dir.join(group_call_name(ordinal, "result")))?;
+        previous_not_called = None;
+        if let Some(value) = &result_ref {
+            let result: GroupCallResultV1 = decode(&reference(slot, value)?)?;
+            if result.schema != 1 || result.kind != GroupFrameKind::GroupCallResult || result.call_intent != intent_ref {
+                return Err("RecoveryRequired: group call result binding conflict".into());
+            }
+            if let GroupCallStatus::NotCalled { cause } = result.outcome {
+                if cause.is_empty() { return Err("group NotCalled cause absent".into()); }
+                previous_not_called = Some(value.clone());
+            }
+        }
+        let readback = optional_reference(slot, &dir.join(group_call_name(ordinal, "readback")))?;
+        if let Some(value) = &readback {
+            let observation = receive_group_readback(slot, value, resolution)?;
+            if observation.call_result != result_ref || result_ref.is_none() { return Err("group readback result reference conflict".into()); }
+        }
+        attempts.push(GroupAttemptRefs { intent: intent_ref, result: result_ref, readback });
+        next = next.checked_add(1).ok_or("group call ordinal overflow")?;
+    }
+    Ok(attempts)
+}
+fn receive_group_readback(slot: &CheckedPath, value: &EvidenceRef, resolution: &EvidenceRef) -> Result<GroupReadbackV1> {
+    let frame: GroupReadbackV1 = decode(&reference(slot, value)?)?;
+    if frame.schema != 1 || frame.kind != GroupFrameKind::GroupReadback || frame.resolution_intent != *resolution
+        || matches!(&frame.observed, GroupReadbackState::Unavailable { cause } if cause.is_empty()) {
+        return Err("RecoveryRequired: group readback binding conflict".into());
+    }
+    Ok(frame)
+}
+
+fn receive_vendor_apply(slot: &CheckedPath, value: &EvidenceRef, vendor_ref: &EvidenceRef,
+    vendor: &VendorUpdateIntent) -> Result<VendorReceivedApply> {
+    let dir = operation_dir(slot, vendor_ref)?;
+    let normal = optional_reference(slot, &dir.join("apply-v2-outcome.json"))?;
+    let resolution = optional_reference(slot, &dir.join("group-metadata-resolution.json"))?;
+    match (normal, resolution) {
+        (Some(normal), None) if normal == *value => {
+            if optional_reference(slot, &dir.join("group-metadata-intent.json"))?.is_some() { return Err("normal vendor proof conflicts with group intent".into()); }
+            Ok(receive_step(slot, value, &vendor.operation_id, "apply-v2")?.into())
+        }
+        (None, Some(resolution)) if resolution == *value => receive_group_resolution(slot, value, vendor_ref, vendor),
+        _ => Err("RecoveryRequired: vendor proof fixed-kind/reference conflict".into()),
+    }
+}
+fn receive_group_resolution(slot: &CheckedPath, value: &EvidenceRef, vendor_ref: &EvidenceRef,
+    vendor: &VendorUpdateIntent) -> Result<VendorReceivedApply> {
+    let result: VendorGroupMetadataResolutionV1 = decode(&reference(slot, value)?)?;
+    let input = receive_group_failure(slot, vendor_ref, vendor)?;
+    let frame = receive_group_intent(slot, &result.resolution_intent, vendor_ref, vendor, &input)?;
+    let dir = operation_dir(slot, vendor_ref)?;
+    let candidate = reference(slot, &vendor.candidate)?;
+    let attempts = receive_group_attempts(slot, &dir, &result.resolution_intent, &input, &frame, &candidate)?;
+    if result.schema != 1 || result.kind != GroupFrameKind::VendorGroupMetadataResolution || result.slot_id != vendor.slot_id
+        || result.operation_id != vendor.operation_id || result.vendor_intent != *vendor_ref || result.step_intent != input.step_ref
+        || result.failure != input.failure_ref || result.attempts != attempts || !validate_group_capture(&input, &frame, &candidate, &result.postimage)? {
+        return Err("RecoveryRequired: vendor group resolution binding conflict".into());
+    }
+    let final_readback = match &result.proof {
+        GroupResolutionProof::ReturnedAndVerified { result: call_result, readback } => {
+            let last = attempts.last().ok_or("verified group call absent")?;
+            if last.result.as_ref() != Some(call_result) || last.readback.as_ref() != Some(readback) { return Err("verified group call refs conflict".into()); }
+            let terminal: GroupCallResultV1 = decode(&reference(slot, call_result)?)?;
+            if !matches!(terminal.outcome, GroupCallStatus::Returned { win_error: 0 }) { return Err("verified group call did not return zero".into()); }
+            readback
+        }
+        GroupResolutionProof::ObservedDesired { readback } => {
+            if optional_reference(slot, &dir.join("group-final-readback.json"))?.as_ref() != Some(readback) { return Err("group observation fixed reference conflict".into()); }
+            readback
+        }
+    };
+    let observed = receive_group_readback(slot, final_readback, &result.resolution_intent)?;
+    if !matches!(&observed.observed, GroupReadbackState::Captured { object } if object == &result.postimage)
+        || (matches!(result.proof, GroupResolutionProof::ObservedDesired { .. }) && observed.call_result.is_some()) {
+        return Err("RecoveryRequired: full desired group observation absent".into());
+    }
+    let a = &result.applied;
+    if a.record_version != 1 || a.target != input.target_path || a.original != input.step.source.metadata
+        || a.pre_digest != input.step.source.digest || a.post != result.postimage.target.metadata || a.post_digest != result.postimage.target.digest
+        || a.original_backup != input.step.layout.original_backup || a.original_backup_identity != frame.original_backup.target.metadata
+        || a.displaced_backup != input.step.layout.displaced_backup || a.displaced_identity != frame.displaced_backup.target.metadata {
+        return Err("RecoveryRequired: actual group-resolved AppliedArchive differs".into());
+    }
+    Ok(VendorReceivedApply { intent: input.step_ref, target: result.postimage.target, native_id: result.postimage.native_id, applied: Some(result.applied) })
+}
+
+fn group_recovery_precheck<W: MaintenanceWindow>(bound: &BoundInstallation, authority: &Authority,
+    frame: &GroupResolutionIntentV1, cancel: &AtomicBool, window: &mut W) -> Result<()> {
+    if cancel.load(Ordering::SeqCst) { return Err("Cancelled: vendor metadata recovery held".into()); }
+    bound.revalidate_context()?;
+    window.ensure_held()?;
+    let (_, digest) = receive_current(&authority.slot)?;
+    if digest != authority.digest || digest != frame.pending_current.digest {
+        return Err("RecoveryRequired: group-resolution Pending changed".into());
+    }
+    Ok(())
+}
+fn group_call_can_follow(last: Option<&GroupCallStatus>) -> Result<()> {
+    match last {
+        Some(GroupCallStatus::NotCalled { cause }) if !cause.is_empty() => Ok(()),
+        Some(GroupCallStatus::Returned { win_error }) => Err(format!("RecoveryRequired: retained group call WinError={win_error}; no repeat")),
+        _ => Err("RecoveryRequired: group call Unknown or invalid NotCalled; no repeat".into()),
+    }
+}
+fn resolve_vendor_group_metadata<W: MaintenanceWindow>(bound: &BoundInstallation, authority: &Authority,
+    op: &Operation, vendor: &VendorUpdateIntent, cancel: &AtomicBool, window: &mut W) -> Result<(EvidenceRef, VendorReceivedApply)> {
+    let dir = operation_dir(&authority.slot, &op.intent)?;
+    let input = receive_group_failure(&authority.slot, &op.intent, vendor)?;
+    let candidate = reference(&authority.slot, &vendor.candidate)?;
+    if cancel.load(Ordering::SeqCst) { return Err("Cancelled: vendor metadata recovery not started".into()); }
+    window.ensure_held()?;
+    let resolution_ref = match optional_reference(&authority.slot, &dir.join("group-metadata-intent.json"))? {
+        Some(value) => value,
+        None => {
+            // These are fresh recovery captures, never invented historical IDs.
+            let (_, postimage) = capture_group_object(&bound.archive.path)?;
+            let (_, original_backup) = capture_group_object(&input.step.layout.original_backup)?;
+            let (_, displaced_backup) = capture_group_object(&input.step.layout.displaced_backup)?;
+            let frame = GroupResolutionIntentV1 { schema: 1, kind: GroupFrameKind::GroupResolutionIntent,
+                slot_id: vendor.slot_id.clone(), operation_id: op.id.clone(), pending_current: authority.retain_current()?,
+                vendor_intent: op.intent.clone(), step_intent: input.step_ref.clone(), failure: input.failure_ref.clone(),
+                actor_user: current_token_user_sid()?, postimage, original_backup, displaced_backup };
+            // Reject malformed captures before persisting a new recovery lineage.
+            if frame.original_backup.target != input.original_backup || frame.displaced_backup.target != input.displaced_backup
+                || frame.displaced_backup.native_id != input.step.source_native_id {
+                return Err("RecoveryRequired: initial group-resolution backup receiving differs".into());
+            }
+            validate_group_capture(&input, &frame, &candidate, &frame.postimage)?;
+            receive_group_actual(bound, &authority.slot, vendor, &input, &frame)?;
+            save_group_frame(authority, &dir, "group-metadata-intent.json", &frame)?
+        }
+    };
+    let frame = receive_group_intent(&authority.slot, &resolution_ref, &op.intent, vendor, &input)?;
+    group_recovery_precheck(bound, authority, &frame, cancel, window)?;
+    let attempts = receive_group_attempts(&authority.slot, &dir, &resolution_ref, &input, &frame, &candidate)?;
+    let (preimage, postimage, desired) = receive_group_actual(bound, &authority.slot, vendor, &input, &frame)?;
+    if let Some(value) = optional_reference(&authority.slot, &dir.join("group-metadata-resolution.json"))? {
+        let received = receive_vendor_apply(&authority.slot, &value, &op.intent, vendor)?;
+        if !desired || received.target != postimage.target || received.native_id != postimage.native_id {
+            return Err("RecoveryRequired: group-resolved actual target changed".into());
+        }
+        return Ok((value, received));
+    }
+    let (proof, postimage) = if desired {
+        // A later genuine Recover may observe convergence after Unknown or a
+        // nonzero return. It preserves that entire lineage and makes no call.
+        let observed = GroupReadbackV1 { schema: 1, kind: GroupFrameKind::GroupReadback,
+            resolution_intent: resolution_ref.clone(), call_result: None,
+            observed: GroupReadbackState::Captured { object: postimage.clone() } };
+        let value = match optional_reference(&authority.slot, &dir.join("group-final-readback.json"))? {
+            Some(value) if reference(&authority.slot, &value)? == json(&observed)? => value,
+            Some(_) => return Err("RecoveryRequired: immutable group observation conflict".into()),
+            None => save_group_frame(authority, &dir, "group-final-readback.json", &observed)?,
+        };
+        (GroupResolutionProof::ObservedDesired { readback: value }, postimage)
+    } else {
+        let previous_not_called = match attempts.last() {
+            None => None,
+            Some(last) => {
+                let result = last.result.as_ref().map(|value| reference(&authority.slot, value).and_then(|bytes| decode::<GroupCallResultV1>(&bytes))).transpose()?;
+                group_call_can_follow(result.as_ref().map(|value| &value.outcome))?;
+                last.result.clone()
+            }
+        };
+        if optional_reference(&authority.slot, &dir.join("group-final-readback.json"))?.is_some() {
+            return Err("RecoveryRequired: immutable desired observation no longer matches".into());
+        }
+        group_recovery_precheck(bound, authority, &frame, cancel, window)?;
+        let ordinal = u64::try_from(attempts.len()).map_err(|_| "group ordinal encoding")?.checked_add(1).ok_or("group ordinal overflow")?;
+        // Open first. If admission/open fails, the separately retained terminal
+        // truthfully says NotCalled; it never claims acquired native rights.
+        let mut handle = native::GroupMetadataHandle::open(&preimage, &postimage.native_id,
+            &input.postimage.metadata.security_descriptor, &input.step.source.metadata.security_descriptor, &frame.actor_user);
+        let call = GroupCallIntentV1 { schema: 1, kind: GroupFrameKind::GroupCallIntent,
+            resolution_intent: resolution_ref.clone(), ordinal, previous_not_called, pre_call: postimage };
+        let call_ref = save_group_frame(authority, &dir, &group_call_name(ordinal, "intent"), &call)
+            .map_err(|error| format!("RecoveryRequired: group intent persistence={error}; preCallAdmission={:?}; native call not made", handle.as_ref().err()))?;
+        group_checkpoint("after-intent")?;
+        let status = match handle.as_mut() {
+            Err(cause) => GroupCallStatus::NotCalled { cause: cause.clone() },
+            Ok(handle) => match (|| -> Result<()> {
+                group_recovery_precheck(bound, authority, &frame, cancel, window)?;
+                receive_group_actual(bound, &authority.slot, vendor, &input, &frame)?;
+                group_checkpoint("before-call")?;
+                handle.recheck()
+            })() {
+                Err(cause) => GroupCallStatus::NotCalled { cause },
+                Ok(()) => GroupCallStatus::Returned { win_error: handle.set_group() },
+            },
+        };
+        // Preserve the acquired code before any optional readback/formatting.
+        let terminal = GroupCallResultV1 { schema: 1, kind: GroupFrameKind::GroupCallResult, call_intent: call_ref, outcome: status };
+        if let Err(error) = group_checkpoint("after-native-before-result") {
+            let actual = match handle.as_mut() { Ok(handle) => capture_group_handle(handle), Err(_) => capture_group_object(&bound.archive.path) };
+            return Err(format!("RecoveryRequired: acquired group outcome={:?}; {error}; actualReadback={actual:?}; Pending retained", terminal.outcome));
+        }
+        let persisted = save_group_frame(authority, &dir, &group_call_name(ordinal, "result"), &terminal);
+        let actual = match handle.as_mut() { Ok(handle) => capture_group_handle(handle), Err(_) => capture_group_object(&bound.archive.path) };
+        let observed = match actual {
+            Ok((_, object)) => GroupReadbackState::Captured { object },
+            Err(cause) => GroupReadbackState::Unavailable { cause },
+        };
+        let result_ref = persisted.map_err(|error| format!("RecoveryRequired: acquired group outcome={:?}; resultPersistence={error}; actualReadback={observed:?}; Pending retained", terminal.outcome))?;
+        group_checkpoint("after-result")?;
+        let readback = GroupReadbackV1 { schema: 1, kind: GroupFrameKind::GroupReadback,
+            resolution_intent: resolution_ref.clone(), call_result: Some(result_ref.clone()), observed };
+        let readback_ref = save_group_frame(authority, &dir, &group_call_name(ordinal, "readback"), &readback)
+            .map_err(|error| format!("RecoveryRequired: acquired group outcome={:?}; readback={:?}; readbackPersistence={error}", terminal.outcome, readback.observed))?;
+        match terminal.outcome {
+            GroupCallStatus::NotCalled { cause } => return Err(format!("RecoveryRequired: group NotCalled: {cause}; readback={:?}; a later explicit Recover must re-receive", readback.observed)),
+            GroupCallStatus::Returned { win_error } if win_error != 0 => return Err(format!("RecoveryRequired: SetSecurityInfo GROUP WinError={win_error}; readback={:?}; no automatic repeat", readback.observed)),
+            GroupCallStatus::Returned { .. } => {}
+        }
+        let actual = match readback.observed {
+            GroupReadbackState::Captured { object } => object,
+            GroupReadbackState::Unavailable { cause } => return Err(format!("RecoveryRequired: group returned zero; readback unavailable: {cause}")),
+        };
+        if !validate_group_capture(&input, &frame, &candidate, &actual)? { return Err("RecoveryRequired: group returned zero without full desired metadata".into()); }
+        group_recovery_precheck(bound, authority, &frame, cancel, window)?;
+        let (_, fresh, full) = receive_group_actual(bound, &authority.slot, vendor, &input, &frame)?;
+        if !full || fresh != actual { return Err("RecoveryRequired: group post-call full receiving changed".into()); }
+        (GroupResolutionProof::ReturnedAndVerified { result: result_ref, readback: readback_ref }, actual)
+    };
+    group_recovery_precheck(bound, authority, &frame, cancel, window)?;
+    let source = SourceSnapshot { target: input.target_path.clone(), bytes: reference(&authority.slot, &input.step.preimage)?,
+        digest: input.step.source.digest.clone(), identity: input.step.source.metadata.clone() };
+    let host = vendor.deployment.host.path.to_str().ok_or("group resolution host encoding")?;
+    let applied = archive_install::receive_applied_profile(&source, &candidate, &step_paths(&input.step.layout), desktop_hook::HookProfile::GuiHost(host))?;
+    let (_, final_post, full) = receive_group_actual(bound, &authority.slot, vendor, &input, &frame)?;
+    if !full || final_post != postimage { return Err("RecoveryRequired: group final receiving changed".into()); }
+    let attempts = receive_group_attempts(&authority.slot, &dir, &resolution_ref, &input, &frame, &candidate)?;
+    let result = VendorGroupMetadataResolutionV1 { schema: 1, kind: GroupFrameKind::VendorGroupMetadataResolution,
+        slot_id: vendor.slot_id.clone(), operation_id: op.id.clone(), vendor_intent: op.intent.clone(), step_intent: input.step_ref,
+        failure: input.failure_ref, resolution_intent: resolution_ref, attempts, proof, postimage, applied };
+    let value = save_group_frame(authority, &dir, "group-metadata-resolution.json", &result)?;
+    group_checkpoint("after-resolution")?;
+    let received = receive_vendor_apply(&authority.slot, &value, &op.intent, vendor)?;
+    Ok((value, received))
+}
+
+fn group_checkpoint(_stage: &str) -> Result<()> {
+    #[cfg(test)]
+    if TEST_GROUP_STOP.with(|value| if value.get() == Some(_stage) { value.set(None); true } else { false }) {
+        return Err(format!("RecoveryRequired: injected group recovery interruption {_stage}; Pending/readback receiving required"));
+    }
+    Ok(())
+}
+
 fn same_metadata(a: &FileIdentity, b: &FileIdentity) -> bool {
     a.volume == b.volume
         && a.size == b.size
@@ -291,6 +820,18 @@ pub(super) fn receive_vendor_pending(slot: &CheckedPath, current: &Current, op: 
     }
     Ok(())
 }
+pub(super) fn receive_vendor_pending_target(slot: &CheckedPath, current: &Current, op: &Operation, bound: &BoundInstallation) -> Result<()> {
+    receive_vendor_pending(slot, current, op)?;
+    let intent = receive_vendor_intent(slot, &op.intent)?;
+    bound.revalidate_context()?;
+    let actual = bound.binding()?;
+    if !ordinal(&current.locator, &bound.root.locator)? || actual.parent != intent.new_binding.parent
+        || actual.root != intent.new_binding.root || actual.resources != intent.new_binding.resources
+        || actual.executable != intent.new_binding.executable || actual.executable_digest != intent.new_binding.executable_digest {
+        return Err("RecoveryRequired: selected VendorPending target changed".into());
+    }
+    Ok(())
+}
 
 pub(super) fn receive_vendor_settled(slot: &CheckedPath, current: &Current, outcome: &VendorUpdateOutcome)
     -> Result<(TargetState, Option<archive_install::AppliedArchive>)> {
@@ -300,7 +841,7 @@ pub(super) fn receive_vendor_settled(slot: &CheckedPath, current: &Current, outc
         || current.locator != prior.locator || intent.slot_id != outcome.slot_id || intent.operation_id != outcome.operation_id {
         return Err("RecoveryRequired: vendor update settlement identity conflict".into());
     }
-    let result = receive_step(slot, &outcome.step, &outcome.operation_id, "apply-v2")?;
+    let result = receive_vendor_apply(slot, &outcome.step, &outcome.intent, &intent)?;
     match &intent.runtime_input {
         VendorRuntimeRecord::ReuseReceivedRuntime if !outcome.retirement_steps.is_empty() || !outcome.retirement_final_checks.is_empty() => {
             return Err("RecoveryRequired: reused runtime has unexpected retirement evidence".into());
@@ -534,10 +1075,13 @@ fn check_incarnation(
 }
 
 fn check_actual(bound: &BoundInstallation, outcome: &StepOutcome) -> Result<SourceSnapshot> {
+    check_actual_target(bound, &outcome.target, &outcome.native_id)
+}
+fn check_actual_target(bound: &BoundInstallation, expected: &TargetState, native_id: &ObjectId) -> Result<SourceSnapshot> {
     bound.revalidate_context()?;
     let target = read_path(&bound.archive.path, READ | DELETE)?;
-    if object_state(&target) != outcome.target
-        || object_id(&open_regular(&target.target, READ | DELETE)?)? != outcome.native_id
+    if object_state(&target) != *expected
+        || object_id(&open_regular(&target.target, READ | DELETE)?)? != *native_id
     {
         return Err(
             "RecoveryRequired: actual full postimage/native identity differs from received step"
@@ -1346,7 +1890,7 @@ impl<W: MaintenanceWindow> PreparedVendorUpdate<'_, W> {
         let (step_ref, step) = run_step(&self.bound, &self.authority, &dir, &op.id, "apply-v2",
             &intent.apply_layout, None, desktop_hook::HookProfile::GuiHost(host_path),
             Some((&intent.new_binding, &self.candidate.bytes)), &mut window)?;
-        publish_vendor_result(&self.bound, &mut self.authority, &op, &intent, step_ref, step,
+        publish_vendor_result(&self.bound, &mut self.authority, &op, &intent, step_ref, step.into(),
             retirement_steps, &mut runner, cancel, &mut window)?;
         let current_sha256: [u8; 32] = hex::decode(&self.authority.digest).map_err(|_| "current digest encoding")?
             .try_into().map_err(|_| "current digest length")?;
@@ -1360,10 +1904,10 @@ impl<W: MaintenanceWindow> PreparedVendorUpdate<'_, W> {
 }
 
 fn publish_vendor_result<W: MaintenanceWindow>(bound: &BoundInstallation, authority: &mut Authority,
-    op: &Operation, intent: &VendorUpdateIntent, step_ref: EvidenceRef, step: StepOutcome,
+    op: &Operation, intent: &VendorUpdateIntent, step_ref: EvidenceRef, step: VendorReceivedApply,
     retirement_steps: Vec<EvidenceRef>, runner: &mut Option<&mut dyn gateway_rules::GatewayRuleRunner>,
     cancel: &AtomicBool, window: &mut W) -> Result<()> {
-    let actual = check_actual(bound, &step)?;
+    let actual = check_actual_target(bound, &step.target, &step.native_id)?;
     window.ensure_held()?;
     let received = BoundInstallation::open(&bound.exe.path)?;
     let binding = received.binding()?;
@@ -1403,7 +1947,7 @@ fn publish_vendor_result<W: MaintenanceWindow>(bound: &BoundInstallation, author
     current.settled = Some(Settled { target: step.target.clone(), applied: step.applied.clone(), evidence });
     super::receive_settlement(&authority.slot, &current)?;
     window.ensure_held()?;
-    check_actual(bound, &step)?;
+    check_actual_target(bound, &step.target, &step.native_id)?;
     authority.publish(current)
 }
 
@@ -1418,9 +1962,6 @@ pub(super) fn recover_vendor_update<W: MaintenanceWindow>(bound: BoundInstallati
         return Err("RecoveryRequired: selected vendor incarnation changed".into());
     }
     let dir = operation_dir(&authority.slot, &op.intent)?;
-    let step_ref = optional_reference(&authority.slot, &dir.join("apply-v2-outcome.json"))?
-        .ok_or("RecoveryRequired: vendor native success not received; Pending retained without replay")?;
-    let step = receive_step(&authority.slot, &step_ref, &op.id, "apply-v2")?;
     let retirement_steps = match &intent.runtime_input {
         VendorRuntimeRecord::ReuseReceivedRuntime => Vec::new(),
         VendorRuntimeRecord::QualifiedPackage { retirement, .. } => gateway_rules::retained_vendor_retirement(
@@ -1432,9 +1973,18 @@ pub(super) fn recover_vendor_update<W: MaintenanceWindow>(bound: BoundInstallati
         None => (None, &never_cancel),
     };
     let mut qualified = ContextWindow { context: bound.ancestor_context.as_ref(), window };
+    let (step_ref, step) = match optional_reference(&authority.slot, &dir.join("apply-v2-outcome.json"))? {
+        Some(value) => {
+            let received = receive_vendor_apply(&authority.slot, &value, &op.intent, &intent)?;
+            (value, received)
+        }
+        None => resolve_vendor_group_metadata(&bound, &authority, &op, &intent, cancel, &mut qualified)?,
+    };
+    group_checkpoint("before-publish")?;
     publish_vendor_result(&bound, &mut authority, &op, &intent, step_ref, step,
         retirement_steps, &mut runner, cancel, &mut qualified)?;
-    Ok("RecoverySettled: received vendor update success without native replay".into())
+    group_checkpoint("after-publish")?;
+    Ok("RecoverySettled: vendor operation received; capable runtime/background delivery remains an ordinary Apply obligation".into())
 }
 
 /// Fresh/pristine/reverted input reaches V2 without a dummy V1 native operation.
@@ -1927,6 +2477,7 @@ pub(super) fn runtime_installed(bound: &BoundInstallation) -> Result<bool> {
 thread_local! {
     pub(super) static TEST_STOP_AFTER_RECEIPT: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
     static TEST_LOSE_RECEIPT: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+    static TEST_GROUP_STOP: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
 }
 
 #[cfg(test)]

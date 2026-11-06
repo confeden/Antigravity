@@ -204,7 +204,15 @@ pub(super) fn apply_profile(
         ) {
             return Err("original backup changed before retention".into());
         }
-        let staged = create_checked(&paths.staged, &candidate.bytes, &source.identity)?;
+        #[cfg(test)]
+        let fixture_metadata = if TEST_WRONG_GROUP_STAGE.with(|value| value.replace(false)) {
+            Some(super::native::fixture_wrong_group_metadata(&source.identity)?)
+        } else { None };
+        #[cfg(test)]
+        let stage_metadata = fixture_metadata.as_ref().unwrap_or(&source.identity);
+        #[cfg(not(test))]
+        let stage_metadata = &source.identity;
+        let staged = create_checked(&paths.staged, &candidate.bytes, stage_metadata)?;
         let staged_object = object_id(&open_regular(&paths.staged, READ | DELETE)?)?;
         phase = "publish-precheck";
         window.ensure_held()?;
@@ -237,6 +245,12 @@ pub(super) fn apply_profile(
     })();
     operation.map_err(|e| failure(target, Some(paths), phase, e, called))
 }
+#[cfg(test)]
+thread_local! {
+    // One explicitly owned synthetic vendor fixture. The real archive owner
+    // still calls ReplaceFileW and persists its actual strict metadata failure.
+    pub(super) static TEST_WRONG_GROUP_STAGE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 pub(super) fn receive_applied(
     source: &SourceSnapshot,
@@ -246,7 +260,7 @@ pub(super) fn receive_applied(
     receive_applied_profile(source, candidate, paths, desktop_hook::HookProfile::Legacy)
 }
 
-fn receive_applied_profile(
+pub(super) fn receive_applied_profile(
     source: &SourceSnapshot,
     candidate: &[u8],
     paths: &InstallPaths,

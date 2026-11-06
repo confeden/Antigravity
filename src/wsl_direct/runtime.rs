@@ -134,6 +134,38 @@ pub(crate) fn apply_vendor_update(
 }
 
 #[cfg(windows)]
+fn ensure_saved_apply_intent(settings: &Settings, saved: &[u8; 32],
+    receive: impl FnOnce(&Settings) -> Result<[u8; 32], String>) -> Result<(), String> {
+    if receive(settings)? != *saved {
+        return Err("Cancelled: saved WSL intent changed".into());
+    }
+    Ok(())
+}
+
+/// Finishing a recorded file operation depends on this acknowledged Apply and
+/// its Desktop window, independently of current guest preparation demands.
+#[cfg(windows)]
+struct SavedIntentMaintenance<'a, W: crate::windows_coordinator::windows_installation::MaintenanceWindow> {
+    inner: W,
+    settings: &'a Settings,
+    saved: [u8; 32],
+}
+#[cfg(windows)]
+impl<W: crate::windows_coordinator::windows_installation::MaintenanceWindow> SavedIntentMaintenance<'_, W> {
+    fn ensure_held_with(&mut self, receive: impl FnOnce(&Settings) -> Result<[u8; 32], String>) -> Result<(), String> {
+        ensure_saved_apply_intent(self.settings, &self.saved, receive)?;
+        self.inner.ensure_held()
+    }
+}
+#[cfg(windows)]
+impl<W: crate::windows_coordinator::windows_installation::MaintenanceWindow>
+    crate::windows_coordinator::windows_installation::MaintenanceWindow for SavedIntentMaintenance<'_, W> {
+    fn ensure_held(&mut self) -> Result<(), String> {
+        self.ensure_held_with(crate::settings::saved_intent_sha256)
+    }
+}
+
+#[cfg(windows)]
 struct VendorMaintenance<'a> {
     inner: GuiMaintenance<'a>,
     settings: &'a Settings,
@@ -142,9 +174,7 @@ struct VendorMaintenance<'a> {
 #[cfg(windows)]
 impl crate::windows_coordinator::windows_installation::MaintenanceWindow for VendorMaintenance<'_> {
     fn ensure_held(&mut self) -> Result<(), String> {
-        if crate::settings::saved_intent_sha256(self.settings)? != self.saved {
-            return Err("Cancelled: saved WSL intent changed".into());
-        }
+        ensure_saved_apply_intent(self.settings, &self.saved, crate::settings::saved_intent_sha256)?;
         let selected = self.settings.wsl.as_ref().ok_or("WSL selection missing")?;
         let registered = crate::windows_coordinator::registered_distributions_with_cancel(self.inner.cancellation)?;
         if !selected.enabled || selected.distros.is_empty()
@@ -178,6 +208,7 @@ pub(crate) fn automatic_vendor_update(root: &std::path::Path, settings: &Setting
         }
         owner::ApplyCurrentObservation::Absent | owner::ApplyCurrentObservation::Settled { .. } => Ok(false),
         owner::ApplyCurrentObservation::GatewayPending(_) => Err("RecoveryRequired: gateway operation is Pending".into()),
+        owner::ApplyCurrentObservation::VendorPending(_) => Err("RecoveryRequired: vendor operation is Pending; ordinary Apply must receive recovery".into()),
     }
 }
 
@@ -282,6 +313,9 @@ pub(crate) fn inspect_selection(plan: &crate::ops::AllTargetApplyPlan, cancellat
         if cancellation.load(Ordering::SeqCst) { return Err("WSL requirement collection cancelled".into()); }
         let bound = target.desktop_binding()?;
         let observation = owner::observe_apply_current(&bound)?;
+        if matches!(&observation, owner::ApplyCurrentObservation::VendorPending(_) | owner::ApplyCurrentObservation::GatewayPending(_)) {
+            return Err("RecoveryRequired: Apply prerequisite must settle before selected package planning".into());
+        }
         let vendor = matches!(&observation, owner::ApplyCurrentObservation::VendorReplacement(_));
         let host = match observation {
             owner::ApplyCurrentObservation::VendorReplacement(ref expected) =>
@@ -611,6 +645,47 @@ pub(crate) fn receive_apply_gateway_outcome(target: &crate::instances::GuiReplac
     expected: &crate::windows_coordinator::windows_installation::GatewayPendingObservation,
     result: Result<String, String>,
     current: Result<crate::windows_coordinator::windows_installation::BoundInstallation, String>) -> Result<String, String> {
+    receive_apply_recovery_outcome(target, &expected.slot_id, &expected.operation_id, &expected.current_sha256, result, current)
+}
+
+/// Source-free prerequisite of the existing acknowledged Apply. Normal file
+/// rights are attempted first; ordinary RequestElevation/ShowMain remains a
+/// fresh restart, never a fabricated full-plan continuation or a parity waiver.
+#[cfg(windows)]
+pub(crate) fn recover_apply_vendor_metadata(bound: crate::windows_coordinator::windows_installation::BoundInstallation,
+    target: &crate::instances::GuiReplacementTarget,
+    expected: &crate::windows_coordinator::windows_installation::VendorPendingObservation,
+    settings: &Settings, saved: [u8; 32], cancel: &AtomicBool) -> Result<String, String> {
+    use crate::windows_coordinator::{self as coordinator, windows_installation as owner};
+    if cancel.load(Ordering::SeqCst) { return Err("Cancelled: Apply vendor metadata recovery not started".into()); }
+    ensure_saved_apply_intent(settings, &saved, crate::settings::saved_intent_sha256)?;
+    if target.kind != crate::instances::GuiTargetKind::Desktop
+        || bound.native_root_id() != target.native_root_id || bound.native_executable_id() != target.anchor_native_id
+        || !owner::same_windows_path(bound.executable().as_path(), &target.anchor_path)? {
+        return Err("RecoveryRequired: selected vendor recovery intent/target changed".into());
+    }
+    bound.revalidate_context()?;
+    if owner::observe_apply_current(&bound)? != owner::ApplyCurrentObservation::VendorPending(expected.clone()) {
+        return Err("RecoveryRequired: Apply vendor prerequisite snapshot changed".into());
+    }
+    let _background = vendor_background_lease()?;
+    let powershell = coordinator::system_powershell_program()?;
+    let mut window = SavedIntentMaintenance { inner: GuiMaintenance { desktop: &target.anchor_path, powershell, cancellation: cancel }, settings, saved };
+    let mut runner = coordinator::gateway_native::WindowsGatewayRuleRunner::new(owner::new_request_id)?;
+    let result = owner::recover(bound, &expected.operation_id, &hex::encode(expected.current_sha256),
+        Some(owner::GatewayRecoveryContext { runner: &mut runner, cancel }), &mut window);
+    // Cancellation and Err do not skip receiving a possibly published Current.
+    let current = (|| -> Result<owner::BoundInstallation, String> {
+        let mut current = owner::BoundInstallation::open(&target.anchor_path)?;
+        if let Some(context) = coordinator::receive_saved_context(&current)? { current.attach_ancestor_context(context)?; }
+        Ok(current)
+    })();
+    receive_apply_recovery_outcome(target, &expected.slot_id, &expected.operation_id, &expected.current_sha256, result, current)
+}
+#[cfg(windows)]
+fn receive_apply_recovery_outcome(target: &crate::instances::GuiReplacementTarget, slot_id: &str, operation_id: &str,
+    pending_sha256: &[u8; 32], result: Result<String, String>,
+    current: Result<crate::windows_coordinator::windows_installation::BoundInstallation, String>) -> Result<String, String> {
     use crate::windows_coordinator::windows_installation as owner;
     // Err is not proof of zero changes: finish can publish custody and only
     // then deny fresh readiness. Receive actual Current on both return paths.
@@ -621,8 +696,8 @@ pub(crate) fn receive_apply_gateway_outcome(target: &crate::instances::GuiReplac
         owner::observe_apply_current(&current)
     });
     let evidence = format!("recovery scope slot={} operation={} priorCurrent={}; actualCurrent={observed:?}",
-        expected.slot_id, expected.operation_id, hex::encode(expected.current_sha256));
-    let settled = matches!(&observed, Ok(owner::ApplyCurrentObservation::Settled { slot_id, .. }) if slot_id == &expected.slot_id);
+        slot_id, operation_id, hex::encode(pending_sha256));
+    let settled = matches!(&observed, Ok(owner::ApplyCurrentObservation::Settled { slot_id: actual_slot, .. }) if actual_slot == slot_id);
     match result {
         Ok(outcome) if settled => Ok(format!("{outcome}; {evidence}")),
         Ok(outcome) => Err(format!("recovery owner completed but fresh selected Current remains held; ownerOutcome={outcome}; {evidence}")),
@@ -714,6 +789,86 @@ mod tests {
     }
 
     use super::*;
+
+    struct InertMetadataWindow<'a> {
+        trace: std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>,
+        cancellation: &'a AtomicBool,
+        desktop_running: &'a std::cell::Cell<bool>,
+    }
+    impl crate::windows_coordinator::windows_installation::MaintenanceWindow for InertMetadataWindow<'_> {
+        fn ensure_held(&mut self) -> Result<(), String> {
+            self.trace.borrow_mut().push("gui");
+            if self.cancellation.load(Ordering::SeqCst) { return Err("Cancelled: fixture Desktop window".into()); }
+            if self.desktop_running.get() { return Err("fixture Desktop is live".into()); }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn recorded_metadata_window_receives_saved_intent_and_gui_without_guest_demand() {
+        use sha2::{Digest, Sha256};
+        for preference in [None,
+            Some(crate::wsl_api::WslPreferences { enabled: false, distros: vec!["removed fixture guest".into()] }),
+            Some(crate::wsl_api::WslPreferences { enabled: true, distros: Vec::new() }),
+            Some(crate::wsl_api::WslPreferences { enabled: true, distros: vec!["unavailable fixture guest".into()] })] {
+            let mut settings = Settings::default(); settings.wsl = preference;
+            // In-memory bytes stand in only for the saved-reader dependency.
+            // No global settings, guest registration or native window is read.
+            let bytes = serde_json::to_vec_pretty(&settings).unwrap();
+            let saved: [u8; 32] = Sha256::digest(&bytes).into();
+            let trace = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let cancellation = AtomicBool::new(false);
+            let desktop_running = std::cell::Cell::new(false);
+            let mut window = SavedIntentMaintenance { settings: &settings, saved,
+                inner: InertMetadataWindow { trace: trace.clone(), cancellation: &cancellation, desktop_running: &desktop_running } };
+            let mut receive = |expected: &Settings| {
+                trace.borrow_mut().push("saved");
+                assert_eq!(serde_json::to_vec_pretty(expected).unwrap(), bytes);
+                Ok(saved)
+            };
+            window.ensure_held_with(&mut receive).unwrap();
+            window.ensure_held_with(&mut receive).unwrap();
+            assert_eq!(*trace.borrow(), ["saved", "gui", "saved", "gui"]);
+        }
+    }
+
+    #[test]
+    fn recorded_metadata_window_preserves_continuous_intent_and_gui_failure_order() {
+        use sha2::{Digest, Sha256};
+        let settings = Settings::default();
+        let bytes = serde_json::to_vec_pretty(&settings).unwrap();
+        let saved: [u8; 32] = Sha256::digest(&bytes).into();
+        let observed = std::cell::Cell::new(saved);
+        let read_failure = std::cell::RefCell::new(None::<String>);
+        let trace = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let cancellation = AtomicBool::new(false);
+        let desktop_running = std::cell::Cell::new(false);
+        let mut window = SavedIntentMaintenance { settings: &settings, saved,
+            inner: InertMetadataWindow { trace: trace.clone(), cancellation: &cancellation, desktop_running: &desktop_running } };
+        let mut receive = |expected: &Settings| {
+            trace.borrow_mut().push("saved");
+            assert_eq!(serde_json::to_vec_pretty(expected).unwrap(), bytes);
+            match read_failure.borrow().as_ref() { Some(error) => Err(error.clone()), None => Ok(observed.get()) }
+        };
+        window.ensure_held_with(&mut receive).unwrap();
+        // A retained marker models an acquired outcome; there is no native call.
+        trace.borrow_mut().push("acquired-result");
+        let mut changed = saved; changed[0] ^= 1; observed.set(changed);
+        assert_eq!(window.ensure_held_with(&mut receive).unwrap_err(), "Cancelled: saved WSL intent changed");
+        assert_eq!(*trace.borrow(), ["saved", "gui", "acquired-result", "saved"]);
+        observed.set(saved);
+        *read_failure.borrow_mut() = Some("settings read failed: synthetic unavailable".into());
+        assert_eq!(window.ensure_held_with(&mut receive).unwrap_err(), "settings read failed: synthetic unavailable");
+        assert_eq!(trace.borrow().last(), Some(&"saved"));
+        *read_failure.borrow_mut() = None;
+        cancellation.store(true, Ordering::SeqCst);
+        assert_eq!(window.ensure_held_with(&mut receive).unwrap_err(), "Cancelled: fixture Desktop window");
+        assert_eq!(&trace.borrow()[trace.borrow().len() - 2..], ["saved", "gui"]);
+        cancellation.store(false, Ordering::SeqCst);
+        desktop_running.set(true);
+        assert_eq!(window.ensure_held_with(&mut receive).unwrap_err(), "fixture Desktop is live");
+        assert_eq!(&trace.borrow()[trace.borrow().len() - 2..], ["saved", "gui"]);
+    }
 
     #[test]
     fn automatic_vendor_update_requires_positive_wsl_and_effect_intent() {

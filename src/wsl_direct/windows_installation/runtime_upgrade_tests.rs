@@ -36,6 +36,315 @@ impl MaintenanceWindow for Window {
     }
 }
 
+// Pure wire/field guards use invented in-memory identities, never native call
+// evidence or a production Current. Actual failure fixtures below use the owner.
+fn synthetic_group_sd(group: u32) -> Vec<u8> {
+    let sid = |value: u32| { let mut sid = vec![1, 1, 0, 0, 0, 0, 0, 5]; sid.extend_from_slice(&value.to_le_bytes()); sid };
+    let mut sd = vec![1, 0, 4, 128];
+    for offset in [20u32, 32, 0, 44] { sd.extend_from_slice(&offset.to_le_bytes()); }
+    sd.extend(sid(17)); sd.extend(sid(group));
+    sd.extend([2, 0, 8, 0, 0, 0, 0, 0]);
+    sd
+}
+#[test]
+fn group_resolution_post_fields_use_failed_index_and_candidate_size_not_source() {
+    let source = TargetState { digest: hash(b"old"), metadata: FileIdentity { volume: 1, index: 3, size: 3,
+        attributes: 32, creation: 8, write: 9, security_descriptor: synthetic_group_sd(17) } };
+    let candidate = b"patched-longer";
+    let mut failed = source.clone();
+    failed.digest = hash(candidate); failed.metadata.index = 7; failed.metadata.size = candidate.len() as u64;
+    failed.metadata.security_descriptor = synthetic_group_sd(18);
+    assert!(post_fields(&failed, &failed, &source, candidate));
+    for field in ["index", "size", "digest", "volume", "attributes", "creation", "write"] {
+        let mut altered = failed.clone();
+        match field {
+            "index" => altered.metadata.index = source.metadata.index,
+            "size" => altered.metadata.size = source.metadata.size,
+            "digest" => altered.digest = source.digest.clone(),
+            "volume" => altered.metadata.volume += 1,
+            "attributes" => altered.metadata.attributes ^= 1,
+            "creation" => altered.metadata.creation += 1,
+            "write" => altered.metadata.write += 1,
+            _ => unreachable!(),
+        }
+        assert!(!post_fields(&altered, &failed, &source, candidate), "{field}");
+    }
+    let mut desired = failed.clone(); desired.metadata.security_descriptor = source.metadata.security_descriptor.clone();
+    assert!(post_fields(&desired, &failed, &source, candidate));
+    let actor = &source.metadata.security_descriptor[20..32];
+    assert!(!native::receive_group_metadata(&failed.metadata.security_descriptor, &failed.metadata.security_descriptor, &source.metadata.security_descriptor, actor).unwrap());
+    assert!(native::receive_group_metadata(&desired.metadata.security_descriptor, &failed.metadata.security_descriptor, &source.metadata.security_descriptor, actor).unwrap());
+    let third_group = synthetic_group_sd(19);
+    let mut control = synthetic_group_sd(18); control[2] ^= 0x10;
+    let mut owner = synthetic_group_sd(18); owner[28] ^= 1;
+    let mut dacl = synthetic_group_sd(18); dacl[45] ^= 1;
+    for sd in [third_group, control, owner, dacl] {
+        assert!(native::receive_group_metadata(&sd, &failed.metadata.security_descriptor, &source.metadata.security_descriptor, actor).is_err());
+    }
+    for size in [0, 19, 27, 43, 51] {
+        assert!(native::receive_group_metadata(&synthetic_group_sd(18)[..size], &failed.metadata.security_descriptor,
+            &source.metadata.security_descriptor, actor).is_err());
+    }
+    let mut invalid = synthetic_group_sd(18); invalid[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
+    assert!(native::receive_group_metadata(&invalid, &failed.metadata.security_descriptor, &source.metadata.security_descriptor, actor).is_err());
+    assert!(native::receive_group_metadata(&failed.metadata.security_descriptor, &failed.metadata.security_descriptor,
+        &synthetic_group_sd(18), actor).is_err());
+}
+#[test]
+fn group_unknown_and_returned_codes_never_admit_another_call() {
+    assert!(group_call_can_follow(None).unwrap_err().contains("Unknown"));
+    for win_error in [0, 5] { assert!(group_call_can_follow(Some(&GroupCallStatus::Returned { win_error })).unwrap_err().contains("no repeat")); }
+    assert!(group_call_can_follow(Some(&GroupCallStatus::NotCalled { cause: String::new() })).is_err());
+    group_call_can_follow(Some(&GroupCallStatus::NotCalled { cause: "actual access denied before native call".into() })).unwrap();
+}
+
+#[test]
+fn group_private_wire_is_closed_required_nullable_and_does_not_decode_as_native_success() {
+    let reference = EvidenceRef { path: "operation/input.json".into(), digest: "a".repeat(64) };
+    let target = TargetState { digest: "b".repeat(64), metadata: FileIdentity { volume: 1, index: 4, size: 3,
+        attributes: 32, creation: 8, write: 9, security_descriptor: synthetic_group_sd(18) } };
+    let call = GroupCallIntentV1 { schema: 1, kind: GroupFrameKind::GroupCallIntent, resolution_intent: reference.clone(),
+        ordinal: 1, previous_not_called: None, pre_call: GroupObject { target, native_id: ObjectId { volume: 1, file: [2; 16] } } };
+    let value = serde_json::to_value(&call).unwrap();
+    assert!(value.get("previousNotCalled").unwrap().is_null());
+    for field in ["kind", "resolutionIntent", "ordinal", "previousNotCalled", "preCall"] {
+        let mut missing = value.clone(); missing.as_object_mut().unwrap().remove(field);
+        assert!(serde_json::from_value::<GroupCallIntentV1>(missing).is_err(), "{field}");
+    }
+    let mut unknown = value.clone(); unknown["consent"] = true.into();
+    assert!(serde_json::from_value::<GroupCallIntentV1>(unknown).is_err());
+    let mut unknown_kind = value; unknown_kind["kind"] = "unrecognized".into();
+    assert!(serde_json::from_value::<GroupCallIntentV1>(unknown_kind).is_err());
+    assert!(decode::<StepOutcome>(&json(&call).unwrap()).is_err());
+    for status in [GroupCallStatus::NotCalled { cause: "actual pre-call denial".into() }, GroupCallStatus::Returned { win_error: 5 }] {
+        let result = GroupCallResultV1 { schema: 1, kind: GroupFrameKind::GroupCallResult, call_intent: reference.clone(), outcome: status };
+        let mut value = serde_json::to_value(&result).unwrap(); value["outcome"]["unknown"] = true.into();
+        assert!(serde_json::from_value::<GroupCallResultV1>(value).is_err());
+    }
+    let real_failure_shape = serde_json::json!({"phase":"metadata-preservation", "cause":"retained cause", "replace_result":true,
+        "recovery":{"target":["synthetic", "Missing"], "staged":null, "original_backup":null, "displaced_backup":null}});
+    let actual: ActualFailure = serde_json::from_value(real_failure_shape.clone()).unwrap();
+    assert_eq!(actual.replace_result, Some(true));
+    assert!(known_vendor_group_failure(&actual));
+    for result in [serde_json::Value::Null, false.into()] {
+        let mut wrong = real_failure_shape.clone(); wrong["replace_result"] = result;
+        assert!(!known_vendor_group_failure(&serde_json::from_value::<ActualFailure>(wrong).unwrap()));
+    }
+    let mut wrong = real_failure_shape.clone(); wrong["phase"] = "readback".into();
+    assert!(!known_vendor_group_failure(&serde_json::from_value::<ActualFailure>(wrong).unwrap()));
+    let mut missing = real_failure_shape; missing.as_object_mut().unwrap().remove("replace_result");
+    assert!(serde_json::from_value::<ActualFailure>(missing).is_err());
+}
+
+fn vendor_group_failure(name: &str) -> Fixture {
+    let f = fixture(name);
+    native::initialize_token_group_fixture(&f.desktop.parent().unwrap().join("resources/app.asar")).unwrap();
+    f.upgrade().unwrap();
+    let (_, prior_digest) = f.current();
+    replace_with_vendor_update(&f);
+    native::TEST_GROUP_CALLS.with(|v| v.set(0));
+    TEST_GROUP_STOP.with(|v| v.set(None));
+    archive_install::TEST_WRONG_GROUP_STAGE.with(|v| v.set(true));
+    let digest = hash(&f.host.read_snapshot().unwrap());
+    let mut window = Window;
+    let error = prepare_vendor_update(&prior_digest, f.bound(), None,
+        VendorRuntimeInput::ReuseReceivedRuntime { source: &f.host, source_sha256: &digest }, None,
+        &AtomicBool::new(false), &mut window).unwrap().execute(None, &AtomicBool::new(false)).err()
+        .expect("wrong-group fixture must return its actual strict metadata failure");
+    assert!(error.contains("metadata-preservation"), "actual OS fixture did not produce the admitted failure: {error}");
+    let authority = Authority::open(&f.bound(), false, true).unwrap();
+    let op = authority.current.active_operation.as_ref().unwrap();
+    let vendor = receive_vendor_intent(&authority.slot, &op.intent).unwrap();
+    let input = receive_group_failure(&authority.slot, &op.intent, &vendor).unwrap();
+    assert_ne!(input.step.source.metadata.index, input.postimage.metadata.index);
+    assert_ne!(input.step.source.metadata.size, input.postimage.metadata.size);
+    assert_eq!(object_state(&f.archive()), input.postimage);
+    drop(authority);
+    assert!(matches!(observe_apply_current(&f.bound()).unwrap(), ApplyCurrentObservation::VendorPending(_)));
+    f
+}
+
+#[test]
+#[ignore = "explicit owned canonical fixture, genuine context and new pristine archive; real ReplaceFileW and group-only API"]
+fn vendor_group_recovery_settles_real_failed_postimage_and_preserves_old_failure() {
+    let f = vendor_group_failure("vendor-group-settle");
+    let archive_calls = TEST_NATIVE_CALLS.with(|v| v.get());
+    let before = f.archive();
+    let authority = Authority::open(&f.bound(), false, true).unwrap();
+    let op = authority.current.active_operation.as_ref().unwrap().clone();
+    let dir = operation_dir(&authority.slot, &op.intent).unwrap();
+    let failure = read_private(&dir.join("apply-v2-failure.json")).unwrap();
+    drop(authority);
+    assert!(f.recover().unwrap().contains("RecoverySettled"));
+    assert_eq!(native::TEST_GROUP_CALLS.with(|v| v.get()), 1);
+    assert_eq!(TEST_NATIVE_CALLS.with(|v| v.get()), archive_calls);
+    let after = f.archive();
+    assert_eq!(before.bytes, after.bytes); assert_eq!(before.identity.index, after.identity.index); assert_eq!(before.identity.size, after.identity.size);
+    let authority = Authority::open(&f.bound(), false, false).unwrap();
+    assert_eq!(authority.current.mode, Mode::SettledApplied);
+    assert_eq!(authority.current.binding.archive_metadata, after.identity);
+    assert_eq!(authority.current.binding.archive_digest, after.digest);
+    assert_eq!(read_private(&dir.join("apply-v2-failure.json")).unwrap(), failure);
+    assert!(optional_reference(&authority.slot, &dir.join("apply-v2-outcome.json")).unwrap().is_none());
+    let proof = optional_reference(&authority.slot, &dir.join("group-metadata-resolution.json")).unwrap().unwrap();
+    assert!(receive_step(&authority.slot, &proof, &op.id, "apply-v2").is_err(), "old success-only receiver must fail closed");
+    let result: VendorGroupMetadataResolutionV1 = decode(&reference(&authority.slot, &proof).unwrap()).unwrap();
+    assert!(matches!(result.proof, GroupResolutionProof::ReturnedAndVerified { .. }));
+    assert_eq!(result.applied.post, after.identity);
+    assert_eq!(result.applied.original_backup_identity, read_path(&result.applied.original_backup, READ).unwrap().identity);
+    assert_eq!(result.applied.displaced_identity, read_path(&result.applied.displaced_backup, READ).unwrap().identity);
+    assert!(receive_vendor_apply(&authority.slot, &result.failure, &op.intent, &receive_vendor_intent(&authority.slot, &op.intent).unwrap()).is_err());
+}
+
+#[test]
+#[ignore = "explicit owned canonical fixture and genuine context; actual failed replacement, no group replay"]
+fn vendor_group_unknown_intent_holds_without_native_or_archive_replay() {
+    let f = vendor_group_failure("vendor-group-unknown");
+    TEST_GROUP_STOP.with(|v| v.set(Some("after-intent")));
+    assert!(f.recover().unwrap_err().contains("after-intent"));
+    let calls = TEST_NATIVE_CALLS.with(|v| v.get());
+    assert!(f.recover().unwrap_err().contains("Unknown"));
+    assert_eq!(native::TEST_GROUP_CALLS.with(|v| v.get()), 0);
+    assert_eq!(TEST_NATIVE_CALLS.with(|v| v.get()), calls);
+    assert_eq!(f.current().0.mode, Mode::Pending);
+}
+
+#[test]
+#[ignore = "explicit owned canonical fixture and genuine context; actual group call, result/capture/publication interruption"]
+fn vendor_group_acquired_result_and_observed_convergence_never_repeat_call() {
+    for stage in ["after-native-before-result", "after-result", "after-resolution", "before-publish", "after-publish"] {
+        let f = vendor_group_failure(&format!("vendor-group-{stage}"));
+        let calls = TEST_NATIVE_CALLS.with(|v| v.get());
+        TEST_GROUP_STOP.with(|v| v.set(Some(stage)));
+        let error = f.recover().unwrap_err();
+        assert!(error.contains(stage));
+        assert_eq!(native::TEST_GROUP_CALLS.with(|v| v.get()), 1);
+        if stage != "after-publish" { f.recover().unwrap(); }
+        assert_eq!(native::TEST_GROUP_CALLS.with(|v| v.get()), 1);
+        assert_eq!(TEST_NATIVE_CALLS.with(|v| v.get()), calls);
+        assert_eq!(f.current().0.mode, Mode::SettledApplied);
+        if matches!(stage, "after-native-before-result" | "after-result") {
+            let authority = Authority::open(&f.bound(), false, false).unwrap();
+            let settlement: Settlement = decode(&reference(&authority.slot, &authority.current.settled.as_ref().unwrap().evidence).unwrap()).unwrap();
+            let Settlement::VendorUpdate(outcome) = settlement else { panic!("vendor settlement required") };
+            let resolved: VendorGroupMetadataResolutionV1 = decode(&reference(&authority.slot, &outcome.step).unwrap()).unwrap();
+            assert!(matches!(resolved.proof, GroupResolutionProof::ObservedDesired { .. }));
+            assert_eq!(resolved.attempts.len(), 1);
+            if stage == "after-native-before-result" { assert!(resolved.attempts[0].result.is_none()); }
+        }
+    }
+}
+
+#[test]
+#[ignore = "explicit owned canonical fixture and genuine context; positive NotCalled then distinct later Recover"]
+fn vendor_group_not_called_admits_only_a_later_distinct_attempt() {
+    let f = vendor_group_failure("vendor-group-not-called");
+    let calls = TEST_NATIVE_CALLS.with(|v| v.get());
+    TEST_GROUP_STOP.with(|v| v.set(Some("before-call")));
+    assert!(f.recover().unwrap_err().contains("NotCalled"));
+    assert_eq!(native::TEST_GROUP_CALLS.with(|v| v.get()), 0);
+    f.recover().unwrap();
+    assert_eq!(native::TEST_GROUP_CALLS.with(|v| v.get()), 1);
+    assert_eq!(TEST_NATIVE_CALLS.with(|v| v.get()), calls);
+    let authority = Authority::open(&f.bound(), false, false).unwrap();
+    let settlement: Settlement = decode(&reference(&authority.slot, &authority.current.settled.as_ref().unwrap().evidence).unwrap()).unwrap();
+    let Settlement::VendorUpdate(outcome) = settlement else { panic!("vendor settlement required") };
+    let resolved: VendorGroupMetadataResolutionV1 = decode(&reference(&authority.slot, &outcome.step).unwrap()).unwrap();
+    assert_eq!(resolved.attempts.len(), 2);
+    let second: GroupCallIntentV1 = decode(&reference(&authority.slot, &resolved.attempts[1].intent).unwrap()).unwrap();
+    assert_eq!(second.previous_not_called, resolved.attempts[0].result);
+}
+
+#[test]
+#[ignore = "explicit owned canonical fixture and genuine context; inject persistence failure after real native success"]
+fn vendor_group_persistence_failure_retains_acquired_return_and_can_only_observe() {
+    for stage in ["save:group-call-1-result.json", "save:group-call-1-readback.json", "save:group-metadata-resolution.json"] {
+        let f = vendor_group_failure(&format!("vendor-group-persistence-{}", stage.replace(':', "-")));
+        let calls = TEST_NATIVE_CALLS.with(|v| v.get());
+        TEST_GROUP_STOP.with(|v| v.set(Some(stage)));
+        let error = f.recover().unwrap_err();
+        assert!(error.contains(stage));
+        if stage.ends_with("-result.json") || stage.ends_with("-readback.json") { assert!(error.contains("win_error: 0"), "acquired native status must survive: {error}"); }
+        assert_eq!(f.current().0.mode, Mode::Pending);
+        assert_eq!(native::TEST_GROUP_CALLS.with(|v| v.get()), 1);
+        f.recover().unwrap();
+        assert_eq!(native::TEST_GROUP_CALLS.with(|v| v.get()), 1);
+        assert_eq!(TEST_NATIVE_CALLS.with(|v| v.get()), calls);
+    }
+}
+
+#[test]
+#[ignore = "explicit owned canonical fixture and genuine context; malformed private fixture evidence never native authority"]
+fn vendor_group_corrupt_terminal_and_lineage_holes_hold_without_replay() {
+    for name in ["group-call-1-result.json", "group-call-3-intent.json", "group-call-01-result.json"] {
+        let f = vendor_group_failure("vendor-group-corrupt");
+        TEST_GROUP_STOP.with(|v| v.set(Some("after-intent")));
+        f.recover().unwrap_err();
+        let authority = Authority::open(&f.bound(), false, true).unwrap();
+        let op = authority.current.active_operation.as_ref().unwrap();
+        let dir = operation_dir(&authority.slot, &op.intent).unwrap();
+        // Deliberately malformed data only, never a forged native terminal.
+        write_private(&dir.join(name), b"{").unwrap();
+        drop(authority);
+        let calls = TEST_NATIVE_CALLS.with(|v| v.get());
+        assert!(f.recover().is_err());
+        assert_eq!(f.current().0.mode, Mode::Pending);
+        assert_eq!(native::TEST_GROUP_CALLS.with(|v| v.get()), 0);
+        assert_eq!(TEST_NATIVE_CALLS.with(|v| v.get()), calls);
+    }
+}
+
+#[test]
+#[ignore = "explicit owned canonical fixture and genuine context; production Apply prerequisite receiver only, no package/source or effects"]
+fn vendor_pending_reaches_real_apply_prerequisite_before_package_planning() {
+    let f = vendor_group_failure("vendor-apply-prerequisite");
+    let bound = f.bound();
+    let target = crate::instances::GuiReplacementTarget { kind: crate::instances::GuiTargetKind::Desktop,
+        root_path: f.desktop.parent().unwrap().to_owned(), native_root_id: bound.native_root_id(),
+        anchor_path: f.desktop.clone(), anchor_native_id: bound.native_executable_id() };
+    let calls = TEST_NATIVE_CALLS.with(|v| v.get());
+    // This is the production classifier used by Cmd::ApplySettings's plan
+    // receiver, before inspect_native_apply and selected source/assets receiving.
+    let result = crate::ops::receive_desktop_apply_current(bound, &target, [7; 32]);
+    let Err(crate::ops::ApplyPlanError::VendorMetadataRecoveryRequired(prerequisite)) = result else { panic!("typed vendor prerequisite required") };
+    assert_eq!(prerequisite.saved_sha256, [7; 32]);
+    assert_eq!(prerequisite.target, target);
+    let (pending, digest) = f.current();
+    assert_eq!(prerequisite.observation.slot_id, pending.slot_id);
+    assert_eq!(prerequisite.observation.operation_id, pending.active_operation.unwrap().id);
+    assert_eq!(hex::encode(prerequisite.observation.current_sha256), digest);
+    assert!(super::super::strict_current_expectation(observe_apply_current(&f.bound()).unwrap()).is_err());
+    drop(prerequisite);
+    let mut changed = target; changed.anchor_native_id.file[0] ^= 1;
+    assert!(matches!(crate::ops::receive_desktop_apply_current(f.bound(), &changed, [7; 32]), Err(crate::ops::ApplyPlanError::Receiving(_))));
+    assert_eq!(native::TEST_GROUP_CALLS.with(|v| v.get()), 0);
+    assert_eq!(TEST_NATIVE_CALLS.with(|v| v.get()), calls);
+}
+
+#[test]
+#[ignore = "explicit owned canonical fixture and genuine context; actual staged/backup/content drift, zero recovery calls"]
+fn vendor_group_actual_drift_holds_before_group_call() {
+    for which in ["target", "stage", "backup"] {
+        let f = vendor_group_failure(&format!("vendor-group-drift-{which}"));
+        let authority = Authority::open(&f.bound(), false, true).unwrap();
+        let op = authority.current.active_operation.as_ref().unwrap();
+        let vendor = receive_vendor_intent(&authority.slot, &op.intent).unwrap();
+        let path = match which {
+            "target" => f.desktop.parent().unwrap().join("resources/app.asar"),
+            "stage" => vendor.apply_layout.staged,
+            "backup" => vendor.apply_layout.original_backup,
+            _ => unreachable!(),
+        };
+        drop(authority);
+        if which == "stage" { write_private(&path, b"occupied synthetic stage").unwrap(); }
+        else { fs::write(NativeFsPath::from_path(&path).unwrap().as_path(), b"changed synthetic bytes").unwrap(); }
+        let calls = TEST_NATIVE_CALLS.with(|v| v.get());
+        assert!(f.recover().is_err());
+        assert_eq!(native::TEST_GROUP_CALLS.with(|v| v.get()), 0);
+        assert_eq!(TEST_NATIVE_CALLS.with(|v| v.get()), calls);
+    }
+}
+
 #[test]
 fn vendor_runtime_choice_never_defaults_to_a_new_package() {
     #[derive(Deserialize)]
