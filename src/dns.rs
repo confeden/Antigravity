@@ -52,9 +52,17 @@ const AG_NRPT_LEGACY_TAGS: &[&str] = &["AG_UNLOCKER_NRPT"];
 // a foreign rule on either name is left alone (so is a subtree rule, I44).
 // Everything else Antigravity talks to - oauth2/www/play/accounts and
 // jetski-webchannel - works on real Google and is deliberately not listed.
+//
+// `aicode` (2026-11-06, owner) is here for a different reason than the other
+// two: not because a provider substitutes it (only geohide was measured doing
+// so), but because it carries the voice session and the relay's loopback
+// answer is the only door a running client takes to the route table. A rule
+// is what sends its lookup to the relay at all; with the door down it is
+// answered from the pool like the rest, so it costs a passthrough at worst.
 const AG_NRPT_CORE: &[&str] = &[
     "cloudcode-pa.googleapis.com",
     "daily-cloudcode-pa.googleapis.com",
+    "aicode.googleapis.com",
 ];
 
 /// The names an NRPT rule always points at the relay - and therefore the ones

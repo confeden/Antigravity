@@ -50,7 +50,7 @@ irm https://raw.githubusercontent.com/confeden/Antigravity/main/tui.ps1 | iex
 
 1. **Language Server / CLI** (`language_server.exe`, `agy.exe`): две строки одинаковой длины: `ineligible` → `inexigible` (снимает региональное ограничение) и `https_proxy` → `AG_LS_PROXY`. Размер файла не меняется.
 2. **Локальный прокси и служба** (`%ProgramData%\AGUnlocker`, порт `127.0.0.1:53129`): на него указывает только `AG_LS_PROXY`. Системный `HTTPS_PROXY` не трогается, `git` и браузеры работают как раньше. TLS не расшифровывается, сертификаты не ставятся.
-3. **DNS-правила (NRPT)** только для `cloudcode-pa.googleapis.com` и `daily-cloudcode-pa.googleapis.com`. Остальной DNS, включая вход в аккаунт, идёт обычным путём.
+3. **DNS-правила (NRPT)** только для `cloudcode-pa.googleapis.com`, `daily-cloudcode-pa.googleapis.com` и `aicode.googleapis.com` (голосовые запросы). Остальной DNS, включая вход в аккаунт, идёт обычным путём.
 4. **Приоритет IPv4** над IPv6, только если у вас нет глобального IPv6; снимается при откате.
 
 Gemini CLI не поддерживается: Google закрыл в нём вход для личных аккаунтов, и обойти это на стороне клиента нельзя.

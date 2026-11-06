@@ -1,4 +1,4 @@
-//! Group proxy: the owner's dedicated server, whitelisted to the 2 gate hosts.
+//! Group proxy: the owner's dedicated server, whitelisted to the gate hosts.
 //! Credential is private in `.group`.
 //! No region probe because the server refuses trace hosts (cloudflare etc.) by design;
 //! its region is known to be correct.
