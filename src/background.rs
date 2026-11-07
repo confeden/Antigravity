@@ -533,11 +533,14 @@ mod windows_impl {
 mod unix_impl {
     use std::fs;
     use std::path::PathBuf;
+    #[cfg(not(target_os = "macos"))]
     use std::process::Command;
 
     use super::{PROXY_FLAG, WATCHDOG_FLAG};
 
+    #[cfg(not(target_os = "macos"))]
     const UNIT_NAME: &str = "ag-unlocker-proxy.service";
+    #[cfg(not(target_os = "macos"))]
     const WATCHDOG_UNIT_NAME: &str = "ag-unlocker-watchdog.service";
 
     fn home() -> String {
@@ -563,12 +566,14 @@ mod unix_impl {
         install_dir().join("ag_proxy")
     }
 
+    #[cfg(not(target_os = "macos"))]
     fn unit_path() -> PathBuf {
         xdg("XDG_CONFIG_HOME", ".config")
             .join("systemd/user")
             .join(UNIT_NAME)
     }
 
+    #[cfg(not(target_os = "macos"))]
     fn watchdog_unit_path() -> PathBuf {
         xdg("XDG_CONFIG_HOME", ".config")
             .join("systemd/user")
@@ -577,6 +582,7 @@ mod unix_impl {
 
     /// Runs `systemctl --user ...`; true on success. Best-effort: a machine
     /// without a user systemd manager (rare on a desktop) just fails the enable.
+    #[cfg(not(target_os = "macos"))]
     fn systemctl(args: &[&str]) -> bool {
         Command::new("systemctl")
             .arg("--user")
@@ -587,6 +593,7 @@ mod unix_impl {
     }
 
     /// The unit file existing is what "enabled" means here.
+    #[cfg(not(target_os = "macos"))]
     pub fn is_enabled() -> bool {
         unit_path().exists()
     }
@@ -596,10 +603,12 @@ mod unix_impl {
     /// reason `ensure_installed` exists), and an update that replaces
     /// `language_server` under a running Antigravity is as real here as on
     /// Windows. The unit file existing is what "enabled" means, as for the proxy.
+    #[cfg(not(target_os = "macos"))]
     pub fn is_watchdog_enabled() -> bool {
         watchdog_unit_path().exists()
     }
 
+    #[cfg(not(target_os = "macos"))]
     pub fn is_running() -> bool {
         Command::new("systemctl")
             .args(["--user", "is-active", "--quiet", UNIT_NAME])
@@ -617,6 +626,7 @@ mod unix_impl {
     /// runs it with `--proxy`, and starts it. No root: `systemctl --user` targets
     /// the caller's own session manager, which is why the whole Linux flow runs
     /// unprivileged (and "Run as a Program" works without a password prompt).
+    #[cfg(not(target_os = "macos"))]
     pub fn ensure_running() -> Result<(), String> {
         let replaced = install_copy()?;
 
@@ -656,6 +666,7 @@ mod unix_impl {
     }
 
     /// A user unit running the installed copy with `flag`.
+    #[cfg(not(target_os = "macos"))]
     fn unit_text(description: &str, flag: &str) -> String {
         let data_home = crate::dns_forwarder::log_dir()
             .parent()
@@ -702,6 +713,10 @@ mod unix_impl {
             let fresh = dir.join(".ag_proxy.new");
             fs::copy(&src, &fresh).map_err(|e| format!("копия exe: {}", e))?;
             let _ = fs::set_permissions(&fresh, fs::Permissions::from_mode(0o755));
+            // A copy of a browser download keeps its quarantine flag, and
+            // launchd would then be refused the binary by Gatekeeper.
+            #[cfg(target_os = "macos")]
+            crate::macos::strip_quarantine(&fresh);
             fs::rename(&fresh, &exe).map_err(|e| {
                 let _ = fs::remove_file(&fresh);
                 format!("замена exe: {}", e)
@@ -723,6 +738,7 @@ mod unix_impl {
         }
     }
 
+    #[cfg(not(target_os = "macos"))]
     pub fn enable() -> Result<(), String> {
         ensure_running()?;
         let _ = systemctl(&["restart", UNIT_NAME]);
@@ -732,6 +748,7 @@ mod unix_impl {
     /// Writes the watcher's user unit and starts it. Only the file and the unit:
     /// the proxy unit is not touched, so auto-patch on its own never switches the
     /// 400 bypass on.
+    #[cfg(not(target_os = "macos"))]
     pub fn enable_watchdog() -> Result<(), String> {
         let replaced = install_copy()?;
         let up = watchdog_unit_path();
@@ -760,6 +777,7 @@ mod unix_impl {
         install_copy().map(|_| ())
     }
 
+    #[cfg(not(target_os = "macos"))]
     pub fn disable_watchdog() {
         systemctl(&["disable", "--now", WATCHDOG_UNIT_NAME]);
         let _ = fs::remove_file(watchdog_unit_path());
@@ -768,11 +786,108 @@ mod unix_impl {
 
     /// Stops and removes the user unit and the installed copy. Quiet success even
     /// when nothing was installed, so the undo menus never error.
+    #[cfg(not(target_os = "macos"))]
     pub fn disable() -> Result<(), String> {
         systemctl(&["disable", "--now", UNIT_NAME]);
         let _ = fs::remove_file(unit_path());
         systemctl(&["daemon-reload"]);
         // The watcher runs the same copy: while its unit is there the file stays.
+        if !is_watchdog_enabled() {
+            let _ = fs::remove_file(installed_exe());
+            let _ = fs::remove_dir(install_dir());
+        }
+        Ok(())
+    }
+
+    // ---- macOS: launchd user agents in place of the systemd user units (S80).
+    // Same copy (`install_copy`), same flags, same data dir handed to the job;
+    // `~/Library/LaunchAgents/<label>.plist` existing is what "enabled" means.
+
+    #[cfg(target_os = "macos")]
+    const PROXY_LABEL: &str = "com.agunlocker.proxy";
+    #[cfg(target_os = "macos")]
+    const WATCHDOG_LABEL: &str = "com.agunlocker.watchdog";
+
+    /// The agent's plist: the installed copy with `flag`, kept alive, with the
+    /// data dir the window reads (`log_dir()` follows `XDG_DATA_HOME`, which
+    /// launchd does not carry).
+    #[cfg(target_os = "macos")]
+    fn agent_text(label: &str, flag: &str) -> String {
+        let data_home = crate::dns_forwarder::log_dir()
+            .parent()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        crate::macos::agent_plist(
+            label,
+            &[installed_exe().display().to_string(), flag.to_string()],
+            &[("XDG_DATA_HOME", data_home)],
+            true,
+        )
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn is_enabled() -> bool {
+        crate::macos::agent_exists(PROXY_LABEL)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn is_watchdog_enabled() -> bool {
+        crate::macos::agent_exists(WATCHDOG_LABEL)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn is_running() -> bool {
+        crate::macos::agent_is_running(PROXY_LABEL)
+    }
+
+    /// Installs the copy, writes the agent and loads it. A changed plist is
+    /// reloaded by `agent_install`; a replaced copy under an unchanged plist
+    /// needs a kickstart to leave the old binary.
+    #[cfg(target_os = "macos")]
+    pub fn ensure_running() -> Result<(), String> {
+        let replaced = install_copy()?;
+        let changed =
+            crate::macos::agent_install(PROXY_LABEL, &agent_text(PROXY_LABEL, PROXY_FLAG))?;
+        if replaced && !changed && !crate::macos::agent_restart(PROXY_LABEL) {
+            return Err(
+                "новая версия прокси записана, но служба не перезапустилась (launchctl)"
+                    .to_string(),
+            );
+        }
+        if replaced && is_watchdog_enabled() {
+            crate::macos::agent_restart(WATCHDOG_LABEL);
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn enable() -> Result<(), String> {
+        ensure_running()?;
+        let _ = crate::macos::agent_restart(PROXY_LABEL);
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn enable_watchdog() -> Result<(), String> {
+        let replaced = install_copy()?;
+        let changed = crate::macos::agent_install(
+            WATCHDOG_LABEL,
+            &agent_text(WATCHDOG_LABEL, WATCHDOG_FLAG),
+        )?;
+        if replaced && !changed && !crate::macos::agent_restart(WATCHDOG_LABEL) {
+            return Err("автопатч записан, но служба не перезапустилась (launchctl)".to_string());
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn disable_watchdog() {
+        crate::macos::agent_remove(WATCHDOG_LABEL);
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn disable() -> Result<(), String> {
+        crate::macos::agent_remove(PROXY_LABEL);
         if !is_watchdog_enabled() {
             let _ = fs::remove_file(installed_exe());
             let _ = fs::remove_dir(install_dir());

@@ -803,7 +803,12 @@ fn answer_log(hits: &[(std::path::PathBuf, ls_log::Tally)]) {
     // After the answers and refusals: an answer older than the drop must not
     // wipe the streak the drop is about to add to.
     if let Some(d) = drop {
-        on_drops(drops, d, dropped_host.as_deref(), answer.is_some_and(|a| a > d));
+        on_drops(
+            drops,
+            d,
+            dropped_host.as_deref(),
+            answer.is_some_and(|a| a > d),
+        );
     }
 }
 

@@ -932,7 +932,10 @@ mod tests {
         let t0 = Instant::now();
         bench(b, t0);
         assert_eq!(plan(&[a, b], 0, t0), vec![a]);
-        assert_eq!(plan(&[a, b], 0, t0 + BENCH_FIRST + Duration::from_secs(1)), vec![a, b]);
+        assert_eq!(
+            plan(&[a, b], 0, t0 + BENCH_FIRST + Duration::from_secs(1)),
+            vec![a, b]
+        );
         unbench(b);
         assert_eq!(plan(&[a, b], 1, t0), vec![b, a]);
     }

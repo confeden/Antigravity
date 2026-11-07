@@ -632,10 +632,11 @@ fn worth_sending(fresh: &View, shown: &View) -> bool {
     if relay_changed || fresh.net_ok != shown.net_ok {
         return true;
     }
-    let newer = |a: Option<crate::ls_log::Sighting>, b: Option<crate::ls_log::Sighting>| match (a, b) {
-        (Some(a), Some(b)) => a.count != b.count || a.ago < b.ago,
-        (a, b) => a.is_some() != b.is_some(),
-    };
+    let newer =
+        |a: Option<crate::ls_log::Sighting>, b: Option<crate::ls_log::Sighting>| match (a, b) {
+            (Some(a), Some(b)) => a.count != b.count || a.ago < b.ago,
+            (a, b) => a.is_some() != b.is_some(),
+        };
     let verify_changed = match (&fresh.verify, &shown.verify) {
         (Some(a), Some(b)) => a.url != b.url || a.ago < b.ago,
         (a, b) => a.is_some() != b.is_some(),
@@ -702,12 +703,18 @@ mod tests {
             verify: link(10, "https://accounts.google.com/a"),
             ..shown.clone()
         };
-        assert!(worth_sending(&asked, &shown), "a verification demand appeared");
+        assert!(
+            worth_sending(&asked, &shown),
+            "a verification demand appeared"
+        );
         let aged = View {
             verify: link(13, "https://accounts.google.com/a"),
             ..shown.clone()
         };
-        assert!(!worth_sending(&aged, &asked), "the same demand, three seconds on");
+        assert!(
+            !worth_sending(&aged, &asked),
+            "the same demand, three seconds on"
+        );
         let again = View {
             verify: link(2, "https://accounts.google.com/b"),
             ..shown.clone()
@@ -849,9 +856,21 @@ mod tests {
             ..Report::default()
         };
         assert!(r.cut_off());
-        assert!(!Report { reached_at: now - 5, ..r.clone() }.cut_off());
-        assert!(!Report { started_at: now - 30, ..r.clone() }.cut_off());
-        assert!(!Report { version: 31, ..r.clone() }.cut_off());
+        assert!(!Report {
+            reached_at: now - 5,
+            ..r.clone()
+        }
+        .cut_off());
+        assert!(!Report {
+            started_at: now - 30,
+            ..r.clone()
+        }
+        .cut_off());
+        assert!(!Report {
+            version: 31,
+            ..r.clone()
+        }
+        .cut_off());
         assert!(!Report { started_at: 0, ..r }.cut_off());
     }
 }

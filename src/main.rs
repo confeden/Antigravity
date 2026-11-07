@@ -29,14 +29,17 @@ mod egress;
 mod elevate;
 mod endpoint;
 mod gate;
+pub mod group;
+mod group_key;
 mod gui;
 mod health;
 mod hosts_pin;
 mod hwid;
 mod instances;
-mod group_key;
 mod loopback;
 mod ls_log;
+#[cfg(target_os = "macos")]
+mod macos;
 mod net;
 mod ops;
 mod patch_binary;
@@ -49,7 +52,6 @@ mod settings;
 mod tui;
 mod update;
 mod upstream;
-pub mod group;
 mod utils;
 mod watchdog;
 
@@ -83,6 +85,9 @@ fn is_install_root(path: &Path) -> bool {
         return false;
     }
 
+    #[cfg(target_os = "macos")]
+    let resources = macos::resources_dir(path);
+    #[cfg(not(target_os = "macos"))]
     let resources = path.join("resources");
     if resources.exists() && resources.is_dir() {
         if resources.join("app.asar").exists()
@@ -154,6 +159,8 @@ pub fn resolve_install_root(raw: &Path) -> Option<PathBuf> {
         "Programs\\Antigravity IDE",
         "Programs\\Antigravity",
         "resources",
+        // macOS: the `.app` itself was picked; the root is its `Contents`.
+        "Contents",
     ];
     for sub in subfolder_candidates {
         let candidate = p.join(sub);
@@ -235,6 +242,10 @@ fn standard_install_candidates() -> Vec<PathBuf> {
         v.push(h.join(".local/share/agy/bin"));
         v.push(h.join(".gemini/bin"));
     }
+    // macOS: `.app` bundles in /Applications and ~/Applications; the install
+    // root is the bundle's `Contents` (S80).
+    #[cfg(target_os = "macos")]
+    v.extend(macos::app_bundles());
     v
 }
 
@@ -406,6 +417,9 @@ pub fn process_install(install: &Path) -> Result<InstallOutcome, String> {
     let bin_summary = patch_all_binaries(install);
     let mut warnings: Vec<String> = Vec::new();
 
+    #[cfg(target_os = "macos")]
+    let resources = macos::resources_dir(install);
+    #[cfg(not(target_os = "macos"))]
     let resources = install.join("resources");
     let app_dir = resources.join("app");
     let app_asar = resources.join("app.asar");
@@ -546,6 +560,7 @@ pub fn install_label(install: &Path) -> &'static str {
         "Antigravity CLI"
     } else if install.join("Antigravity IDE.exe").exists()
         || install.join("resources").join("app").join("out").exists()
+        || install.join("Resources").join("app").join("out").exists()
     {
         "Antigravity IDE"
     } else {

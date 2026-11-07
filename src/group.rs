@@ -1189,7 +1189,10 @@ mod tests {
             Server::new("b.example".into(), 8443),
             Server::new("c.example".into(), 443),
         ];
-        let listed = vec![("a.example".to_string(), 443), ("c.example".to_string(), 443)];
+        let listed = vec![
+            ("a.example".to_string(), 443),
+            ("c.example".to_string(), 443),
+        ];
         assert!(prune_unlisted(&mut v, &("a.example".into(), 443), &listed));
         assert_eq!(v.len(), 2);
         assert!(!prune_unlisted(&mut v, &("a.example".into(), 443), &listed));
@@ -1206,8 +1209,14 @@ mod tests {
         assert!(!a.benched());
         // A benched current server is not "ok", so a fresh pick leaves it.
         let cands = [
-            Cand { ok: false, cpu: Some(0) },
-            Cand { ok: true, cpu: Some(90) },
+            Cand {
+                ok: false,
+                cpu: Some(0),
+            },
+            Cand {
+                ok: true,
+                cpu: Some(90),
+            },
         ];
         assert_eq!(choose(&cands, Some(0), 0, 0.3), Some(1));
     }

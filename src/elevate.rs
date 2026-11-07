@@ -151,6 +151,47 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// Runs `exe flag inst` as root behind the desktop's own password prompt, and
+/// hands back its output with pkexec's exit codes (126 = refused, 127 = no
+/// prompt possible) whatever did the asking.
+///
+/// Linux: `pkexec --disable-internal-agent` - with no desktop agent (a TUI over
+/// SSH) it fails instead of asking on the terminal the TUI is drawing on.
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+fn elevated_output(exe: &Path, flag: &str, inst: &Path) -> std::io::Result<std::process::Output> {
+    std::process::Command::new("pkexec")
+        .arg("--disable-internal-agent")
+        .arg(exe)
+        .arg(flag)
+        .arg(inst)
+        .output()
+}
+
+/// macOS: AppleScript's `with administrator privileges`, the system's own
+/// password sheet (S80). Its stdout is the command's; a dismissed sheet is
+/// error -128, mapped to pkexec's 126.
+#[cfg(target_os = "macos")]
+fn elevated_output(exe: &Path, flag: &str, inst: &Path) -> std::io::Result<std::process::Output> {
+    use std::os::unix::process::ExitStatusExt;
+    let cmd = format!(
+        "{} {} {}",
+        shell_quote(&exe.display().to_string()),
+        flag,
+        shell_quote(&inst.display().to_string())
+    );
+    let as_literal = cmd.replace('\\', "\\\\").replace('"', "\\\"");
+    let script = format!(
+        "do shell script \"{as_literal}\" with administrator privileges without altering line endings"
+    );
+    let mut out = std::process::Command::new("/usr/bin/osascript")
+        .args(["-e", &script])
+        .output()?;
+    if !out.status.success() && String::from_utf8_lossy(&out.stderr).contains("-128") {
+        out.status = std::process::ExitStatus::from_raw(126 << 8);
+    }
+    Ok(out)
+}
+
 /// Patches `inst` through `pkexec`, which shows the desktop's own password
 /// prompt. `--disable-internal-agent`: with no desktop agent (a TUI over SSH)
 /// pkexec would otherwise ask on the terminal the TUI is drawing on, so it
@@ -159,22 +200,16 @@ fn shell_quote(s: &str) -> String {
 pub fn patch_as_root(inst: &Path) -> Result<Elevated, String> {
     use std::process::Command;
     let exe = std::env::current_exe().map_err(|e| format!("не найден путь к exe: {e}"))?;
-    let out = Command::new("pkexec")
-        .arg("--disable-internal-agent")
-        .arg(&exe)
-        .arg(PATCH_ROOT_FLAG)
-        .arg(inst)
-        .output()
-        .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                format!(
-                    "установка принадлежит root, а pkexec в системе нет. Выполните в терминале: {}",
-                    manual_command(inst)
-                )
-            } else {
-                format!("pkexec не запустился: {e}")
-            }
-        })?;
+    let out = elevated_output(&exe, PATCH_ROOT_FLAG, inst).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            format!(
+                "установка принадлежит root, а pkexec в системе нет. Выполните в терминале: {}",
+                manual_command(inst)
+            )
+        } else {
+            format!("pkexec не запустился: {e}")
+        }
+    })?;
     let stdout = String::from_utf8_lossy(&out.stdout);
     let parsed = parse_report(&stdout);
     match (out.status.code(), parsed) {
@@ -272,22 +307,16 @@ fn parse_report(stdout: &str) -> Result<Elevated, String> {
 pub fn unpatch_as_root(inst: &Path) -> Result<Reverted, String> {
     use std::process::Command;
     let exe = std::env::current_exe().map_err(|e| format!("не найден путь к exe: {e}"))?;
-    let out = Command::new("pkexec")
-        .arg("--disable-internal-agent")
-        .arg(&exe)
-        .arg(UNPATCH_ROOT_FLAG)
-        .arg(inst)
-        .output()
-        .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                format!(
-                    "установка принадлежит root, а pkexec в системе нет. Выполните в терминале: {}",
-                    manual_command_for(UNPATCH_ROOT_FLAG, inst)
-                )
-            } else {
-                format!("pkexec не запустился: {e}")
-            }
-        })?;
+    let out = elevated_output(&exe, UNPATCH_ROOT_FLAG, inst).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            format!(
+                "установка принадлежит root, а pkexec в системе нет. Выполните в терминале: {}",
+                manual_command_for(UNPATCH_ROOT_FLAG, inst)
+            )
+        } else {
+            format!("pkexec не запустился: {e}")
+        }
+    })?;
     match (
         out.status.code(),
         parse_reverted(&String::from_utf8_lossy(&out.stdout)),
@@ -353,8 +382,10 @@ fn parse_reverted(stdout: &str) -> Option<Reverted> {
 mod tests {
     #[test]
     fn the_unpatch_report_reads_back_and_needs_its_last_line() {
-        let done = super::parse_reverted("FILES\t2\nBAD\tlanguage_server: отказано\nWARN\tapp.asar\nDONE\n")
-            .expect("done");
+        let done = super::parse_reverted(
+            "FILES\t2\nBAD\tlanguage_server: отказано\nWARN\tapp.asar\nDONE\n",
+        )
+        .expect("done");
         assert_eq!(done.files, 2);
         assert_eq!(done.errors, vec!["language_server: отказано".to_string()]);
         assert_eq!(done.warnings, vec!["app.asar".to_string()]);

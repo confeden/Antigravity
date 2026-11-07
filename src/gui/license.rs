@@ -113,7 +113,9 @@ pub fn view(app: &mut App, ui: &mut egui::Ui) {
                 app.key_next_attempt = Some(std::time::Instant::now() + app.key_cooldown);
 
                 if valid {
-                    app.worker.send(crate::ops::Cmd::RememberLicense(app.key_input.trim().to_string()));
+                    app.worker.send(crate::ops::Cmd::RememberLicense(
+                        app.key_input.trim().to_string(),
+                    ));
                     app.screen = Screen::Main;
                     // The key field is about to stop existing. Leaving egui's focus
                     // pointed at it makes the next key press land on whatever claims

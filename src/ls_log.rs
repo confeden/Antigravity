@@ -460,7 +460,13 @@ fn profile_root() -> Option<PathBuf> {
 
 /// Linux keeps the same layout under `~/.config`; nothing tails it there yet
 /// because the DNS layer it would steer is not ported, but the path is right.
-#[cfg(not(target_os = "windows"))]
+/// macOS: Electron keeps the profile under `~/Library/Application Support`.
+#[cfg(target_os = "macos")]
+fn profile_root() -> Option<PathBuf> {
+    Some(crate::macos::application_support())
+}
+
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 fn profile_root() -> Option<PathBuf> {
     match std::env::var("XDG_CONFIG_HOME") {
         Ok(x) if !x.is_empty() => Some(PathBuf::from(x)),

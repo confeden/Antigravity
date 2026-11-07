@@ -313,7 +313,7 @@ fn legacy_removals(https: Option<&str>, no_proxy: Option<&str>, url: &str) -> (b
 /// Value-scoped, unlike the blanket unset `remove_proxy` does: this runs on the
 /// patch path, where a `https_proxy` the user exported for themselves is none of
 /// our business.
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 pub fn remove_legacy_proxy_env(url: &str) -> Result<bool, String> {
     use std::process::Command;
     let Ok(out) = Command::new("systemctl")
@@ -376,7 +376,7 @@ pub fn remove_legacy_proxy_env(url: &str) -> Result<bool, String> {
 /// shell, every `curl`, every package manager through `127.0.0.1:53129`. The
 /// private name reaches the patched binaries and nothing else; rewriting the
 /// file in place is also what retires the old names on an upgrade.
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 pub fn apply_proxy(url: &str, _ca_path: &str) -> Result<Outcome, String> {
     use std::process::Command;
     let path = environment_d_path()?;
@@ -412,7 +412,7 @@ pub fn apply_proxy(url: &str, _ca_path: &str) -> Result<Outcome, String> {
 }
 
 /// `~/.config/environment.d/ag-unlocker.conf`, honouring `XDG_CONFIG_HOME`.
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 fn environment_d_path() -> Result<PathBuf, String> {
     let base = match std::env::var("XDG_CONFIG_HOME") {
         Ok(x) if !x.is_empty() => PathBuf::from(x),
@@ -462,7 +462,7 @@ pub fn remove_proxy(url: &str, ca_path: &str) -> Result<(), String> {
 /// Only ever removes our own file (the path is ours by construction) and our own
 /// variable; the standard names an older build exported are unset by value, so a
 /// proxy the user set another way survives the revert.
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 pub fn remove_proxy(url: &str, _ca_path: &str) -> Result<(), String> {
     use std::process::Command;
     if let Ok(path) = environment_d_path() {
@@ -483,6 +483,61 @@ pub fn remove_proxy(url: &str, _ca_path: &str) -> Result<(), String> {
         .ok();
     remove_legacy_proxy_env(url).ok();
     Ok(())
+}
+
+// ---- macOS (S80): the launchd environment is the session manager. An app
+// started from the Dock or Finder inherits what `launchctl setenv` put there;
+// the `com.agunlocker.env` login agent sets it again after a reboot. Only
+// `PROXY_ENV_VAR`, for the same reason as on Linux (D19).
+
+/// No build ever wrote the standard names on a Mac, so there is nothing
+/// legacy to migrate; a user's own `HTTPS_PROXY` is not ours to touch.
+#[cfg(target_os = "macos")]
+pub fn remove_legacy_proxy_env(_url: &str) -> Result<bool, String> {
+    Ok(false)
+}
+
+#[cfg(target_os = "macos")]
+pub fn apply_proxy(url: &str, _ca_path: &str) -> Result<Outcome, String> {
+    if crate::macos::persist_env(PROXY_ENV_VAR, url)? {
+        Ok(Outcome::Applied)
+    } else {
+        Ok(Outcome::AlreadySet)
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub fn remove_proxy(_url: &str, _ca_path: &str) -> Result<(), String> {
+    crate::macos::unpersist_env(PROXY_ENV_VAR);
+    Ok(())
+}
+
+/// `HTTPS_PROXY`/`https_proxy` as launchd hands them to GUI apps.
+#[cfg(target_os = "macos")]
+fn session_manager_proxy(ours: &str) -> Option<ForeignProxy> {
+    for name in [LEGACY_PROXY_ENV_VAR, "https_proxy"] {
+        if let Some(value) = crate::macos::getenv(name) {
+            if !is_ours_on_any_port(&value, ours) {
+                return Some(ForeignProxy {
+                    value,
+                    found_in: format!("{} в launchctl (окружение приложений)", name),
+                });
+            }
+        }
+    }
+    None
+}
+
+/// The process environment, then launchd's, then the login agent's plist.
+#[cfg(target_os = "macos")]
+fn current_env(name: &str) -> Option<String> {
+    if let Ok(v) = std::env::var(name) {
+        let v = v.trim().to_string();
+        if !v.is_empty() {
+            return Some(v);
+        }
+    }
+    crate::macos::getenv(name).or_else(|| crate::macos::persisted_env(name))
 }
 
 /// A proxy the user set up themselves, which this tool must not get in front of.
@@ -558,7 +613,7 @@ pub fn foreign_proxy(ours: &str) -> Option<ForeignProxy> {
 /// `HTTPS_PROXY`/`https_proxy` as the systemd user manager holds it - what a
 /// `environment.d` drop-in or a `systemctl --user set-environment` leaves behind,
 /// and what every app launched from the desktop inherits.
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 fn session_manager_proxy(ours: &str) -> Option<ForeignProxy> {
     use std::process::Command;
     let out = Command::new("systemctl")
@@ -643,7 +698,13 @@ fn profile_root() -> Option<PathBuf> {
     std::env::var("APPDATA").ok().map(PathBuf::from)
 }
 
-#[cfg(not(target_os = "windows"))]
+/// macOS: Electron keeps the profile under `~/Library/Application Support`.
+#[cfg(target_os = "macos")]
+fn profile_root() -> Option<PathBuf> {
+    Some(crate::macos::application_support())
+}
+
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 fn profile_root() -> Option<PathBuf> {
     match std::env::var("XDG_CONFIG_HOME") {
         Ok(x) if !x.is_empty() => Some(PathBuf::from(x)),
@@ -808,7 +869,7 @@ fn current_env(name: &str) -> Option<String> {
 
 /// On Linux reads the process environment, the systemd user manager session,
 /// or the persistent environment.d drop-in.
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 fn current_env(name: &str) -> Option<String> {
     if let Ok(v) = std::env::var(name) {
         let trimmed = v.trim().to_string();

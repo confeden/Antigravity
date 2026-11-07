@@ -1988,10 +1988,14 @@ mod tests {
 
     #[test]
     fn custom_dns_takes_plain_ipv4_and_refuses_loops_and_junk() {
-        let got = parse_custom_dns("77.88.8.8, 77.88.8.8;1.1.1.1  127.0.0.53 0.0.0.0 junk 224.0.0.1");
+        let got =
+            parse_custom_dns("77.88.8.8, 77.88.8.8;1.1.1.1  127.0.0.53 0.0.0.0 junk 224.0.0.1");
         assert_eq!(
             got,
-            vec!["77.88.8.8".parse::<Ipv4Addr>().unwrap(), "1.1.1.1".parse().unwrap()]
+            vec![
+                "77.88.8.8".parse::<Ipv4Addr>().unwrap(),
+                "1.1.1.1".parse().unwrap()
+            ]
         );
         assert!(parse_custom_dns("").is_empty());
     }

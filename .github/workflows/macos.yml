@@ -1,0 +1,128 @@
+name: macOS (arm64)
+
+# Builds the Apple-Silicon release on a real macOS runner — the one platform the
+# owner cannot build locally (no Mac). The patch, discovery, launchd services and
+# the launchctl env carrier are the macOS port (S80); `codesign`/`xattr` exist
+# only here, so this is also the only place the re-sign-on-write path is exercised
+# for real.
+#
+# Private routes (built-in exits / relay / group) live in gitignored files. They
+# are rebuilt from repository secrets when those secrets are set, so an owner
+# build keeps full parity; without them the workflow still produces a working
+# public build (DNS route). Secret values are masked in the log, and the exit
+# addresses never appear in committed source — the rule that keeps a free proxy
+# free (see CLAUDE.md) holds.
+
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: "Attach the bundle to a GitHub release for this tag (e.g. v2.28.2). Empty = artifact only."
+        required: false
+        default: ""
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-14 # Apple Silicon
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: |
+          rustup set profile minimal
+          rustup default stable
+          rustup target add aarch64-apple-darwin
+          rustc -V
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-arm64
+
+      - name: Restore private route files from secrets
+        env:
+          EXITS_RS: ${{ secrets.EXITS_RS }}
+          EXITS: ${{ secrets.EXITS }}
+          RELAY_RS: ${{ secrets.RELAY_RS }}
+          RELAY_KEY: ${{ secrets.RELAY_KEY }}
+          GROUP: ${{ secrets.GROUP }}
+        run: |
+          set -eu
+          # Each secret is base64 of the file's contents; absent => public build.
+          decode() { # <secret-value> <dest>
+            if [ -n "${1:-}" ]; then
+              printf '%s' "$1" | base64 --decode > "$2"
+              echo "restored $2"
+            fi
+          }
+          decode "$EXITS_RS"   src/exits.rs
+          decode "$EXITS"      .exits
+          decode "$RELAY_RS"   src/relay.rs
+          decode "$RELAY_KEY"  .relay_key
+          decode "$GROUP"      .group
+          # The relay route is compiled in only when both its files AND the opt-in
+          # are present (build.rs); xbox took the public relay down, so it stays
+          # off unless the owner ships relay.rs + .relay_key.
+          if [ -f src/relay.rs ] && [ -f .relay_key ]; then
+            echo "AG_WITH_RELAY=1" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build
+        run: cargo build --release --bin ag_unlocker --target aarch64-apple-darwin
+
+      - name: Assemble bundle
+        id: pack
+        run: |
+          set -eu
+          VER=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          # Tag v2.28.2 and a 4th-digit build 2.28.2.1 both map to the asset name
+          # with an underscore before the 4th number, matching the other platforms.
+          ASSET_VER=$(printf '%s' "$VER" | sed -E 's/\.([0-9]+)$/_\1/')
+          NAME="AG_${ASSET_VER}_macos"
+          BIN=target/aarch64-apple-darwin/release/ag_unlocker
+
+          # Ad-hoc sign the shipped binary itself. The patcher re-signs the files
+          # it edits at runtime; this is so our own download is not killed by
+          # Gatekeeper before it can.
+          codesign --force --sign - "$BIN"
+          codesign --verify --verbose "$BIN"
+
+          mkdir -p "release/$NAME"
+          cp "$BIN" "release/$NAME/ag_unlocker"
+          chmod +x "release/$NAME/ag_unlocker"
+          cp linux/README.md "release/$NAME/README.md" 2>/dev/null || true
+          cat > "release/$NAME/Запустить.command" <<'SH'
+          #!/bin/sh
+          # Double-click launcher. Strips our own quarantine flag (a downloaded
+          # tar keeps it) and starts the unlocker from its own folder.
+          cd "$(dirname "$0")"
+          xattr -dr com.apple.quarantine ag_unlocker 2>/dev/null || true
+          exec ./ag_unlocker "$@"
+          SH
+          chmod +x "release/$NAME/Запустить.command"
+
+          # Keep the execute bit and the signature inside the archive.
+          tar -C release -czf "release/${NAME}.tar.gz" "$NAME"
+          echo "name=$NAME"            >> "$GITHUB_OUTPUT"
+          echo "tgz=release/${NAME}.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "version=$VER"          >> "$GITHUB_OUTPUT"
+          ls -la "release/$NAME" "release/${NAME}.tar.gz"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pack.outputs.name }}
+          path: release/${{ steps.pack.outputs.name }}.tar.gz
+          if-no-files-found: error
+
+      - name: Attach to release
+        # On a tag push, or when a tag was given to workflow_dispatch.
+        if: startsWith(github.ref, 'refs/tags/v') || inputs.release != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.release != '' && inputs.release || github.ref_name }}
+        run: gh release upload "$TAG" "${{ steps.pack.outputs.tgz }}" --clobber --repo "$GITHUB_REPOSITORY"

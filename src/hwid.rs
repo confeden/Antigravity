@@ -207,7 +207,31 @@ fn parse_smbios(mut data: &[u8]) -> Option<String> {
     None
 }
 
-#[cfg(unix)]
+/// macOS: the hardware UUID (`IOPlatformUUID`), the same quantity the SMBIOS
+/// system UUID is on a PC. Without this every Mac fell through to "unknown"
+/// and shared one PC code.
+#[cfg(target_os = "macos")]
+fn get_raw_hwid() -> String {
+    let out = std::process::Command::new("/usr/sbin/ioreg")
+        .args(["-rd1", "-c", "IOPlatformExpertDevice"])
+        .output();
+    if let Ok(out) = out {
+        let text = String::from_utf8_lossy(&out.stdout);
+        if let Some(uuid) = text
+            .lines()
+            .find(|l| l.contains("\"IOPlatformUUID\""))
+            .and_then(|l| l.rsplit('"').nth(1))
+        {
+            let uuid = uuid.trim().replace('-', "").to_lowercase();
+            if !uuid.is_empty() {
+                return format!("smbios-uuid:{}", uuid);
+            }
+        }
+    }
+    "unknown".to_string()
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
 fn get_raw_hwid() -> String {
     use std::fs;
     if let Ok(uuid) = fs::read_to_string("/sys/class/dmi/id/product_uuid") {

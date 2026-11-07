@@ -97,4 +97,3 @@ mod tests {
         assert!(verify_key(&formatted));
     }
 }
-

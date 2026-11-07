@@ -50,7 +50,16 @@ pub fn requested() -> bool {
 }
 
 /// Linux: a terminal and nothing to draw a window into — a server over SSH.
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+pub fn only_terminal() -> bool {
+    use std::io::IsTerminal;
+    // No DISPLAY on a Mac: the window server is always there, unless this is
+    // a shell reached over SSH.
+    (std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some())
+        && std::io::stdin().is_terminal()
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
 pub fn only_terminal() -> bool {
     use std::io::IsTerminal;
     std::env::var_os("DISPLAY").is_none()
