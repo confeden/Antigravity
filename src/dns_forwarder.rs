@@ -595,7 +595,11 @@ fn warm_forever() {
             // address reached from the tunnel's exit is refused by the RU-only
             // providers (N25) - so the relay answers as the tunnel would (D13's
             // old rule, now the fallback D25 leaves in place).
-            let (stand_down, _) = if tunnel && !loopback::active() {
+            //
+            // Never outside Windows: there the client's gate traffic reaches us
+            // through the renamed proxy variable, not through a DNS answer, so
+            // there is no answer to change and no door to be down.
+            let (stand_down, _) = if cfg!(target_os = "windows") && tunnel && !loopback::active() {
                 egress::vpn_verdict(eg.as_ref())
             } else {
                 (false, egress::ClientEgress::Unknown)

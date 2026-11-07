@@ -1143,8 +1143,14 @@ fn read_own_proxy() -> State {
     }
 }
 
-/// The three kinds, in the order the window lists them.
-const INSTALL_KINDS: [&str; 3] = ["Antigravity 2.0", "Antigravity IDE", "Antigravity CLI"];
+/// The kinds, in the order the window lists them. VS Code is the Antigravity
+/// extension's backend in `~/.gemini/bin` (`install_label`).
+const INSTALL_KINDS: [&str; 4] = [
+    "Antigravity 2.0",
+    "Antigravity IDE",
+    "Antigravity CLI",
+    "Antigravity для VS Code",
+];
 
 fn collect_installs(
     settings: &Settings,

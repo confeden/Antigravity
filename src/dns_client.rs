@@ -63,8 +63,22 @@ mod sys {
 
 #[cfg(not(target_os = "windows"))]
 mod sys {
-    pub fn bind_socket_to_interface(_: &std::net::UdpSocket, _: u32) -> Result<(), String> {
-        Err("поддерживается только на Windows".to_string())
+    /// `SO_BINDTOIFINDEX` / `IP_BOUND_IF` (`net::bind_to_interface`). A kernel
+    /// that refuses it for lack of privilege leaves the query unpinned instead of unsent: through a
+    /// tunnel the answer comes back unsubstituted, and the verdict against the
+    /// reference resolver is what catches that (I4's job, done by `resolvers`).
+    pub fn bind_socket_to_interface(
+        sock: &std::net::UdpSocket,
+        if_index: u32,
+    ) -> Result<(), String> {
+        match crate::net::bind_to_interface(&socket2::SockRef::from(sock), false, if_index) {
+            Ok(()) => Ok(()),
+            Err(e) if crate::net::refused_privilege(&e) => {
+                crate::net::note_unpinned(&e);
+                Ok(())
+            }
+            Err(_) => Err("не удалось привязать сокет к интерфейсу".to_string()),
+        }
     }
 }
 

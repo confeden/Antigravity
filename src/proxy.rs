@@ -499,9 +499,10 @@ fn gate_direct_addrs(host: &str, port: u16) -> Result<(Vec<std::net::SocketAddr>
     let if_index = crate::net::pin_interface();
     let (addrs, _, verdict) = crate::resolvers::direct_addrs(host, if_index)
         .ok_or_else(|| "имя не разрешилось".to_string())?;
-    // With no relay to stand down for a tunnel (D13) and no VPN route of ours,
-    // Google's own address is the gate and nothing else: the next route in the
-    // table takes the connection instead.
+    // Outside Windows nothing stands down for a tunnel (D13) - the client
+    // reaches us through the proxy variable, not a DNS answer - and the user's
+    // VPN has a row of its own (`Kind::Vpn`), so Google's own address here is
+    // the gate and nothing else: the next route in the table takes it instead.
     if !cfg!(target_os = "windows") && verdict != crate::resolvers::Verdict::Substituted {
         return Err(
             "сервисы разблокировки не подменили адрес — напрямую будет ошибка 400".to_string(),

@@ -41,6 +41,8 @@ mod ls_log;
 #[cfg(target_os = "macos")]
 mod macos;
 mod net;
+#[cfg(not(target_os = "windows"))]
+mod netif;
 mod ops;
 mod patch_binary;
 mod patch_ide;
@@ -511,7 +513,7 @@ pub fn process_install(install: &Path) -> Result<InstallOutcome, String> {
             warnings.push(format!("Прежний {} не снят: {}", endpoint::CLI_ENV_VAR, e));
         }
         return Ok(InstallOutcome {
-            label: "Antigravity CLI",
+            label: install_label(install),
             warnings,
             summary: bin_summary,
         });
@@ -555,8 +557,51 @@ pub fn remove_legacy_ca_quiet() -> bool {
 /// A guess from the layout rather than the name `process_install` returns,
 /// because the line is printed before the work starts - that is the whole point
 /// of it.
+/// Editor extension folders where the Antigravity extension for VS Code (and
+/// its forks, which install from the same marketplace package) lives. The
+/// extension downloads its backend to `~/.gemini/bin`, the folder discovery
+/// already patches, so the folder is that editor's install in the window.
+const VSCODE_EXTENSION_DIRS: [&str; 5] = [
+    ".vscode",
+    ".vscode-insiders",
+    ".vscode-oss",
+    ".cursor",
+    ".windsurf",
+];
+
+/// Whether the Antigravity extension is installed in any VS Code-family editor.
+pub fn vscode_extension_installed() -> bool {
+    let Some(home) = env::var_os("USERPROFILE").or_else(|| env::var_os("HOME")) else {
+        return false;
+    };
+    let home = PathBuf::from(home);
+    VSCODE_EXTENSION_DIRS.iter().any(|d| {
+        fs::read_dir(home.join(d).join("extensions"))
+            .map(|entries| {
+                entries.flatten().any(|e| {
+                    e.file_name()
+                        .to_string_lossy()
+                        .to_ascii_lowercase()
+                        .starts_with("google.google-antigravity-")
+                })
+            })
+            .unwrap_or(false)
+    })
+}
+
+/// `~/.gemini/bin`: the backend of the VS Code extension and of IDE 2.6.0.
+fn is_gemini_bin(install: &Path) -> bool {
+    install.file_name().is_some_and(|n| n == "bin")
+        && install
+            .parent()
+            .and_then(|p| p.file_name())
+            .is_some_and(|n| n == ".gemini")
+}
+
 pub fn install_label(install: &Path) -> &'static str {
-    if install.join("agy.exe").is_file() || install.join("agy").is_file() {
+    if is_gemini_bin(install) && vscode_extension_installed() {
+        "Antigravity для VS Code"
+    } else if install.join("agy.exe").is_file() || install.join("agy").is_file() {
         "Antigravity CLI"
     } else if install.join("Antigravity IDE.exe").exists()
         || install.join("resources").join("app").join("out").exists()

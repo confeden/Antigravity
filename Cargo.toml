@@ -1,6 +1,6 @@
 [package]
 name = "ag_unlocker"
-version = "2.28.2"
+version = "2.29.0"
 edition = "2021"
 description = "Antigravity Configuration Tool"
 authors = ["Brent t.me/nova_txt"]
@@ -27,7 +27,7 @@ arboard = { version = "3.6", default-features = false }
 # `connect`, and std creates and connects in one call. Pins the relay's own
 # connections to the ISP link while a VPN holds the default route (`net.rs`),
 # the same way every UDP resolver query already is (I4). Small, no runtime.
-socket2 = "0.6"
+socket2 = { version = "0.6", features = ["all"] }
 # The terminal UI (`--tui`; on Linux also any start with no graphical session,
 # e.g. a server over SSH; on Windows also the fallback when no renderer opens a
 # window). Only the crossterm backend - no widgets beyond the core set.
@@ -49,6 +49,9 @@ eframe = { version = "0.36", default-features = false, features = ["accesskit", 
 wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "wgsl", "dx12"] }
 
 [target.'cfg(not(windows))'.dependencies]
+# getifaddrs/if_nametoindex and the sockaddr layouts for `netif.rs` (interfaces
+# and the default route on Linux/macOS). Already in the tree through socket2.
+libc = "0.2"
 # Linux has no DirectX: wgpu's default Vulkan + GL, then glow.
 eframe = { version = "0.36", features = ["glow"] }
 

@@ -421,17 +421,17 @@ def prune_dev_cache(target_dir, release_profile):
 
 def prune_old_releases(release_dir, version):
     """Deletes other versions' build outputs from release/ - the .exe, the Linux
-    bundle directory and its .tar.gz - and nothing else: the release notes and
+    and macOS bundle directories and their .tar.gz - and nothing else: the release notes and
     scripts kept beside them are not the build's to delete. Every published
     version is on GitHub Releases; the others were test builds.
     Returns (entries removed, bytes freed)."""
-    output = re.compile(r"^AG_(.+?)(\.exe|_linux\.tar\.gz|_linux)$")
+    output = re.compile(r"^AG_(.+?)(\.exe|_(?:linux|macos)\.tar\.gz|_linux|_macos)$")
     removed = freed = 0
     for entry in _entries(release_dir):
         m = output.match(entry.name)
         if not m or m.group(1) == version:
             continue
-        if entry.is_dir(follow_symlinks=False) != (m.group(2) == "_linux"):
+        if entry.is_dir(follow_symlinks=False) != (m.group(2) in ("_linux", "_macos")):
             continue
         freed += _remove(entry.path)
         if not os.path.exists(entry.path):
@@ -450,12 +450,16 @@ def print_prune(label, target_dir, result):
     print(line + ".")
 
 
-def prune_linux_cache(target_dir):
-    """Run by python3 inside WSL (build_linux_bundle), where the cache is local."""
+def prune_wsl_cache(target_dir, label):
+    """Run by python3 inside WSL (the Linux and macOS builds), where the cache is local."""
     with open(os.path.join(target_dir, "messages.json"), encoding="utf-8",
               errors="replace") as f:
         report = BuildReport(f)
-    print_prune("Linux", target_dir, prune_release_cache(target_dir, report, whole_dir=True))
+    print_prune(label, target_dir, prune_release_cache(target_dir, report, whole_dir=True))
+
+
+def prune_linux_cache(target_dir):
+    prune_wsl_cache(target_dir, "Linux")
 
 
 # UPX packing is OFF (owner, `_4`). A packed exe is the single biggest source of
@@ -865,6 +869,192 @@ def build_linux_bundle(version):
         return None
 
 
+# The Apple-Silicon build, cross-compiled in the same WSL distro as the Linux one
+# (owner, 2026-11-07: one `python build_rust.py` yields all three). It used to
+# exist only on a GitHub Actions macos-14 runner (D43), which builds what was
+# pushed, not this working tree, and needs the private route files as repo
+# secrets. cargo-zigbuild links Mach-O itself; what it lacks is Apple's
+# frameworks (eframe links AppKit, Metal, QuartzCore), so an extracted
+# MacOSX*.sdk is needed once, under MACOS_SDK_DIR in the distro. zig's linker
+# ad-hoc signs an arm64 executable, which is all the kernel demands to run it
+# once the quarantine flag is gone (the launcher strips it); the patcher re-signs
+# the files it edits on the Mac itself (G88), so no codesign is needed here.
+MACOS_TARGET = "aarch64-apple-darwin"
+# Asked for, not obtained: zig's linker writes its own floor into LC_BUILD_VERSION
+# (measured minos 13.0 with zig 0.16), so the bundle starts on macOS 13+. Kept so
+# cc-rs builds the C parts (ring) for the same or an older system.
+MACOS_DEPLOYMENT_TARGET = "11.0"
+MACOS_SDK_DIR = "${XDG_DATA_HOME:-$HOME/.local/share}/macos-sdk"
+MACOS_CACHE = "${XDG_CACHE_HOME:-$HOME/.cache}/ag_unlocker/target-mac"
+
+# Double-click launcher, the same text the CI workflow writes.
+MACOS_LAUNCHER = """#!/bin/sh
+# Double-click launcher. Strips our own quarantine flag (a downloaded
+# tar keeps it) and starts the unlocker from its own folder.
+cd "$(dirname "$0")"
+xattr -dr com.apple.quarantine ag_unlocker 2>/dev/null || true
+exec ./ag_unlocker "$@"
+"""
+
+LC_CODE_SIGNATURE = 0x1D
+
+
+def macho_is_signed(path):
+    """True when the thin 64-bit Mach-O carries an LC_CODE_SIGNATURE, False when
+    it does not, None when the file is not one. Measured rather than trusted:
+    an unsigned arm64 binary is killed by the kernel before main."""
+    import struct
+    try:
+        with open(path, "rb") as f:
+            head = f.read(32)
+            if len(head) < 32 or struct.unpack("<I", head[:4])[0] != 0xFEEDFACF:
+                return None
+            ncmds, sizeofcmds = struct.unpack("<II", head[16:24])
+            cmds = f.read(sizeofcmds)
+    except OSError:
+        return None
+    off = 0
+    for _ in range(ncmds):
+        if off + 8 > len(cmds):
+            break
+        cmd, size = struct.unpack("<II", cmds[off:off + 8])
+        if cmd == LC_CODE_SIGNATURE:
+            return True
+        if size == 0:
+            break
+        off += size
+    return False
+
+
+def build_macos_bundle(version):
+    """Cross-builds the arm64 Mach-O in WSL and assembles release/AG_<ver>_macos/
+    (+ .tar.gz), the layout the CI workflow ships. Best-effort; returns the bundle
+    dir or None. Never raises - the Windows build must not depend on it."""
+    import tarfile
+
+    try:
+        distro = find_wsl_distro()
+        if not distro:
+            print("[i] macOS-сборка пропущена: не найден WSL-дистрибутив с cargo.")
+            return None
+        repo_wsl = _win_to_wsl_path(os.getcwd())
+        probe = _wsl_run(
+            distro,
+            '. "$HOME/.cargo/env" 2>/dev/null; export PATH="$HOME/.local/bin:$PATH"; '
+            'command -v cargo-zigbuild >/dev/null || { echo NOZIG; exit 0; }; '
+            'rustup target list --installed | grep -qx %s || rustup target add %s >/dev/null 2>&1; '
+            'rustup target list --installed | grep -qx %s || { echo NOTARGET; exit 0; }; '
+            'S=$(ls -d %s/MacOSX*.sdk 2>/dev/null | sort -V | tail -1); '
+            '[ -n "$S" ] && echo "SDK=$S" || echo NOSDK'
+            % (MACOS_TARGET, MACOS_TARGET, MACOS_TARGET, MACOS_SDK_DIR),
+        )
+        out = probe.stdout or ""
+        if "NOZIG" in out:
+            print("[i] macOS-сборка пропущена: нет cargo-zigbuild в WSL "
+                  "(pip3 install --user --break-system-packages ziglang && cargo install cargo-zigbuild).")
+            return None
+        if "NOTARGET" in out:
+            print(f"[i] macOS-сборка пропущена: не ставится цель {MACOS_TARGET} "
+                  f"(rustup target add {MACOS_TARGET}).")
+            return None
+        sdk = [l.strip()[4:] for l in out.splitlines() if l.strip().startswith("SDK=")]
+        if not sdk:
+            print("[i] macOS-сборка пропущена: нет macOS SDK. Распакуйте MacOSX<ver>.sdk в "
+                  "~/.local/share/macos-sdk/ внутри WSL.")
+            return None
+        sdk = sdk[-1]
+        print(f"[INFO] Сборка macOS-версии в WSL ({distro}, {sdk.rsplit('/', 1)[-1]})...")
+
+        # Same shape as the Linux build: cargo's own exit status counts, JSON to a
+        # file for the cache prune, only the log's tail comes back.
+        remap = (
+            'export CARGO_ENCODED_RUSTFLAGS="--remap-path-prefix=$HOME=~"$\'\\x1f\''
+            '"--remap-path-prefix=%s=/ag_unlocker"$\'\\x1f\''
+            '"--remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo"; '
+        ) % repo_wsl
+        build_cmd = (
+            '. "$HOME/.cargo/env"; export PATH="$HOME/.local/bin:$PATH"; '
+            'cd "%s" || exit 1; T="%s"; mkdir -p "$T" || exit 1; '
+            + remap +
+            'export AG_FULL_VERSION="%s" SDKROOT="%s" MACOSX_DEPLOYMENT_TARGET="%s"; '
+            'echo "TARGET_DIR=$T"; '
+            'cargo zigbuild --release --bin ag_unlocker --target %s --target-dir "$T" %s '
+            '>"$T/messages.json" 2>"$T/build.log"; rc=$?; '
+            'if [ $rc -eq 0 ]; then tail -n 3 "$T/build.log"; else tail -n 40 "$T/build.log"; fi; '
+            'exit $rc'
+        ) % (repo_wsl, MACOS_CACHE, version, sdk, MACOS_DEPLOYMENT_TARGET, MACOS_TARGET, CARGO_JSON)
+        res = _wsl_run(distro, build_cmd, capture=True)
+        lines = [l.rstrip() for l in (res.stdout or "").splitlines() if l.strip()]
+        marker = [l.strip() for l in lines if l.strip().startswith("TARGET_DIR=")]
+        target_dir = marker[0][len("TARGET_DIR="):] if marker else None
+        shown = "\n".join(l for l in lines if not l.strip().startswith("TARGET_DIR="))
+        if shown:
+            print(shown)
+        if res.returncode != 0 or not target_dir:
+            print("[WARNING] macOS-сборка не удалась (см. вывод выше) - macOS-бандл не обновлён.")
+            return None
+
+        binary = "%s/%s/release/ag_unlocker" % (target_dir, MACOS_TARGET)
+        name = f"AG_{version}_macos"
+        bundle = os.path.abspath(os.path.join("release", name))
+        if os.path.exists(bundle):
+            shutil.rmtree(bundle, ignore_errors=True)
+        os.makedirs(bundle, exist_ok=True)
+        copied = _wsl_run(distro, 'cp "%s" "%s/ag_unlocker"' % (binary, _win_to_wsl_path(bundle)))
+        if copied.returncode != 0:
+            print(f"[WARNING] Mach-O не скопирован в бандл: {(copied.stdout or '').strip()}")
+            return None
+        shipped = os.path.join(bundle, "ag_unlocker")
+        signed = macho_is_signed(shipped)
+        if not signed:
+            print("[WARNING] macOS-бинарник %s - на arm64 он не запустится; бандл не собран."
+                  % ("не arm64 Mach-O" if signed is None else "без подписи (LC_CODE_SIGNATURE)"))
+            shutil.rmtree(bundle, ignore_errors=True)
+            return None
+        print("[INFO] macOS-бинарник подписан ad-hoc (подпись компоновщика).")
+
+        with open(os.path.join(bundle, "Запустить.command"), "w", encoding="utf-8", newline="\n") as f:
+            f.write(MACOS_LAUNCHER)
+        readme = os.path.join("linux", "README.md")
+        if os.path.exists(readme):
+            shutil.copy2(readme, os.path.join(bundle, "README.md"))
+
+        tar_path = bundle + ".tar.gz"
+        if os.path.exists(tar_path):
+            os.remove(tar_path)
+
+        def _exec_bits(tarinfo):
+            if tarinfo.isdir() or os.path.basename(tarinfo.name) in ("ag_unlocker", "Запустить.command"):
+                tarinfo.mode = 0o755
+            return tarinfo
+
+        with tarfile.open(tar_path, "w:gz") as tar:
+            tar.add(bundle, arcname=name, filter=_exec_bits)
+
+        wsl_home = _wsl_run(distro, 'printf %s "$HOME"')
+        wsl_home = ((wsl_home.stdout or "").strip().splitlines() or [""])[-1].strip() if wsl_home else ""
+        check_shipped_binary(shipped, [wsl_home + "/", "/.cargo/registry"], windows=False)
+        print(f"[УСПЕХ] macOS-бандл: {bundle} (Mach-O {os.path.getsize(shipped) // 1024} КБ)")
+        print(f"        Архив для переноса на Mac: {tar_path}")
+
+        pruned = _wsl_run(
+            distro,
+            'python3 -B -c "import sys; sys.path.insert(0, sys.argv[1]); '
+            'import build_rust; build_rust.prune_wsl_cache(sys.argv[2], sys.argv[3])" "%s" "%s" macOS'
+            % (repo_wsl, target_dir),
+        )
+        said = (pruned.stdout or "").strip().splitlines()
+        if pruned.returncode == 0:
+            print("\n".join(said))
+        else:
+            print("[i] Кэш macOS-сборки не почищен (нужен python3 в WSL): %s"
+                  % (said[-1] if said else "нет ответа"))
+        return bundle
+    except Exception as e:
+        print(f"[WARNING] macOS-сборка пропущена из-за ошибки: {e}")
+        return None
+
+
 def read_base_secret(auth_rs_path):
     """Reads the committed base secret straight from src\\auth.rs, so the source
     is the single source of truth for both the binary and the key generator."""
@@ -881,7 +1071,7 @@ def main():
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
     print("[INFO] Starting build process...")
 
-    VERSION = "2.28.2"
+    VERSION = "2.29.0"
     version = VERSION
     # env!("CARGO_PKG_VERSION") only sees MAJOR.MINOR.PATCH, so the key salt uses
     # the same trimmed value the binary will compile with.
@@ -1234,6 +1424,8 @@ if __name__ == "__main__":
         # Linux bundle, built via WSL alongside the exe. Best-effort: a machine
         # without WSL/cargo still ships the Windows build above.
         build_linux_bundle(version)
+        # The Apple-Silicon bundle, cross-built in the same distro.
+        build_macos_bundle(version)
 
         removed, freed = prune_old_releases("release", version)
         if removed:

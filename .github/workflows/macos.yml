@@ -20,9 +20,9 @@ on:
         description: "Attach the bundle to a GitHub release for this tag (e.g. v2.28.2). Empty = artifact only."
         required: false
         default: ""
-  push:
-    tags:
-      - "v*"
+  # No `push: tags` trigger any more: the release bundle is built locally by
+  # build_rust.py with the private routes (D44). On a tag this job built a
+  # public build and `--clobber`ed it over the owner's asset.
 
 permissions:
   contents: write

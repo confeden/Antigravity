@@ -67,10 +67,22 @@ fn parse_egress(line: &str) -> Option<Egress> {
     })
 }
 
+/// Linux/macOS: the ISP link is the non-tunnel default route, and a tunnel is
+/// up when the routing table sends a public address through one (`netif`).
+#[cfg(not(target_os = "windows"))]
+pub fn detect() -> Option<Egress> {
+    let (if_index, vpn_active) = crate::netif::egress()?;
+    Some(Egress {
+        if_index,
+        vpn_active,
+    })
+}
+
 /// The default route that belongs to real hardware. `Get-NetAdapter -Physical`
 /// drops WireGuard/TAP tunnels and the Hyper-V/VMware virtual switches in one
 /// go, and requiring a real next hop drops host-only adapters, which carry a
 /// gateway address but no default route.
+#[cfg(target_os = "windows")]
 pub fn detect() -> Option<Egress> {
     const SCRIPT: &str = "\
 $phys=@(Get-NetAdapter -Physical -ErrorAction SilentlyContinue | \
