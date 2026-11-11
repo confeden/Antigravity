@@ -72,5 +72,5 @@ Gemini CLI не поддерживается: Google закрыл в нём вх
 🙋 **Группа в Телеграм:** [@nova_txt](https://t.me/nova_txt) — вопросы, новости,
 поддержка.
 
-☕ **[Отблагодарить](https://nova-app.eu/donate)** — если Antigravity Unlocker оказался полезным.
+❤ **[Благодарности](https://nova.gratis/donate)** — если Antigravity Unlocker оказался полезным.
 Это необязательный способ сказать "спасибо".

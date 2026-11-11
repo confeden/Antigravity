@@ -298,18 +298,43 @@ pub fn query(ep: &Endpoint, wire: &[u8], budget: Duration) -> Result<Vec<u8>, St
     answer
 }
 
+/// `query` for an endpoint whose addresses are not compiled in: the user's own
+/// DoH server, whose name is resolved at run time. Same walk, same kept
+/// connections - the certificate still has to prove `ep.host`.
+pub fn query_at(
+    ep: &Endpoint,
+    ips: &[IpAddr],
+    wire: &[u8],
+    budget: Duration,
+) -> Result<Vec<u8>, String> {
+    let answer = query_ips(&POOL, ep, ips, wire, budget);
+    if answer.is_ok() {
+        crate::net::note_reached();
+    }
+    answer
+}
+
 /// `query` over a given pool - separate so a test can count what one pool
 /// opened without the rest of the process sharing it.
 fn query_via(pool: &Pool, ep: &Endpoint, wire: &[u8], budget: Duration) -> Result<Vec<u8>, String> {
+    let ips: Vec<IpAddr> = ep.addrs.iter().filter_map(|a| a.parse().ok()).collect();
+    query_ips(pool, ep, &ips, wire, budget)
+}
+
+fn query_ips(
+    pool: &Pool,
+    ep: &Endpoint,
+    ips: &[IpAddr],
+    wire: &[u8],
+    budget: Duration,
+) -> Result<Vec<u8>, String> {
     let deadline = Instant::now() + budget;
     let mut last = "нет адресов".to_string();
-    let n = ep.addrs.len();
-    if n == 0 {
+    if ips.is_empty() {
         return Err(last);
     }
     let start = NEXT_ADDR.fetch_add(1, Ordering::Relaxed);
-    let ips: Vec<IpAddr> = ep.addrs.iter().filter_map(|a| a.parse().ok()).collect();
-    for ip in plan(&ips, start, Instant::now()) {
+    for ip in plan(ips, start, Instant::now()) {
         let now = Instant::now();
         if now >= deadline {
             break;

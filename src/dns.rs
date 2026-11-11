@@ -956,10 +956,13 @@ mod tests {
 
     #[test]
     fn without_the_relay_ipv6_is_listed_and_loopback_is_not() {
-        let servers = assemble_nameservers(false, &["45.155.204.190"]);
+        let servers = assemble_nameservers(false, &["31.25.239.132"]);
         assert!(!servers.iter().any(|s| s == dns_forwarder::LISTEN_IP));
-        assert!(
+        // Whatever v6 resolvers the pool has belong in the no-relay list (since
+        // 2.31.0 it has none: eu.geohide.ru is IPv4 only).
+        assert_eq!(
             servers.iter().any(|s| s.contains(':')),
+            !resolvers::all_v6().is_empty(),
             "v6 resolvers belong in the no-relay list: {:?}",
             servers
         );

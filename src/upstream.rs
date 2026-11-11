@@ -188,8 +188,9 @@ impl Route {
             }
             Err(why) => {
                 crate::dns_forwarder::log_proxy(&format!("{} не отвечает: {}", self.label, why));
+                if self.kind != crate::routes::Kind::Exits && crate::routes::is_streaming(self.kind) { return; }
                 if self.kind != crate::routes::Kind::Exits {
-                    crate::routes::record_failure(self.kind);
+                    crate::routes::probe_failed(self.kind);
                 }
                 self.health.probe_failed();
             }

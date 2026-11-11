@@ -174,7 +174,7 @@ dependencies = [
 
 [[package]]
 name = "ag_unlocker"
-version = "2.29.0"
+version = "2.31.1"
 dependencies = [
  "aes-gcm",
  "arboard",
@@ -192,6 +192,7 @@ dependencies = [
  "socket2",
  "webpki-roots",
  "wgpu",
+ "windows-sys 0.61.2",
  "winres",
 ]
 

@@ -219,26 +219,44 @@ mod windows_impl {
         // LastTaskResult 1 and there is no relay, while this function has already
         // reported success. Observed exactly once, which is once more than a
         // silent one should happen.
-        for attempt in 0..RELAY_START_TRIES {
-            thread::sleep(RELAY_START_SETTLE);
-            if is_running() {
-                return Ok(());
-            }
-            // Re-poke the task only twice, a few seconds apart: a cold first start
-            // (antivirus scan of a fresh exe in ProgramData) is slow, and a start
-            // request on top of a still-starting instance is ignored anyway.
-            if attempt + 1 < RELAY_START_TRIES && attempt % 4 == 3 {
-                powershell(&format!("Start-ScheduledTask -TaskName '{}'", TASK_NAME));
-            }
+        if wait_for_relay() {
+            return Ok(());
         }
         // Say what the task scheduler knows: 0x80070002 = the exe was blocked,
         // 0x1 = it ran and exited, 0x41303 = it never ran.
-        let last = powershell(&format!(
-            "'{{0:X}}' -f (Get-ScheduledTaskInfo -TaskName '{}').LastTaskResult",
-            TASK_NAME
-        ))
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .filter(|s| !s.is_empty());
+        let mut last = last_task_result();
+
+        // 0x41303 on a task that was just registered and started: the S4U
+        // principal was accepted by Register-ScheduledTask and then never run -
+        // Task Scheduler refuses a batch logon for the account (the right was
+        // withdrawn, a policy changed; seen 2026-11-11 with even a one-line test
+        // task, while an Interactive one ran at once, G93). The old principal is
+        // the fallback the comment above promises, so it is used for this too,
+        // not only when registering throws. Costs a console flash at logon.
+        if last.as_deref() == Some("41303") {
+            let cmd = format!(
+                "Stop-ScheduledTask -TaskName '{task}' -ErrorAction SilentlyContinue; \
+                 $a=New-ScheduledTaskAction -Execute '{exe}' -Argument '{flag}'; \
+                 $t=New-ScheduledTaskTrigger -AtLogOn; \
+                 $s=New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries \
+                      -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew \
+                      -ExecutionTimeLimit ([TimeSpan]::Zero) \
+                      -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1); \
+                 Register-ScheduledTask -TaskName '{task}' -Action $a -Trigger $t \
+                      -Settings $s -Description 'Antigravity Unlocker: локальный DNS-релей' \
+                      -Force -ErrorAction Stop | Out-Null; \
+                 Start-ScheduledTask -TaskName '{task}'",
+                exe = dst.display(),
+                flag = FORWARDER_FLAG,
+                task = TASK_NAME
+            );
+            if powershell(&cmd).is_some_and(|o| o.status.success()) {
+                if wait_for_relay() {
+                    return Ok(());
+                }
+                last = last_task_result();
+            }
+        }
         Err(match last {
             Some(code) => format!(
                 "задача создана, но релей не запустился (код задачи 0x{code}; подробности в forwarder.log)"
@@ -249,6 +267,33 @@ mod windows_impl {
 
     /// How long to give the relay to appear: about 18 s in all. A cold start of a
     /// fresh exe under antivirus can take well over the 3.6 s this used to allow.
+    /// Waits for the relay process to appear after its task was started.
+    fn wait_for_relay() -> bool {
+        for attempt in 0..RELAY_START_TRIES {
+            thread::sleep(RELAY_START_SETTLE);
+            if is_running() {
+                return true;
+            }
+            // Re-poke the task only twice, a few seconds apart: a cold first start
+            // (antivirus scan of a fresh exe in ProgramData) is slow, and a start
+            // request on top of a still-starting instance is ignored anyway.
+            if attempt + 1 < RELAY_START_TRIES && attempt % 4 == 3 {
+                powershell(&format!("Start-ScheduledTask -TaskName '{}'", TASK_NAME));
+            }
+        }
+        false
+    }
+
+    /// The task's last result as hex digits, or `None` when it cannot be read.
+    fn last_task_result() -> Option<String> {
+        powershell(&format!(
+            "'{{0:X}}' -f (Get-ScheduledTaskInfo -TaskName '{}').LastTaskResult",
+            TASK_NAME
+        ))
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+    }
+
     const RELAY_START_SETTLE: Duration = Duration::from_millis(1500);
     const RELAY_START_TRIES: usize = 12;
 
@@ -316,7 +361,15 @@ mod windows_impl {
         if is_enabled() && is_running() && installed_copy_is_current() {
             return Ok(());
         }
-        enable()
+        enable()?;
+        if is_watchdog_enabled() && crate::settings::auto_patch_wanted() {
+            if let Err(e) = enable_watchdog() {
+                // DNS is already running. A launch-filter conflict must not
+                // report a failed DNS start or prevent its rules being applied.
+                crate::watchdog::log(&format!("DNS helper upgraded; Desktop launch guard unavailable: {e}"));
+            }
+        }
+        Ok(())
     }
 
     /// Puts this build in `%ProgramData%` for the watchdog task **without**
@@ -367,6 +420,7 @@ mod windows_impl {
         if !exe.exists() {
             return Err("exe не установлен в %ProgramData%".to_string());
         }
+        crate::launch_guard::install()?;
         let cmd = format!(
             "Stop-ScheduledTask -TaskName '{task}' -ErrorAction SilentlyContinue; \
              $a=New-ScheduledTaskAction -Execute '{exe}' -Argument '{flag}'; \
@@ -401,6 +455,9 @@ mod windows_impl {
     /// task's own process instance, so it does not disturb the relay (which shares
     /// the exe image name). Called by both undo paths alongside the relay teardown.
     pub fn disable_watchdog() {
+        if let Err(e) = crate::launch_guard::uninstall() {
+            crate::watchdog::log(&format!("Could not remove Desktop launch guard: {e}"));
+        }
         let cmd = format!(
             "Stop-ScheduledTask -TaskName '{task}' -ErrorAction SilentlyContinue; \
              Unregister-ScheduledTask -TaskName '{task}' -Confirm:$false -ErrorAction SilentlyContinue",
@@ -410,6 +467,9 @@ mod windows_impl {
     }
 
     pub fn disable() -> Result<(), String> {
+        // Never remove the executable while Windows still redirects launches
+        // to it. A failed registry operation must leave the helper available.
+        crate::launch_guard::uninstall()?;
         let cmd = format!(
             "Stop-ScheduledTask -TaskName '{task}' -ErrorAction SilentlyContinue; \
              Unregister-ScheduledTask -TaskName '{task}' -Confirm:$false -ErrorAction SilentlyContinue",

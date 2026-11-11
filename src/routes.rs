@@ -135,7 +135,7 @@ fn pinned_now() -> [Kind; 2] {
 }
 
 /// A measurement older than this says nothing about the route now. Probes run
-/// every two minutes; three misses in a row and the route is unmeasured again.
+/// every ten minutes; a stale sample is forgotten between checks.
 const SAMPLE_TTL: Duration = Duration::from_secs(15 * 60);
 
 /// How much faster a challenger must measure to take the lead, in percent.
@@ -226,7 +226,7 @@ const STUMBLE_FOR: Duration = Duration::from_secs(60);
 /// cannot answer a probe out of the way until one succeeds, and no longer: the
 /// first successful probe `record`s a sample, and the stumble expires on its
 /// own.
-const PROBE_STUMBLE_FOR: Duration = Duration::from_secs(3 * 60);
+const PROBE_STUMBLE_FOR: Duration = Duration::from_secs(12 * 60);
 
 /// How long a route whose live tunnel went **silent** sits behind the others:
 /// it opened, the client spoke, and nothing came back before the tunnel closed.
@@ -356,6 +356,9 @@ pub fn record_failure(kind: Kind) {
 /// Not for a probe that was never applicable - a VPN row with no tunnel up is
 /// unmeasured, not failing - only for one that tried and got nothing.
 pub fn probe_failed(kind: Kind) {
+    // Background checks use separate connections. A failed new connection is
+    // weaker evidence than a model answer on the still-open current one.
+    if is_streaming(kind) { return; }
     record_failure(kind);
     stumble_for(kind, PROBE_STUMBLE_FOR);
 }
@@ -589,7 +592,14 @@ pub fn order(usable: impl Fn(Kind) -> bool) -> Vec<Kind> {
         return if usable(k) { vec![k] } else { Vec::new() };
     }
     let s = snapshot();
-    order_with(&s, usable)
+    let mut ordered = order_with(&s, usable);
+    if let Some(leader) = s.leader.filter(|k| is_streaming(*k)) {
+        if let Some(pos) = ordered.iter().position(|k| *k == leader) {
+            ordered.remove(pos);
+            ordered.insert(0, leader);
+        }
+    }
+    ordered
 }
 
 /// The route a diagnostic run pinned in `settings.json` (`debug_route`).
@@ -663,6 +673,7 @@ pub fn leader() -> Option<Kind> {
 /// in the log when it changed. Run once per warm pass, after the probes.
 pub fn refresh_leader(usable: impl Fn(Kind) -> bool) {
     let s = snapshot();
+    if s.leader.is_some_and(is_streaming) { return; }
     let order = order_with(&s, usable);
     let Some(&best) = order.first() else {
         return;
@@ -862,6 +873,8 @@ struct Tunnel {
     /// pools can sit on different routes - an event about one host must not be
     /// pinned on the other's tunnel.
     host: String,
+    /// Kept after close, so delayed client log lines still identify a DNS IP.
+    peer: Option<std::net::Ipv4Addr>,
     opened: Instant,
     closed: Option<Instant>,
     /// When a model answer was attributed to *this* tunnel. The one fact that
@@ -941,6 +954,10 @@ pub fn attach_upstream(upstream: &TcpStream) {
     };
     if let Ok(mut list) = TUNNELS.lock() {
         if let Some(t) = list.iter_mut().find(|t| t.id == id && t.closed.is_none()) {
+            t.peer = upstream.peer_addr().ok().and_then(|a| match a.ip() {
+                std::net::IpAddr::V4(ip) => Some(ip),
+                _ => None,
+            });
             t.upstream = Some(clone);
         }
     }
@@ -1044,6 +1061,7 @@ pub fn note_used(kind: Kind) {
             id,
             kind,
             host,
+            peer: None,
             opened: now,
             closed: None,
             answered_at: None,
@@ -1156,6 +1174,22 @@ pub fn credit_tunnel(id: u64) {
             t.answered_at = Some(Instant::now());
         }
     }
+}
+
+pub fn dns_endpoint(id: u64) -> Option<(String, std::net::Ipv4Addr)> {
+    let list = TUNNELS.lock().ok()?;
+    let tunnel = list.iter().find(|t| t.id == id && t.kind == Kind::Direct)?;
+    Some((tunnel.host.clone(), tunnel.peer?))
+}
+
+pub fn streaming_dns_endpoints(host: &str) -> Vec<std::net::Ipv4Addr> {
+    let Ok(list) = TUNNELS.lock() else { return Vec::new(); };
+    list.iter().filter(|t| t.kind == Kind::Direct && t.host == host
+        && t.closed.is_none() && t.answered_at.is_some()).filter_map(|t| t.peer).collect()
+}
+
+pub fn is_streaming(kind: Kind) -> bool {
+    live_answer(kind).is_some()
 }
 
 /// What one gate connection looks like, for the line the log writes when a
@@ -1889,6 +1923,16 @@ mod tests {
         credit_tunnel(id);
         // The answer hands the client bytes, the way a stream does.
         activity.to_client(8 * 1024);
+
+        record(Kind::Exits, ms(300));
+        refresh_leader(|k| k == Kind::Exits);
+        let measured = latency(Kind::Exits);
+        probe_failed(Kind::Exits);
+        record(Kind::Relay, ms(1));
+        refresh_leader(|k| matches!(k, Kind::Exits | Kind::Relay));
+        assert_eq!(latency(Kind::Exits), measured, "a failed background probe cannot erase live proof");
+        assert_eq!(leader(), Some(Kind::Exits), "a faster probe cannot move a streaming leader");
+        assert_eq!(order(|k| matches!(k, Kind::Exits | Kind::Relay))[0], Kind::Exits);
 
         match blame(Kind::Exits) {
             Blamed::Streaming { to_client, .. } => assert_eq!(to_client, 8 * 1024),

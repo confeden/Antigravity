@@ -557,6 +557,10 @@ impl App {
                     return;
                 }
                 if let Some(p) = self.status.as_ref().and_then(|s| s.providers.get(i)) {
+                    if !p.available {
+                        self.toast("Свой DNS не задан — добавьте сервер в поле ниже.");
+                        return;
+                    }
                     self.worker
                         .send(Cmd::SetProvider(p.name.clone(), !p.enabled));
                 }
@@ -743,7 +747,6 @@ impl App {
             }
             rows.push(Row::CustomDnsText);
             rows.push(Row::Cap(Cap::LocalProxy));
-            rows.push(Row::Cap(Cap::BuiltinExits));
             rows.push(Row::Cap(Cap::GroupProxy));
             rows.push(Row::GroupProxyText);
             rows.push(Row::GroupProxyOpenRoom);
@@ -786,7 +789,7 @@ impl App {
             Row::GroupProxyOpenRoom => "Открыть Telegram-комнату для получения ключа.".into(),
             Row::GroupProxyCopy => "Скопировать команду для получения ключа.".into(),
             Row::GroupProxyPaste => "Вставить полученный ключ из буфера обмена.".into(),
-            Row::CustomDnsText => "Enter — задать свой DNS: IPv4-адреса через пробел.".into(),
+            Row::CustomDnsText => "Enter — задать свой DNS: IPv4, https://… (DoH) или tls://… (DoT) через пробел.".into(),
             Row::OwnProxyText => {
                 "Enter — изменить адрес: логин:пароль@адрес:порт (или адрес:порт без пароля).".into()
             }

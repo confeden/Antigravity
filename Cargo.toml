@@ -1,6 +1,6 @@
 [package]
 name = "ag_unlocker"
-version = "2.29.0"
+version = "2.31.1"
 edition = "2021"
 description = "Antigravity Configuration Tool"
 authors = ["Brent t.me/nova_txt"]
@@ -45,6 +45,7 @@ ratatui = { version = "0.30", default-features = false, features = ["crossterm"]
 # window ever opened, whichever adapter would have been chosen. D3D12 and its
 # software rasteriser WARP ship with every Windows 10, so nothing else is needed.
 [target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Threading", "Win32_System_Diagnostics_Debug"] }
 eframe = { version = "0.36", default-features = false, features = ["accesskit", "default_fonts", "links", "wgpu_no_default_features", "glow"] }
 wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "wgsl", "dx12"] }
 

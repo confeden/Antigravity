@@ -24,7 +24,9 @@ mod canary;
 mod dns;
 mod dns_client;
 mod dns_forwarder;
+mod dns_route;
 mod doh;
+mod dot;
 mod egress;
 mod elevate;
 mod endpoint;
@@ -36,6 +38,8 @@ mod health;
 mod hosts_pin;
 mod hwid;
 mod instances;
+#[cfg(windows)]
+mod launch_guard;
 mod loopback;
 mod ls_log;
 #[cfg(target_os = "macos")]
@@ -51,6 +55,7 @@ mod proxy;
 mod resolvers;
 mod routes;
 mod settings;
+mod stale_env;
 mod tui;
 mod update;
 mod upstream;
@@ -614,6 +619,11 @@ pub fn install_label(install: &Path) -> &'static str {
 }
 
 fn main() {
+    #[cfg(windows)]
+    if env::args_os().nth(1).is_some_and(|a| a == launch_guard::FLAG) {
+        launch_guard::run();
+        return;
+    }
     if env::args().skip(1).any(|a| {
         matches!(
             a.trim_start_matches('-').to_ascii_lowercase().as_str(),

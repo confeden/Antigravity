@@ -77,7 +77,6 @@ pub struct Settings {
     /// on when any of its parts is, which keeps one truth instead of two.
     pub dns: bool,
     pub local_proxy: bool,
-    pub builtin_exits: bool,
     pub group_proxy: bool,
 
     /// Diagnostics only, set by hand in `settings.json`, never by the window:
@@ -158,7 +157,6 @@ impl Default for Settings {
             decline_unrecorded: false,
             dns: true,
             local_proxy: true,
-            builtin_exits: true,
             group_proxy: true,
             debug_route: String::new(),
             disabled_providers: Vec::new(),
@@ -354,7 +352,10 @@ fn cached() -> Settings {
 
 #[cfg(not(test))]
 fn cached_from_disk() -> Settings {
-    const TTL: Duration = Duration::from_secs(20);
+    // Short on purpose: a switch flipped in the window has to reach the running
+    // relay within a couple of seconds, not half a minute. One small file read
+    // per TTL is nothing next to the DNS queries it sits behind.
+    const TTL: Duration = Duration::from_secs(2);
 
     if let Ok(guard) = CACHE.lock() {
         if let Some((s, at)) = guard.as_ref() {
@@ -378,9 +379,28 @@ fn cached_from_disk() -> Settings {
             .unwrap_or_else(Settings::unreadable),
     };
     if let Ok(mut guard) = CACHE.lock() {
+        let changed = guard.as_ref().is_some_and(|(old, _)| {
+            old.disabled_providers != fresh.disabled_providers
+                || old.provider_order != fresh.provider_order
+                || old.custom_dns != fresh.custom_dns
+                || old.rotate_providers != fresh.rotate_providers
+        });
+        if changed {
+            EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         *guard = Some((fresh.clone(), Instant::now()));
     }
     fresh
+}
+
+/// Bumped whenever a re-read finds the DNS pool's settings changed (a provider
+/// switched, reordered, the user's server edited, rotation flipped). The pool
+/// keeps a decision for minutes and a vetted answer for seconds; both were made
+/// under the old settings, so they compare this and start over when it moved.
+static EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn pool_epoch() -> u64 {
+    EPOCH.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 pub fn custom_dns_cached() -> String {
@@ -455,9 +475,6 @@ pub fn debug_route() -> String {
     cached().debug_route.clone()
 }
 
-pub fn builtin_exits_enabled() -> bool {
-    cached().builtin_exits
-}
 
 #[cfg(test)]
 mod tests {
@@ -468,7 +485,7 @@ mod tests {
         // Nothing has been written in a test process, so this exercises the
         // "first run" path that every new user takes.
         let s = Settings::default();
-        assert!(s.dns && s.local_proxy && s.builtin_exits && s.group_proxy && s.auto_patch);
+        assert!(s.dns && s.local_proxy && s.group_proxy && s.auto_patch);
         assert!(s.rotate_providers, "the pool races by default");
         assert!(
             !s.client_patch,

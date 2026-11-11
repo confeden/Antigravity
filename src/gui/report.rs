@@ -183,7 +183,6 @@ fn status_part(out: &mut String, s: &Status) {
     let _ = writeln!(out, "Автопатч: {}", onoff(&s.watchdog));
     let _ = writeln!(out, "Обход через DNS: {}", onoff(&s.dns));
     let _ = writeln!(out, "Локальный прокси: {}", onoff(&s.local_proxy));
-    let _ = writeln!(out, "Встроенные выходы: {}", onoff(&s.builtin_exits));
     let key_present = if crate::settings::group_key().is_empty() {
         "нет"
     } else {

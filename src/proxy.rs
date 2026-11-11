@@ -153,6 +153,18 @@ pub use exits::probe_health as probe_exits;
 #[cfg(not(exits))]
 pub fn probe_exits() {}
 
+/// The built-in exits' addresses, for the window to show (owner, 2.31.0). Empty
+/// in a build without them.
+#[cfg(exits)]
+pub fn exit_addresses() -> Vec<String> {
+    exits::addresses()
+}
+
+#[cfg(not(exits))]
+pub fn exit_addresses() -> Vec<String> {
+    Vec::new()
+}
+
 // The byte pump's timings, the upstream handshake and `would_block` below are
 // the primitives the private relay module is built on, and its only users. A
 // public build has no such module, so each is marked dead-code-allowed under
@@ -497,31 +509,15 @@ fn try_direct(mut client: TcpStream, host: &str, port: u16) -> Result<(), TcpStr
 /// route to 400s that the log called «the DNS route».
 fn gate_direct_addrs(host: &str, port: u16) -> Result<(Vec<std::net::SocketAddr>, u32), String> {
     let if_index = crate::net::pin_interface();
-    let (addrs, _, verdict) = crate::resolvers::direct_addrs(host, if_index)
-        .ok_or_else(|| "имя не разрешилось".to_string())?;
-    // Outside Windows nothing stands down for a tunnel (D13) - the client
-    // reaches us through the proxy variable, not a DNS answer - and the user's
-    // VPN has a row of its own (`Kind::Vpn`), so Google's own address here is
-    // the gate and nothing else: the next route in the table takes it instead.
-    if !cfg!(target_os = "windows") && verdict != crate::resolvers::Verdict::Substituted {
-        return Err(
-            "сервисы разблокировки не подменили адрес — напрямую будет ошибка 400".to_string(),
-        );
+    let addrs = crate::dns_route::addresses(host);
+    if addrs.is_empty() {
+        return Err("нет проверенных доступных DNS-прокси".into());
     }
-    // While the relay stands down for a tunnel the answer is genuine Google,
-    // reached through that tunnel; pinning it to the ISP link would take it out
-    // of the tunnel and into the gate.
-    let pin =
-        if crate::resolvers::vpn_is_active() || verdict != crate::resolvers::Verdict::Substituted {
-            0
-        } else {
-            if_index
-        };
     let addrs = addrs
         .into_iter()
         .map(|a| std::net::SocketAddr::from((a, port)))
         .collect();
-    Ok((addrs, pin))
+    Ok((addrs, if_index))
 }
 
 fn connect_gate_direct(host: &str, port: u16, budget: Duration) -> Result<TcpStream, String> {
@@ -652,7 +648,7 @@ pub fn route_usable(kind: routes::Kind, host: &str) -> bool {
         // from. Off means the route is simply not usable, which the table
         // already knows how to deal with - it is the same answer an exit that
         // failed its probe gives.
-        routes::Kind::Exits => crate::settings::builtin_exits_enabled() && exits_available(),
+        routes::Kind::Exits => exits_available(),
         routes::Kind::Relay => relay_usable(),
         routes::Kind::Direct => direct_usable(host),
         routes::Kind::Vpn => vpn_usable(),
@@ -666,13 +662,7 @@ pub fn route_usable(kind: routes::Kind, host: &str) -> bool {
 /// do (S37): a needless hop costs one connection, a missing route costs every
 /// request.
 fn direct_usable(host: &str) -> bool {
-    if crate::resolvers::vpn_is_active() {
-        return true;
-    }
-    !matches!(
-        crate::resolvers::served_verdict(host),
-        Some(crate::resolvers::Verdict::Passthrough) | Some(crate::resolvers::Verdict::Sibling)
-    )
+    !crate::dns_route::addresses(host).is_empty()
 }
 
 #[cfg(exits)]
@@ -710,20 +700,146 @@ const DIRECT_PROBE_BUDGET: Duration = Duration::from_secs(15);
 /// Resolves through the relay's own pool, so it measures the address a client
 /// would be handed - a substituted proxy normally, the tunnel's genuine Google
 /// while the relay stands down for a VPN.
-pub fn probe_direct(if_index: u32) {
+pub(crate) fn probe_dns_endpoint(host: &str, ip: Ipv4Addr, pin: u32) -> crate::dns_route::Probe {
     let started = Instant::now();
-    match probe_direct_once(if_index) {
-        Ok(()) => routes::record(routes::Kind::Direct, started.elapsed()),
-        Err(why) => {
-            routes::probe_failed(routes::Kind::Direct);
-            crate::dns_forwarder::log_proxy(&format!("напрямую не отвечает: {}", why));
-        }
+    let probe = (|| {
+        let mut sock = crate::net::connect((ip, 443).into(), Duration::from_secs(3), pin)
+            .map_err(|e| e.to_string())?;
+        sock.set_read_timeout(Some(Duration::from_secs(3))).map_err(|e| e.to_string())?;
+        sock.set_write_timeout(Some(Duration::from_secs(3))).map_err(|e| e.to_string())?;
+        let cutoff = sock.try_clone().map_err(|e| e.to_string())?;
+        thread::scope(|scope| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            scope.spawn(move || {
+                if matches!(rx.recv_timeout(Duration::from_secs(6)), Err(std::sync::mpsc::RecvTimeoutError::Timeout)) {
+                    let _ = cutoff.shutdown(std::net::Shutdown::Both);
+                }
+            });
+            let result = (|| {
+                let name = rustls::pki_types::ServerName::try_from(host.to_string()).map_err(|e| e.to_string())?;
+                let mut tls = ClientConnection::new(probe_config(), name).map_err(|e| e.to_string())?;
+                let mut stream = rustls::Stream::new(&mut tls, &mut sock);
+                write!(stream, "POST /v1internal:loadCodeAssist HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nContent-Length: 2\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n{{}}")
+                    .map_err(dns_probe_io_error)?;
+                let response = read_dns_probe(&mut stream)?;
+                classify_dns_probe(&response, started.elapsed())
+            })();
+            // Cancels the deadline even on TLS/HTTP failure; no detached timers.
+            let _ = tx.send(());
+            result
+        })
+    })();
+    probe.unwrap_or_else(crate::dns_route::Probe::Failed)
+}
+
+fn dns_probe_io_error(error: io::Error) -> String {
+    // A certificate's SANs can identify a private upstream. Log the validation
+    // failure without copying those names into a report or a public log.
+    if matches!(error.get_ref().and_then(|e| e.downcast_ref::<rustls::Error>()),
+        Some(rustls::Error::InvalidCertificate(_))) {
+        "TLS certificate validation failed for the requested Google host".into()
+    } else {
+        error.to_string()
     }
 }
 
-fn probe_direct_once(_if_index: u32) -> Result<(), String> {
-    let sock = connect_gate_direct(DIRECT_PROBE_HOST, 443, DIRECT_OPEN_BUDGET)?;
-    probe_request(sock)
+/// Stop on the HTTP message boundary, not TLS close_notify: some proxies keep
+/// the connection open or close TCP without a TLS shutdown after a whole reply.
+fn read_dns_probe(reader: &mut impl Read) -> Result<Vec<u8>, String> {
+    let mut raw = Vec::new();
+    loop {
+        if raw.len() >= 16 * 1024 { return Err("DNS probe response is too large".into()); }
+        let mut buf = [0; 1024];
+        let n = reader.read(&mut buf).map_err(dns_probe_io_error)?;
+        raw.extend_from_slice(&buf[..n]);
+        if let Some(end) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+            let head = String::from_utf8_lossy(&raw[..end]).to_ascii_lowercase();
+            let body = &raw[end + 4..];
+            if head.lines().any(|l| l.starts_with("transfer-encoding:") && l.contains("chunked")) {
+                if let Some(decoded) = dns_probe_chunks(body)? {
+                    let mut response = raw[..end + 4].to_vec();
+                    response.extend(decoded);
+                    return Ok(response);
+                }
+            } else if let Some(length) = head.lines().find_map(|l| l.strip_prefix("content-length:")) {
+                let length: usize = length.trim().parse().map_err(|_| "invalid probe Content-Length")?;
+                if length > 16 * 1024 { return Err("DNS probe body is too large".into()); }
+                if body.len() >= length { return Ok(raw[..end + 4 + length].to_vec()); }
+            } else if n == 0 {
+                return Ok(raw);
+            }
+        }
+        if n == 0 { return Err("truncated DNS probe response".into()); }
+    }
+}
+
+fn dns_probe_chunks(mut raw: &[u8]) -> Result<Option<Vec<u8>>, String> {
+    let mut out = Vec::new();
+    loop {
+        let Some(end) = raw.windows(2).position(|w| w == b"\r\n") else { return Ok(None); };
+        let line = std::str::from_utf8(&raw[..end]).map_err(|_| "invalid probe chunk")?;
+        let size = usize::from_str_radix(line.split(';').next().unwrap_or("").trim(), 16)
+            .map_err(|_| "invalid probe chunk size")?;
+        raw = &raw[end + 2..];
+        if size == 0 {
+            return Ok((raw.starts_with(b"\r\n") || raw.windows(4).any(|w| w == b"\r\n\r\n")).then_some(out));
+        }
+        let end = size.checked_add(2).filter(|n| *n <= 16 * 1024).ok_or("probe chunk too large")?;
+        if raw.len() < end { return Ok(None); }
+        if &raw[size..end] != b"\r\n" { return Err("invalid probe chunk boundary".into()); }
+        out.extend_from_slice(&raw[..size]);
+        raw = &raw[end..];
+    }
+}
+
+fn classify_dns_probe(response: &[u8], latency: Duration) -> Result<crate::dns_route::Probe, String> {
+    let text = String::from_utf8_lossy(response).to_ascii_lowercase();
+    let status = text.lines().next().and_then(|line| {
+        let mut parts = line.split_whitespace();
+        parts.next().filter(|v| v.starts_with("http/"))?;
+        parts.next()?.parse::<u16>().ok()
+    }).ok_or("ответ не похож на HTTP")?;
+    if text.contains("user location is not supported") {
+        return Ok(crate::dns_route::Probe::Refused);
+    }
+    match status {
+        200..=299 | 401 | 403 | 404 => Ok(crate::dns_route::Probe::Reachable(latency)),
+        _ => Err(format!("Google HTTP {status}")),
+    }
+}
+
+#[cfg(test)]
+mod dns_probe_tests {
+    use super::*;
+
+    #[test]
+    fn reads_a_complete_reply_without_waiting_for_tls_shutdown() {
+        struct Reply;
+        impl Read for Reply {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                let reply = b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 2\r\n\r\n{}";
+                if buf.len() < reply.len() { panic!("fixture buffer too small"); }
+                buf[..reply.len()].copy_from_slice(reply);
+                Ok(reply.len())
+            }
+        }
+        let response = read_dns_probe(&mut Reply).unwrap();
+        assert!(matches!(classify_dns_probe(&response, Duration::ZERO), Ok(crate::dns_route::Probe::Reachable(_))));
+    }
+
+    #[test]
+    fn a_chunked_region_refusal_is_not_a_reachable_proxy() {
+        let raw = b"HTTP/1.1 400 Bad Request\r\nTransfer-Encoding: chunked\r\n\r\nc\r\nUser locatio\r\n12\r\nn is not supported\r\n0\r\n\r\n";
+        let response = read_dns_probe(&mut &raw[..]).unwrap();
+        assert!(matches!(classify_dns_probe(&response, Duration::ZERO), Ok(crate::dns_route::Probe::Refused)));
+    }
+
+    #[test]
+    fn truncated_or_failing_http_is_not_accepted() {
+        assert!(read_dns_probe(&mut &b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 8\r\n\r\n{}"[..]).is_err());
+        assert!(read_dns_probe(&mut &b"HTTP/1.1 400 Bad Request\r\nTransfer-Encoding: chunked\r\n\r\nffffffffff\r\n"[..]).is_err());
+        assert!(classify_dns_probe(b"HTTP/1.1 503 Unavailable\r\n\r\n", Duration::ZERO).is_err());
+    }
 }
 
 /// Times the user's VPN as a route, the same request as the others. Only while

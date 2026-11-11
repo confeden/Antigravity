@@ -53,8 +53,6 @@ pub enum Cap {
     LocalProxy,
     /// The user's own HTTP proxy.
     OwnProxy,
-    /// The built-in permitted-region exits.
-    BuiltinExits,
     GroupProxy,
     /// Whether the DNS pool rotates, or only its first enabled member answers.
     DnsRotation,
@@ -78,7 +76,6 @@ impl Cap {
             Cap::Dns => "Обход через DNS",
             Cap::LocalProxy => "Локальный прокси",
             Cap::OwnProxy => "Свой HTTP-прокси",
-            Cap::BuiltinExits => "Встроенные выходы",
             Cap::GroupProxy => "Прокси из группы",
             Cap::DnsRotation => "Ротация DNS-серверов",
         }
@@ -183,6 +180,9 @@ pub enum VpnSeen {
 pub struct ProviderRow {
     pub name: String,
     pub enabled: bool,
+    /// False only for the «свой DNS» slot while the user has put nothing in it:
+    /// drawn off and not switchable.
+    pub available: bool,
 }
 
 /// A whole-system snapshot. Produced on the worker, rendered on the UI thread.
@@ -195,7 +195,6 @@ pub struct Status {
     pub dns: State,
     pub local_proxy: State,
     pub own_proxy: State,
-    pub builtin_exits: State,
     pub group_proxy: State,
     pub dns_rotation: State,
     /// What the last measurement saw. `None` means it has not been taken yet;
@@ -232,7 +231,6 @@ impl Status {
             Cap::Dns => &self.dns,
             Cap::LocalProxy => &self.local_proxy,
             Cap::OwnProxy => &self.own_proxy,
-            Cap::BuiltinExits => &self.builtin_exits,
             Cap::GroupProxy => &self.group_proxy,
             Cap::DnsRotation => &self.dns_rotation,
         }
@@ -243,7 +241,6 @@ impl Status {
     pub fn bypass_on(&self) -> bool {
         self.dns.is_on()
             || self.local_proxy.is_on()
-            || self.builtin_exits.is_on()
             || self.group_proxy.is_on()
             || self.own_proxy.is_on()
     }
@@ -261,14 +258,12 @@ pub fn bypass_order(on: bool) -> Vec<Cap> {
         vec![
             Cap::Dns,
             Cap::LocalProxy,
-            Cap::BuiltinExits,
             Cap::GroupProxy,
         ]
     } else {
         vec![
             Cap::LocalProxy,
             Cap::OwnProxy,
-            Cap::BuiltinExits,
             Cap::GroupProxy,
             Cap::Dns,
         ]
@@ -570,6 +565,12 @@ fn run_worker(
                     ctx.settings.manual_paths.push(p);
                     ctx.settings.save();
                 }
+                #[cfg(windows)]
+                if is_admin() && ctx.settings.auto_patch_wanted() && background::is_watchdog_enabled() {
+                    if let Err(e) = crate::launch_guard::install() {
+                        ctx.log(Level::Warn, format!("Защита запуска Desktop не обновлена: {e}"));
+                    }
+                }
                 ctx.busy(Some("Проверка установок"));
                 push_status(&mut ctx, Scan::Deep);
                 // The path the user just pointed at is an install found at last.
@@ -660,12 +661,6 @@ fn run_worker(
                         Level::Warn,
                         "Нельзя отключить все DNS-серверы — хотя бы один должен остаться.",
                     );
-                } else if !on && no_usable_nameserver(&ctx.settings) {
-                    ctx.settings.set_provider_enabled(&name, true);
-                    ctx.log(
-                        Level::Warn,
-                        "Этот сервер нельзя отключить: он остался единственным, который Windows может использовать как DNS-сервер напрямую.",
-                    );
                 } else {
                     ctx.log(
                         Level::Info,
@@ -681,17 +676,20 @@ fn run_worker(
                     );
                 }
                 ctx.settings.save();
-                let rewrote = reapply_dns_rules(&mut ctx);
-                // Only when the rules were actually rewritten is there anything
-                // new on the machine to read back.
-                push_status(
-                    &mut ctx,
-                    if rewrote {
-                        Scan::System
-                    } else {
-                        Scan::Settings
-                    },
-                );
+                // The switch is shown as flipped **now**: the file is written and
+                // the relay re-reads it within seconds. Rewriting the NRPT rules
+                // is PowerShell and takes a second or more, so it comes after,
+                // and only when the flipped provider is one of the addresses
+                // those rules list (a DoH or user-typed server is not).
+                push_status(&mut ctx, Scan::Settings);
+                let in_rules = crate::resolvers::udp_provider_names()
+                    .iter()
+                    .any(|n| n.eq_ignore_ascii_case(&name));
+                if in_rules && reapply_dns_rules(&mut ctx) {
+                    // Only when the rules were actually rewritten is there
+                    // anything new on the machine to read back.
+                    push_status(&mut ctx, Scan::System);
+                }
             }
         }
     }
@@ -721,22 +719,21 @@ fn startup_housekeeping(ctx: &mut Ctx) {
     }
 }
 
+/// Whether the provider can be asked at all: everything can, except the user's
+/// own slot while it is empty.
+fn provider_available(s: &Settings, name: &str) -> bool {
+    name != crate::resolvers::CUSTOM_NAME || !s.custom_dns.trim().is_empty()
+}
+
+/// What the window draws: switched on **and** there is something to ask.
+fn provider_on(s: &Settings, name: &str) -> bool {
+    s.provider_enabled(name) && provider_available(s, name)
+}
+
 fn all_providers_disabled(s: &Settings) -> bool {
     crate::resolvers::provider_names()
         .iter()
-        .all(|n| !s.provider_enabled(n))
-}
-
-/// Whether the selection would leave the NRPT rule with no nameserver.
-///
-/// The pool would still resolve — the head of the list speaks DoH through the
-/// relay — but Windows itself would be pointed at nothing, so any lookup that
-/// bypasses the relay (it stopped, it is being upgraded) fails outright instead
-/// of falling back. I49.
-fn no_usable_nameserver(s: &Settings) -> bool {
-    crate::resolvers::udp_provider_names()
-        .iter()
-        .all(|n| !s.provider_enabled(n))
+        .all(|n| !provider_on(s, n))
 }
 
 /// The one that answers when rotation is off: first in pool order that the user
@@ -745,7 +742,7 @@ fn no_usable_nameserver(s: &Settings) -> bool {
 fn first_enabled_provider(s: &Settings) -> Option<&'static str> {
     crate::resolvers::ordered_provider_names()
         .into_iter()
-        .find(|n| s.provider_enabled(n))
+        .find(|n| provider_on(s, n))
 }
 
 // ---------------------------------------------------------------------------
@@ -755,7 +752,7 @@ fn first_enabled_provider(s: &Settings) -> Option<&'static str> {
 /// How much of the system has to be re-read after `cap` was flipped.
 ///
 /// The rule is "what could this switch have changed", not "how important is it":
-/// `VerifyTls`, `VpnDetect` and `BuiltinExits` write one field of `settings.json`
+/// `VerifyTls`, `VpnDetect` and `GroupProxy` write one field of `settings.json`
 /// and nothing else, so asking Windows about scheduled tasks, NRPT rules and the
 /// user environment afterwards is two seconds of latency buying a byte-identical
 /// answer.
@@ -767,7 +764,7 @@ fn scan_after(cap: Cap) -> Scan {
         Cap::Watchdog | Cap::Dns | Cap::LocalProxy | Cap::OwnProxy | Cap::DnsRotation => {
             Scan::System
         }
-        Cap::BuiltinExits | Cap::GroupProxy => Scan::Settings,
+        Cap::GroupProxy => Scan::Settings,
     }
 }
 
@@ -848,7 +845,6 @@ impl Status {
     /// `settings_only_status` cannot drift apart — the bug that would produce is
     /// a switch that answers differently depending on which path drew it.
     fn with_settings_switches(mut self, s: &Settings) -> Self {
-        self.builtin_exits = on_off(s.builtin_exits);
         self.group_proxy = on_off(s.group_proxy);
         self.custom_dns_text = s.custom_dns.clone();
         self.dns_rotation = if s.rotate_providers {
@@ -866,7 +862,8 @@ impl Status {
             .iter()
             .map(|n| ProviderRow {
                 name: (*n).to_string(),
-                enabled: s.provider_enabled(n),
+                enabled: provider_on(s, n),
+                available: provider_available(s, n),
             })
             .collect();
         self
@@ -949,7 +946,6 @@ fn read_status(ctx: &mut Ctx, deep: bool) -> Status {
         own_proxy,
         own_proxy_text,
         custom_dns_text: ctx.settings.custom_dns.clone(),
-        builtin_exits: State::Off,
         group_proxy: State::Off,
         vpn: ctx.vpn,
         dns_rotation: State::Off,
@@ -1338,22 +1334,6 @@ fn apply(ctx: &mut Ctx, cap: Cap, on: bool) {
                 },
             );
         }
-        (Cap::BuiltinExits, on) => {
-            ctx.settings.builtin_exits = on;
-            ctx.log(
-                Level::Ok,
-                if on {
-                    "Встроенные выходы включены."
-                } else {
-                    "Встроенные выходы отключены."
-                },
-            );
-            if on {
-                ensure_route_carrier(ctx);
-            } else {
-                release_route_carrier(ctx);
-            }
-        }
         (Cap::GroupProxy, on) => {
             ctx.settings.group_proxy = on;
             ctx.log(
@@ -1392,7 +1372,6 @@ fn enable_all(ctx: &mut Ctx) {
     }
     // Nothing but a line in settings.json, so it needs nobody's permission.
     // The service they ride on is brought up below, with DNS.
-    ctx.settings.builtin_exits = true;
     ctx.settings.group_proxy = true;
     let dns_on =
         dns::is_nrpt_applied() && background::is_running() && !background::relay_is_outdated();
@@ -1548,7 +1527,7 @@ fn patch_found(ctx: &mut Ctx, found: Vec<(&'static str, PathBuf)>) -> bool {
                 patch_binary::RepatchOutcome::Repatched(_) => patched += 1,
                 patch_binary::RepatchOutcome::AlreadyPatched => {}
                 patch_binary::RepatchOutcome::SignatureMissing => unknown += 1,
-                patch_binary::RepatchOutcome::Failed(e) => failed = Some(e),
+                patch_binary::RepatchOutcome::Failed(e) | patch_binary::RepatchOutcome::Deferred(e) => failed = Some(e),
             }
         }
         let where_ = crate::utils::mask_path(&inst.display().to_string());
@@ -1890,7 +1869,100 @@ fn disable_dns(ctx: &mut Ctx) {
         if endpoint::proxy_env_is_ours() {
             disable_local_proxy(ctx);
         }
+        // The listener is gone now, and the registry no longer names it - but a
+        // running Antigravity got its copy of the variable at launch and keeps
+        // handing it to its language server, so the next request dies on
+        // `proxyconnect … actively refused` until it is restarted.
+        restart_stale_holders(ctx);
     }
+}
+
+/// Image names of the Antigravity shells: restarting one is what gives its
+/// language server an environment without `AG_LS_PROXY`.
+const AG_SHELLS: [&str; 2] = ["Antigravity.exe", "Antigravity IDE.exe"];
+
+/// Editors the Antigravity extension runs in (S95): its `agy` backend inherits
+/// the editor's environment, so the editor is what has to be restarted. Not
+/// closed for the user - unsaved work there is not ours to risk. Everything else
+/// started at logon holds the variable too (measured: dozens of processes) and
+/// never reads it, so it is not worth a line.
+const EXTENSION_HOSTS: [&str; 5] = [
+    "Code.exe",
+    "Code - Insiders.exe",
+    "Cursor.exe",
+    "Windsurf.exe",
+    "VSCodium.exe",
+];
+
+/// Restarts the Antigravity windows whose environment still names the proxy
+/// that was just switched off, and names every other program that holds it.
+fn restart_stale_holders(ctx: &mut Ctx) {
+    let holders = crate::stale_env::holders(endpoint::PROXY_ENV_VAR);
+    if holders.is_empty() {
+        return;
+    }
+    let mut shells: Vec<std::path::PathBuf> = Vec::new();
+    let mut others: Vec<String> = Vec::new();
+    for h in &holders {
+        if AG_SHELLS.iter().any(|s| s.eq_ignore_ascii_case(&h.name)) {
+            if let Some(p) = &h.path {
+                if !shells.contains(p) {
+                    shells.push(p.clone());
+                }
+            }
+        } else if EXTENSION_HOSTS
+            .iter()
+            .any(|e| e.eq_ignore_ascii_case(&h.name))
+            && !others.contains(&h.name)
+        {
+            others.push(h.name.clone());
+        }
+    }
+    if !shells.is_empty() {
+        ctx.log(
+            Level::Step,
+            "Перезапуск Antigravity: он запомнил адрес выключенного прокси",
+        );
+        patch_binary::kill_affected_processes();
+        for path in &shells {
+            launch_clean(path, endpoint::PROXY_ENV_VAR);
+        }
+        ctx.log(
+            Level::Ok,
+            "Antigravity перезапущен и обращается к Google напрямую.",
+        );
+    }
+    // Only when the extension's backend is actually running: every editor
+    // started while the bypass was on holds the variable, used or not.
+    let agy_runs = holders
+        .iter()
+        .any(|h| h.name.eq_ignore_ascii_case("agy.exe"));
+    if agy_runs && !others.is_empty() {
+        ctx.log(
+            Level::Info,
+            format!(
+                "Расширение Antigravity помнит адрес выключенного прокси — перезапустите {}.",
+                others.join(", ")
+            ),
+        );
+    }
+}
+
+/// Starts `path` without `var` in its environment. From an elevated window it
+/// goes through `explorer.exe`, so it runs unelevated with the user's current
+/// environment, which no longer has the variable.
+fn launch_clean(path: &std::path::Path, var: &str) {
+    #[cfg(target_os = "windows")]
+    if is_admin() {
+        let mut cmd = std::process::Command::new("explorer.exe");
+        cmd.arg(path);
+        if crate::utils::no_window(&mut cmd).spawn().is_ok() {
+            return;
+        }
+    }
+    let mut cmd = std::process::Command::new(path);
+    cmd.env_remove(var);
+    let _ = cmd.spawn();
 }
 
 /// Takes the relay service down for good, with auto-patch kept.
@@ -1919,7 +1991,7 @@ fn stop_relay(ctx: &mut Ctx) {
 /// Whether something other than the DNS rules needs the relay running: the
 /// proxy listener and every route it serves live inside it.
 fn routes_want_relay(s: &Settings) -> bool {
-    s.local_proxy || s.own_proxy_enabled || s.group_proxy || s.builtin_exits
+    s.local_proxy || s.own_proxy_enabled || s.group_proxy
 }
 
 /// A route that was switched on by itself has to have something to ride on.
@@ -1976,12 +2048,18 @@ fn release_route_carrier(ctx: &mut Ctx) {
         return;
     }
     stop_relay(ctx);
+    // Same as `disable_dns`: the relay may have put the variable back before it
+    // stopped, and a running Antigravity still holds the old copy.
+    if endpoint::proxy_env_is_ours() {
+        disable_local_proxy(ctx);
+    }
+    restart_stale_holders(ctx);
 }
 
 /// `routes_want_relay` minus the proxy variable's own wish: a route's carrier
 /// sets that wish itself, so it must not count against letting go of it.
 fn routes_want_relay_without_proxy_var(s: &Settings) -> bool {
-    s.own_proxy_enabled || s.group_proxy || s.builtin_exits
+    s.own_proxy_enabled || s.group_proxy
 }
 
 /// Re-writes the NRPT rules when the pool they name has changed.
@@ -2107,34 +2185,37 @@ fn disable_local_proxy(ctx: &mut Ctx) {
 
 // --- own proxy -------------------------------------------------------------
 
-/// Saves the user's own DNS server(s). Anything that is not an IPv4 address is
-/// refused with the reason; the slot stays as it was.
+/// Saves the user's own DNS server(s): IPv4 addresses, `https://` (DoH) and
+/// `tls://` (DoT) servers. Anything else is refused with the reason, and the
+/// slot stays as it was.
 fn set_custom_dns(ctx: &mut Ctx, text: &str) {
     let text = text.trim();
     if text.is_empty() {
         ctx.settings.custom_dns.clear();
-        ctx.settings.set_provider_enabled("свой DNS", true);
         ctx.log(Level::Ok, "Свой DNS убран.");
         return;
     }
-    let found = crate::resolvers::parse_custom_dns(text);
-    let words = text
-        .split(|c: char| c.is_whitespace() || c == ',' || c == ';')
-        .filter(|w| !w.is_empty())
-        .count();
-    if found.is_empty() || found.len() < words {
-        ctx.log(
-            Level::Err,
-            "Нужны IPv4-адреса DNS-серверов через пробел или запятую (не 127.x и не 0.0.0.0), например 77.88.8.8.",
-        );
-        return;
-    }
+    let found = match crate::resolvers::parse_custom_dns(text) {
+        Ok(found) if !found.is_empty() => found,
+        Ok(_) => return,
+        Err(e) => {
+            ctx.log(
+                Level::Err,
+                format!(
+                    "{} Принимаются IPv4-адрес (77.88.8.8), DoH (https://dns.example.com/dns-query)                      и DoT (tls://dns.example.com), через пробел.",
+                    e
+                ),
+            );
+            return;
+        }
+    };
     ctx.settings.custom_dns = found
         .iter()
-        .map(|ip| ip.to_string())
+        .map(|s| s.text())
         .collect::<Vec<_>>()
         .join(" ");
-    ctx.settings.set_provider_enabled("свой DNS", true);
+    ctx.settings
+        .set_provider_enabled(crate::resolvers::CUSTOM_NAME, true);
     ctx.log(
         Level::Ok,
         format!(
@@ -2306,16 +2387,14 @@ mod tests {
     fn a_switch_that_is_off_with_a_note_is_off() {
         let mut s = Settings::default();
         s.rotate_providers = false;
-        s.builtin_exits = false;
         let st = blank_status().with_settings_switches(&s);
 
         assert!(!st.dns_rotation.is_on());
-        assert!(!st.builtin_exits.is_on());
         // The note itself must survive — it is what the row says underneath.
         assert!(st.dns_rotation.note().is_some());
 
         let on = blank_status().with_settings_switches(&Settings::default());
-        assert!(on.dns_rotation.is_on() && on.builtin_exits.is_on());
+        assert!(on.dns_rotation.is_on());
     }
 
     /// A settings-only refresh must produce the same switches a full one does,
@@ -2334,7 +2413,6 @@ mod tests {
     /// to Windows for scheduled tasks and environment variables.
     #[test]
     fn only_the_switches_that_touch_the_system_pay_for_a_system_scan() {
-        assert_eq!(scan_after(Cap::BuiltinExits), Scan::Settings);
         assert_eq!(scan_after(Cap::GroupProxy), Scan::Settings);
         assert_eq!(scan_after(Cap::Dns), Scan::System);
         assert_eq!(scan_after(Cap::LocalProxy), Scan::System);
@@ -2350,7 +2428,6 @@ mod tests {
         for set in [
             |s: &mut Status| s.own_proxy = State::On,
             |s: &mut Status| s.group_proxy = State::On,
-            |s: &mut Status| s.builtin_exits = State::On,
             |s: &mut Status| s.local_proxy = State::On,
             |s: &mut Status| s.dns = State::On,
         ] {
@@ -2384,7 +2461,6 @@ mod tests {
     fn the_service_is_wanted_while_any_route_is() {
         let mut s = Settings::default();
         s.local_proxy = false;
-        s.builtin_exits = false;
         s.group_proxy = false;
         s.own_proxy_enabled = false;
         assert!(!routes_want_relay(&s));
@@ -2442,7 +2518,6 @@ mod tests {
             dns: State::Off,
             local_proxy: State::Off,
             own_proxy: State::Off,
-            builtin_exits: State::Off,
             group_proxy: State::Off,
             dns_rotation: State::Off,
             vpn: None,

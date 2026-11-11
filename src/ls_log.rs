@@ -44,6 +44,14 @@ use std::time::Duration;
 /// preconditions too, and only this one is about where the request came from.
 const REGION_400: &str = "user location is not supported";
 
+/// The same refusal as it comes back from the sign-in call: `onboardUser` answers
+/// `403 PERMISSION_DENIED` with `reason: UNSUPPORTED_LOCATION` (Â«account is not
+/// currently available in your locationÂ»), not the 400 above - seen 2026-11-11
+/// on a fresh login through the group route, where the relay read nothing and
+/// kept the route that had just been refused. The JSON form is matched, once per
+/// refusal: the same word is repeated in the `API Error:` line after it.
+const REGION_403: &str = "\"reason\": \"unsupported_location\"";
+
 /// A model answer, as the language server logs it: the generation call and the
 /// id of the response it got back, on one line. Both halves: `loadCodeAssist`
 /// and `fetchAvailableModels` are logged the same way on a refused session too,
@@ -357,7 +365,13 @@ fn contains_ci(hay: &[u8], needle: &[u8]) -> bool {
 /// because the log is a stream of glog lines that a partial last line may cut
 /// anywhere, and a UTF-8 boundary is not something worth failing on.
 fn count_refusals(buf: &[u8]) -> usize {
-    let needle = REGION_400.as_bytes();
+    [REGION_400, REGION_403]
+        .iter()
+        .map(|n| count_needle(buf, n.as_bytes()))
+        .sum()
+}
+
+fn count_needle(buf: &[u8], needle: &[u8]) -> usize {
     if buf.len() < needle.len() {
         return 0;
     }
@@ -1072,6 +1086,26 @@ mod tests {
             .open(path)
             .expect("open");
         f.write_all(text.as_bytes()).expect("write");
+    }
+
+    #[test]
+    fn the_sign_in_refusal_403_counts_as_a_region_refusal() {
+        let body = b"{
+  \"error\": {
+    \"code\": 403,
+    \"status\": \"PERMISSION_DENIED\",
+    \"details\": [
+      {
+        \"reason\": \"UNSUPPORTED_LOCATION\",
+        \"domain\": \"cloudaicompanion.googleapis.com\"
+      }
+    ]
+  }
+}
+API Error: {Reason:UNSUPPORTED_LOCATION}
+";
+        assert_eq!(count_refusals(body), 1);
+        assert_eq!(count_refusals(b"PERMISSION_DENIED (code 403): You do not have a valid license"), 0);
     }
 
     const REFUSAL: &str = "E0901 15:09:24.614939 1 stream_handler.go:101] FAILED_PRECONDITION (code 400): User location is not supported for the API use.\n";

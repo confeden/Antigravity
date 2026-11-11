@@ -247,6 +247,12 @@ fn blocker(relay: Option<&crate::gate::Report>, what: &str) -> Option<crate::gat
 /// A provider's name as it is shown: an acronym stays one, anything else gets
 /// one capital.
 pub fn provider_name(name: &str) -> String {
+    // The two the pool carries are written the way their owners write them.
+    match name {
+        "dns-ai.ru" => return "DNS-AI.ru".to_string(),
+        "eu.geohide.ru" => return "eu.GeoHide.ru".to_string(),
+        _ => {}
+    }
     let lead: String = name.chars().take_while(|c| c.is_alphabetic()).collect();
     if lead.eq_ignore_ascii_case("dns") {
         return name.to_uppercase();
@@ -286,12 +292,6 @@ pub fn switch_text(cap: Cap) -> (&'static str, &'static str) {
             "Соединения Antigravity с этими двумя серверами идут через посредника внутри \
              вашего компьютера: он выбирает путь, который реально работает, и переключается \
              сам. Содержимое не расшифровывается — посредник только передаёт байты.",
-        ),
-        Cap::BuiltinExits => (
-            "Встроенные выходы",
-            // Deliberately says what they are and never which they are: a
-            // free service that gets named publicly stops being free (I46).
-            "Запасной путь до серверов Google — через страну без ограничений.",
         ),
         Cap::GroupProxy => (
             "Прокси из группы",
@@ -970,9 +970,10 @@ mod tests {
 
     #[test]
     fn an_acronym_stays_an_acronym_and_everything_else_gets_one_capital() {
-        assert_eq!(provider_name("dns-ai.ru"), "DNS-AI.RU");
-        assert_eq!(provider_name("comss.one"), "Comss.one");
-        assert_eq!(provider_name("geohide.ru"), "Geohide.ru");
+        assert_eq!(provider_name("dns-ai.ru"), "DNS-AI.ru");
+        assert_eq!(provider_name("eu.geohide.ru"), "eu.GeoHide.ru");
+        assert_eq!(provider_name("свой DNS"), "Свой DNS");
+        assert_eq!(provider_name("dns.example"), "DNS.EXAMPLE");
         // Must not panic on a name the pool could grow later.
         assert_eq!(provider_name(""), "");
         assert_eq!(provider_name("1.1.1.1"), "1.1.1.1");

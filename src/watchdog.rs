@@ -74,6 +74,11 @@ struct FileState {
     /// is a `taskkill` every four seconds, for ever.
     blocked: u32,
     blocked_for: Option<(u64, SystemTime)>,
+    deferred_until: Option<((u64, SystemTime), Instant)>,
+    /// The app this watcher closed to free a locked server; it is started again
+    /// once the patch has landed (or has been given up on), so an update never
+    /// leaves the user's window closed.
+    reopen: Option<PathBuf>,
 }
 
 /// How many times a settled-but-locked target is worth closing the app for.
@@ -115,7 +120,8 @@ fn run() {
         // written the files, and the app starts its Language Server at once.
         // While a downloaded update is staged (and for a minute after it goes)
         // the files are looked at every 150 ms instead.
-        if updater_busy(&updaters) {
+        let updater_active = updater_busy(&updaters);
+        if updater_active {
             fast_until = Some(Instant::now() + FAST_FOR);
         }
         let fast = fast_until.is_some_and(|t| Instant::now() < t);
@@ -125,7 +131,7 @@ fn run() {
                 installs = discover();
                 updaters = updater_dirs();
             }
-            if crate::settings::auto_patch_wanted() {
+            if !updater_active && crate::settings::auto_patch_wanted() {
                 for inst in &installs {
                     for target in targets(inst) {
                         inspect(&target, states.entry(target.clone()).or_default());
@@ -178,7 +184,7 @@ const FAST_REDISCOVER_EVERY: u32 = 60;
 /// `%LOCALAPPDATA%\<name>-updater\pending` until it runs it (measured: electron
 /// -updater, `antigravity-updater\pending\Antigravity-x64.exe`). Filesystem
 /// checks only.
-fn updater_dirs() -> Vec<PathBuf> {
+pub(crate) fn updater_dirs() -> Vec<PathBuf> {
     let Some(base) = std::env::var_os("LOCALAPPDATA") else {
         return Vec::new();
     };
@@ -198,7 +204,7 @@ fn updater_dirs() -> Vec<PathBuf> {
 /// fails with a sharing violation, a file that merely waits for the user opens
 /// fine (and is left untouched). Without this a downloaded update would keep
 /// the fast poll on for as long as it waits - days, if the user never quits.
-fn updater_busy(dirs: &[PathBuf]) -> bool {
+pub(crate) fn updater_busy(dirs: &[PathBuf]) -> bool {
     dirs.iter().any(|d| {
         let Ok(rd) = fs::read_dir(d) else {
             return false;
@@ -273,6 +279,20 @@ impl ListenerGuard {
     }
 }
 
+/// Starts the app this watcher closed, if it closed one.
+fn reopen_app(st: &mut FileState) {
+    if let Some(app) = st.reopen.take() {
+        match patch_binary::launch_app(&app) {
+            Ok(()) => log(&format!("Antigravity запущен снова: {}", show(&app))),
+            Err(e) => log(&format!(
+                "Antigravity не удалось запустить: {} - {}",
+                show(&app),
+                e
+            )),
+        }
+    }
+}
+
 /// One file, one poll.
 fn inspect(target: &Path, st: &mut FileState) {
     let Some(cur) = stat(target) else {
@@ -281,6 +301,9 @@ fn inspect(target: &Path, st: &mut FileState) {
         return;
     };
     if st.handled == Some(cur) {
+        return;
+    }
+    if st.deferred_until.is_some_and(|(shape, until)| shape == cur && Instant::now() < until) {
         return;
     }
     // Wait for the file to settle: act only once we have seen the same
@@ -304,6 +327,7 @@ fn inspect(target: &Path, st: &mut FileState) {
             // Our own past write, or an install menu 1 just handled. Record the
             // current shape and stay quiet.
             st.handled = stat(target).or(Some(cur));
+            reopen_app(st);
         }
         RepatchOutcome::Repatched(n) => {
             log(&format!("patched: {} ({})", show(target), n));
@@ -312,6 +336,7 @@ fn inspect(target: &Path, st: &mut FileState) {
             // The rename is same-length, so len is unchanged and only mtime
             // moved; re-stat so our own write is not seen as a new change.
             st.handled = stat(target).or(Some(cur));
+            reopen_app(st);
         }
         RepatchOutcome::SignatureMissing => {
             log(&format!(
@@ -322,6 +347,11 @@ fn inspect(target: &Path, st: &mut FileState) {
             // Do not look at this version again; only a further change (a newer
             // build that we might understand) is worth another attempt.
             st.handled = Some(cur);
+            reopen_app(st);
+        }
+        RepatchOutcome::Deferred(e) => {
+            log(&format!("additive patch deferred, LS left running: {} - {}", show(target), e));
+            st.deferred_until = Some((cur, Instant::now() + Duration::from_secs(30)));
         }
         RepatchOutcome::Failed(e) => {
             // The file is settled but the write did not land. Usually that is
@@ -358,6 +388,7 @@ fn inspect(target: &Path, st: &mut FileState) {
                 return;
             }
             if st.blocked >= MAX_LAUNCH_HOLDS {
+                reopen_app(st);
                 if st.blocked == MAX_LAUNCH_HOLDS {
                     st.blocked += 1;
                     log(&format!(
@@ -375,6 +406,14 @@ fn inspect(target: &Path, st: &mut FileState) {
                 MAX_LAUNCH_HOLDS,
                 show(target)
             ));
+            // The app first, then its server: a server killed alone is started
+            // again by the app within seconds and takes the lock back, three
+            // times, after which the app gives up on it and stays open with no
+            // server (G92). With the app closed nothing races the next poll.
+            if let Some(app) = patch_binary::owner_app(target) {
+                patch_binary::quit_app(&app);
+                st.reopen = Some(app);
+            }
             patch_binary::kill_holder(target);
         }
     }
@@ -468,7 +507,7 @@ fn show(p: &Path) -> String {
 /// the moment a file changed, and that is the one question this log is read for.
 /// Never from a test - the file is the *installed* watchdog's, and the wiring
 /// tests below used to append their temp paths to it (G51's twin).
-fn log(line: &str) {
+pub(crate) fn log(line: &str) {
     if cfg!(test) {
         return;
     }

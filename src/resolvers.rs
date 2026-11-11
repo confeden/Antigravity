@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::Mutex;
 use std::thread;
@@ -48,28 +48,270 @@ pub enum Transport {
     Custom,
 }
 
-/// The user's own DNS servers: IPv4 literals split on whitespace, commas and
-/// semicolons. Loopback, unspecified and multicast addresses are dropped - the
-/// relay itself listens on 127.0.0.53, and pointing it at itself would loop.
-pub fn parse_custom_dns(text: &str) -> Vec<Ipv4Addr> {
-    let mut out: Vec<Ipv4Addr> = Vec::new();
-    for part in text.split(|c: char| c.is_whitespace() || c == ',' || c == ';') {
-        let part = part.trim();
-        if part.is_empty() {
-            continue;
+/// The slot the user fills in by hand. The name is what every switch, the
+/// deny-list and the saved order are keyed by, so it never changes.
+pub const CUSTOM_NAME: &str = "свой DNS";
+
+/// One server the user typed into the «свой DNS» slot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CustomServer {
+    /// A plain resolver on UDP:53 - `77.88.8.8`.
+    Udp(Ipv4Addr),
+    /// DNS-over-HTTPS - `https://dns.example.com/dns-query`. Always port 443.
+    Doh { host: String, path: String },
+    /// DNS-over-TLS - `tls://dns.example.com` (port 853) or `tls://host:port`.
+    Dot { host: String, port: u16 },
+}
+
+impl CustomServer {
+    /// The one way a server is written back to the settings file and the field.
+    pub fn text(&self) -> String {
+        match self {
+            CustomServer::Udp(ip) => ip.to_string(),
+            CustomServer::Doh { host, path } => format!("https://{}{}", host, path),
+            CustomServer::Dot { host, port } => {
+                if *port == 853 {
+                    format!("tls://{}", host)
+                } else {
+                    format!("tls://{}:{}", host, port)
+                }
+            }
         }
-        if let Ok(ip) = part.parse::<Ipv4Addr>() {
-            if !ip.is_loopback() && !ip.is_unspecified() && !ip.is_multicast() && !out.contains(&ip)
-            {
-                out.push(ip);
+    }
+}
+
+/// A hostname or an IPv4 literal; nothing that could smuggle a path, a port, a
+/// credential or an IPv6 bracket into a place that expects a bare name.
+fn valid_host(host: &str) -> Result<(), String> {
+    if host.is_empty() || host.len() > 253 {
+        return Err("пустой адрес сервера".into());
+    }
+    if !host
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+        || host.starts_with('.')
+        || host.starts_with('-')
+        || host.ends_with('-')
+    {
+        return Err(format!("«{}» — не адрес сервера", host));
+    }
+    if let Ok(ip) = host.parse::<Ipv4Addr>() {
+        if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() {
+            return Err(format!("{} не подходит: это не внешний сервер", host));
+        }
+    } else if !host.contains('.') {
+        return Err(format!("«{}» — не адрес сервера", host));
+    }
+    Ok(())
+}
+
+/// One word of the field. The reason is Russian and complete: it is shown to the
+/// user as it is.
+pub fn parse_custom_server(token: &str) -> Result<CustomServer, String> {
+    let token = token.trim();
+    let lower = token.to_ascii_lowercase();
+    if let Some(rest) = lower
+        .strip_prefix("https://")
+        .or_else(|| lower.strip_prefix("doh://"))
+    {
+        // Keep the path's own case: only the scheme and host are case-blind.
+        let rest_orig = &token[token.len() - rest.len()..];
+        let (hostport, path) = match rest_orig.find('/') {
+            Some(i) => (&rest_orig[..i], &rest_orig[i..]),
+            None => (rest_orig, "/dns-query"),
+        };
+        let host = match hostport.rsplit_once(':') {
+            Some((h, "443")) => h,
+            Some(_) => return Err(format!("{}: для DoH поддерживается только порт 443", token)),
+            None => hostport,
+        };
+        let host = host.to_ascii_lowercase();
+        valid_host(&host)?;
+        if path.len() > 200
+            || path
+                .chars()
+                .any(|c| c.is_whitespace() || c == '?' || c == '#')
+        {
+            return Err(format!("{}: путь DoH указан неверно", token));
+        }
+        return Ok(CustomServer::Doh {
+            host,
+            path: path.to_string(),
+        });
+    }
+    if let Some(rest) = lower
+        .strip_prefix("tls://")
+        .or_else(|| lower.strip_prefix("dot://"))
+    {
+        let rest = rest.trim_end_matches('/');
+        let (host, port) = match rest.rsplit_once(':') {
+            Some((h, p)) => (
+                h,
+                p.parse::<u16>()
+                    .ok()
+                    .filter(|p| *p != 0)
+                    .ok_or_else(|| format!("{}: неверный порт", token))?,
+            ),
+            None => (rest, 853),
+        };
+        valid_host(host)?;
+        return Ok(CustomServer::Dot {
+            host: host.to_string(),
+            port,
+        });
+    }
+    if lower.starts_with("http://") {
+        return Err(format!("{}: для DoH нужен https://", token));
+    }
+    if lower.contains("://") {
+        return Err(format!(
+            "{}: поддерживаются IPv4-адрес, https:// (DoH) и tls:// (DoT)",
+            token
+        ));
+    }
+    match token.parse::<Ipv4Addr>() {
+        Ok(ip) => {
+            if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() {
+                // The relay itself listens on 127.0.0.53: pointing it at itself loops.
+                Err(format!("{} не подходит: это не внешний сервер", token))
+            } else {
+                Ok(CustomServer::Udp(ip))
+            }
+        }
+        Err(_) => Err(format!(
+            "{}: нужен IPv4-адрес, https://… (DoH) или tls://… (DoT)",
+            token
+        )),
+    }
+}
+
+fn custom_words(text: &str) -> impl Iterator<Item = &str> {
+    text.split(|c: char| c.is_whitespace() || c == ',' || c == ';')
+        .map(str::trim)
+        .filter(|w| !w.is_empty())
+}
+
+/// The user's own servers, strictly: any word that is not a server is an error
+/// naming it, and nothing is kept. Duplicates collapse. At most 8 - a field is
+/// not a list manager, and every one costs a handshake when it is the one asked.
+pub fn parse_custom_dns(text: &str) -> Result<Vec<CustomServer>, String> {
+    let mut out: Vec<CustomServer> = Vec::new();
+    for word in custom_words(text) {
+        let server = parse_custom_server(word)?;
+        if !out.contains(&server) {
+            out.push(server);
+        }
+    }
+    if out.len() > 8 {
+        return Err("Слишком много серверов — не больше 8.".into());
+    }
+    Ok(out)
+}
+
+/// What is stored, read leniently: a word that no longer parses is skipped
+/// rather than taking the rest down with it.
+pub fn custom_dns_servers() -> Vec<CustomServer> {
+    let text = crate::settings::custom_dns_cached();
+    let mut out: Vec<CustomServer> = Vec::new();
+    for word in custom_words(&text) {
+        if let Ok(s) = parse_custom_server(word) {
+            if !out.contains(&s) && out.len() < 8 {
+                out.push(s);
             }
         }
     }
     out
 }
 
-pub fn custom_dns_servers() -> Vec<Ipv4Addr> {
-    parse_custom_dns(&crate::settings::custom_dns_cached())
+/// Addresses of a DoH/DoT host, remembered for ten minutes. An IPv4 literal is
+/// its own answer. Resolved by the system, which is fine here: the three gate
+/// hosts are the only names the relay ever has to keep away from it (D25), and
+/// the certificate still has to prove the name, so a poisoned answer fails
+/// the handshake rather than becoming anything.
+fn host_addrs(host: &str) -> Vec<IpAddr> {
+    use std::net::ToSocketAddrs;
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return vec![ip];
+    }
+    static MEMO: Mutex<Option<HashMap<String, (Vec<IpAddr>, Instant)>>> = Mutex::new(None);
+    const KEEP: Duration = Duration::from_secs(600);
+    if let Ok(g) = MEMO.lock() {
+        if let Some((ips, at)) = g.as_ref().and_then(|m| m.get(host)) {
+            if at.elapsed() < KEEP && !ips.is_empty() {
+                return ips.clone();
+            }
+        }
+    }
+    let mut ips: Vec<IpAddr> = (host, 443u16)
+        .to_socket_addrs()
+        .map(|it| it.map(|a| a.ip()).collect())
+        .unwrap_or_default();
+    // IPv4 first: a line without IPv6 must not spend its slice on one.
+    ips.sort_by_key(|ip| ip.is_ipv6());
+    ips.dedup();
+    if let Ok(mut g) = MEMO.lock() {
+        let m = g.get_or_insert_with(HashMap::new);
+        if ips.is_empty() {
+            // Keep serving the last good answer rather than none.
+            if let Some((old, _)) = m.get(host) {
+                return old.clone();
+            }
+        } else {
+            m.insert(host.to_string(), (ips.clone(), Instant::now()));
+        }
+    }
+    ips
+}
+
+/// A DoH endpoint for a name typed by the user. `doh::Endpoint` borrows its
+/// strings for `'static` (the built-in ones are literals), so each distinct
+/// (host, path) is leaked once and handed out again - a handful of bytes for
+/// the life of the process, bounded by what the field can hold.
+fn custom_doh_endpoint(host: &str, path: &str) -> &'static crate::doh::Endpoint {
+    static MADE: Mutex<Vec<&'static crate::doh::Endpoint>> = Mutex::new(Vec::new());
+    let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(ep) = made.iter().find(|e| e.host == host && e.path == path) {
+        return ep;
+    }
+    let ep: &'static crate::doh::Endpoint = Box::leak(Box::new(crate::doh::Endpoint {
+        host: Box::leak(host.to_string().into_boxed_str()),
+        path: Box::leak(path.to_string().into_boxed_str()),
+        addrs: &[],
+    }));
+    made.push(ep);
+    ep
+}
+
+fn ask_custom(
+    server: &CustomServer,
+    query: &[u8],
+    if_index: u32,
+    timeout: Duration,
+) -> Option<Vec<u8>> {
+    let mut reply = match server {
+        CustomServer::Udp(ip) => dns_client::query_raw_via(query, *ip, if_index, timeout).ok()?,
+        CustomServer::Doh { host, path } => {
+            let ips = host_addrs(host);
+            crate::doh::query_at(custom_doh_endpoint(host, path), &ips, query, timeout).ok()?
+        }
+        CustomServer::Dot { host, port } => {
+            let ips = host_addrs(host);
+            crate::dot::query(host, *port, &ips, query, timeout).ok()?
+        }
+    };
+    // Re-stamp the transaction id: a DoH/DoT server may answer with another one,
+    // and the reply is handed to Windows over UDP:53, where a mismatch is a drop.
+    if reply.len() >= 2 && query.len() >= 2 {
+        reply[0] = query[0];
+        reply[1] = query[1];
+    }
+    Some(reply)
+}
+
+/// Whether the «свой DNS» slot is empty. Without anything in it the slot is not
+/// a provider at all: nothing to ask.
+fn custom_is_empty() -> bool {
+    custom_dns_servers().is_empty()
 }
 
 /// One unblock service. Addresses are tried in order; the first that answers
@@ -121,21 +363,30 @@ pub const PROVIDERS: &[Provider] = &[
         v6: &[],
         transport: Transport::Doh(&DNS_AI),
     },
+    // `eu.geohide.ru` replaced `geohide.ru` and `comss.one` in 2.31.0 (owner):
+    // comss no longer lifts the gate, and geohide is reached through its
+    // European resolver. Measured 2026-11-11 over UDP:53: it answers
+    // `daily-cloudcode-pa` with its own proxy addresses and passes
+    // `cloudcode-pa` through, so it carries one of the two gate names; the pool
+    // still decides per query, and dns-ai.ru is the one that carries both. Four
+    // of its seven A records answered; the rest (45.13.237.213, 5.175.161.40,
+    // 37.221.93.128) timed out and stay out until measured live (P14).
     Provider {
-        name: "comss.one",
-        v4: &["83.220.169.155", "212.109.195.93", "195.133.25.16"],
+        name: "eu.geohide.ru",
+        v4: &[
+            "31.25.239.132",
+            "143.20.64.192",
+            "5.175.161.3",
+            "37.221.93.141",
+        ],
         v6: &[],
         transport: Transport::Udp,
     },
+    // Last on purpose: the user's own server(s). Not a provider at all until
+    // they type one in: `provider_disabled` keeps it out of the race, the
+    // rotation and the head-of-list choice while the field is empty.
     Provider {
-        name: "geohide.ru",
-        v4: &["45.155.204.190", "37.230.192.51"],
-        v6: &["2a0c:9300:0:54::1"],
-        transport: Transport::Udp,
-    },
-    // Last on purpose: the user's own server, empty until they type one in.
-    Provider {
-        name: "свой DNS",
+        name: CUSTOM_NAME,
         v4: &[],
         v6: &[],
         transport: Transport::Custom,
@@ -805,7 +1056,24 @@ fn learn_proxy_addrs(idx: usize, addrs: Vec<IpAddr>) {
     }
 }
 
+/// Forgets every remembered choice and answer once the pool's settings have
+/// changed since they were made, so a switch in the window acts on the very next
+/// query instead of after the cache expires (up to `CHOICE_TTL`).
+fn sync_with_settings() {
+    static SEEN: AtomicU64 = AtomicU64::new(0);
+    let now = crate::settings::pool_epoch();
+    if SEEN.swap(now, Ordering::Relaxed) != now {
+        if let Ok(mut g) = CHOICE.lock() {
+            *g = None;
+        }
+        if let Ok(mut g) = ANSWERS.lock() {
+            *g = None;
+        }
+    }
+}
+
 fn cached_choice(key: &(String, u16)) -> Option<(usize, Verdict)> {
+    sync_with_settings();
     let guard = CHOICE.lock().ok()?;
     let map = guard.as_ref()?;
     let (idx, verdict, at) = map.get(key)?;
@@ -848,6 +1116,7 @@ fn cached_answer(
     stale: bool,
     from_client: bool,
 ) -> Option<(Vec<u8>, &'static str, Verdict)> {
+    sync_with_settings();
     let key = answer_key(query)?;
     let mut guard = ANSWERS.lock().ok()?;
     let hit = guard.as_mut()?.get_mut(&key)?;
@@ -985,6 +1254,7 @@ fn only_provider() -> Option<&'static str> {
     in_user_order()
         .into_iter()
         .map(|p| p.name)
+        .filter(|n| *n != CUSTOM_NAME || !custom_is_empty())
         .find(|n| !disabled.iter().any(|d| d.eq_ignore_ascii_case(n)))
 }
 
@@ -1062,6 +1332,11 @@ fn provider_disabled(name: &str) -> bool {
     if denied(name) {
         return true;
     }
+    // The user's slot with nothing in it: there is no server to ask, and with
+    // rotation off it must not be taken for the head of the list either.
+    if name == CUSTOM_NAME && custom_is_empty() {
+        return true;
+    }
     // Rotation off: everything below the head of the list is treated exactly the
     // way a switched-off provider is, so the race, the fallback list and the
     // NRPT nameservers all narrow together instead of disagreeing.
@@ -1093,8 +1368,8 @@ fn ask_provider(
             None
         }
         Transport::Custom => {
-            for ip in custom_dns_servers() {
-                if let Ok(reply) = dns_client::query_raw_via(query, ip, if_index, timeout) {
+            for server in custom_dns_servers() {
+                if let Some(reply) = ask_custom(&server, query, if_index, timeout) {
                     return Some(reply);
                 }
             }
@@ -1327,7 +1602,18 @@ fn preferred_provider(name: &str) -> Option<usize> {
 fn one_shot_floor(provider: &Provider, budget: Duration) -> Duration {
     match provider.transport {
         Transport::Doh(_) => budget.max(DOH_FAST_TIMEOUT),
-        Transport::Udp | Transport::Custom => budget,
+        Transport::Udp => budget,
+        // A DoH/DoT server needs a handshake before it can answer at all.
+        Transport::Custom => {
+            if custom_dns_servers()
+                .iter()
+                .any(|c| !matches!(c, CustomServer::Udp(_)))
+            {
+                budget.max(DOH_FAST_TIMEOUT)
+            } else {
+                budget
+            }
+        }
     }
 }
 
@@ -1756,35 +2042,28 @@ pub fn resolve_a_best(name: &str, if_index: u32) -> Option<(Vec<Ipv4Addr>, &'sta
     Some((addrs, provider, verdict))
 }
 
-/// What the `Direct` route walks: the race winner's answer, then every proxy
-/// address any provider is known to hand out, the ones that accept a connection
-/// first.
-///
-/// `resolve_a_best` alone is one provider's word. A single-address answer is
-/// never vetted (`drop_dead_addrs` keeps the last address so a slow answer does
-/// not become no answer), so a winner whose lone proxy had died put the direct
-/// route on a black hole every time while another provider's proxy served the
-/// same name (measured: dns-ai.ru's address timed out, geohide's completed TLS).
-pub fn direct_addrs(name: &str, if_index: u32) -> Option<(Vec<Ipv4Addr>, &'static str, Verdict)> {
-    let (mut addrs, provider, verdict) = resolve_a_best(name, if_index)?;
-    if verdict != Verdict::Substituted {
-        return Some((addrs, provider, verdict));
-    }
+/// Candidates, not a DNS verdict: even when today's race returns genuine
+/// Google (or nothing), another provider's known proxy may carry this SNI.
+/// Every address MUST pass the host-specific TLS/HTTP probe before use.
+pub fn dns_proxy_candidates(name: &str, if_index: u32) -> Vec<Ipv4Addr> {
     ensure_proxy_sets_learned(if_index);
-    for idx in 0..PROVIDERS.len() {
-        for a in known_proxy_addrs(idx) {
-            if let IpAddr::V4(v4) = a {
-                if !addrs.contains(&v4) {
-                    addrs.push(v4);
+    let mut out = match resolve_a_best(name, if_index) {
+        Some((ips, provider, Verdict::Substituted)) if !provider_disabled(provider) => ips,
+        _ => Vec::new(),
+    };
+    for (idx, provider) in PROVIDERS.iter().enumerate() {
+        if provider_disabled(provider.name) {
+            continue;
+        }
+        for addr in known_proxy_addrs(idx) {
+            if let IpAddr::V4(ip) = addr {
+                if !out.contains(&ip) {
+                    out.push(ip);
                 }
             }
         }
     }
-    let all: Vec<IpAddr> = addrs.iter().map(|a| IpAddr::V4(*a)).collect();
-    let dead = dead_addrs(&all, false, Some(name));
-    // Stable: the winner keeps its place among the live ones.
-    addrs.sort_by_key(|a| dead.contains(&IpAddr::V4(*a)));
-    Some((addrs, provider, verdict))
+    out
 }
 
 /// Genuine Google for `name`, as the routing table's own path resolves it: the
@@ -1987,17 +2266,85 @@ mod tests {
     }
 
     #[test]
-    fn custom_dns_takes_plain_ipv4_and_refuses_loops_and_junk() {
-        let got =
-            parse_custom_dns("77.88.8.8, 77.88.8.8;1.1.1.1  127.0.0.53 0.0.0.0 junk 224.0.0.1");
+    fn custom_dns_takes_ipv4_doh_and_dot_and_refuses_junk() {
+        let got = parse_custom_dns(
+            "77.88.8.8, 77.88.8.8;1.1.1.1 https://dns.example.com/dns-query tls://Dns.Example.com tls://x.example.org:8853 https://dns.example.com",
+        )
+        .unwrap();
         assert_eq!(
             got,
             vec![
-                "77.88.8.8".parse::<Ipv4Addr>().unwrap(),
-                "1.1.1.1".parse().unwrap()
+                CustomServer::Udp("77.88.8.8".parse().unwrap()),
+                CustomServer::Udp("1.1.1.1".parse().unwrap()),
+                CustomServer::Doh {
+                    host: "dns.example.com".into(),
+                    path: "/dns-query".into()
+                },
+                CustomServer::Dot {
+                    host: "dns.example.com".into(),
+                    port: 853
+                },
+                CustomServer::Dot {
+                    host: "x.example.org".into(),
+                    port: 8853
+                },
             ]
         );
-        assert!(parse_custom_dns("").is_empty());
+        assert!(parse_custom_dns("").unwrap().is_empty());
+        for bad in [
+            "127.0.0.53",
+            "0.0.0.0",
+            "224.0.0.1",
+            "junk",
+            "dns.example.com",
+            "http://dns.example.com/dns-query",
+            "quic://dns.example.com",
+            "https://dns.example.com:8443/dns-query",
+            "https://localhost/dns-query",
+            "tls://dns.example.com:0",
+            "https://127.0.0.1/dns-query",
+        ] {
+            assert!(parse_custom_dns(bad).is_err(), "{} must be refused", bad);
+        }
+        // One bad word spoils the whole line: nothing half-saved.
+        assert!(parse_custom_dns("77.88.8.8 junk").is_err());
+    }
+
+    /// Live: each kind of custom server answers a real question.
+    #[test]
+    #[ignore = "needs a live network"]
+    fn live_custom_servers_answer_over_udp_doh_and_dot() {
+        let query = dns_client::build_query("example.com", 0x2222);
+        for text in [
+            "8.8.8.8",
+            "https://dns.google/dns-query",
+            "tls://dns.google",
+            "tls://1.1.1.1",
+        ] {
+            let server = parse_custom_server(text).unwrap();
+            let reply = ask_custom(&server, &query, 0, Duration::from_secs(5))
+                .unwrap_or_else(|| panic!("{} gave no answer", text));
+            assert!(!dns_client::answer_addrs(&reply).is_empty(), "{}", text);
+            assert_eq!(&reply[0..2], &query[0..2], "{}", text);
+        }
+    }
+
+    #[test]
+    fn a_custom_server_is_written_back_the_way_it_was_read() {
+        for text in [
+            "77.88.8.8",
+            "https://dns.example.com/dns-query",
+            "tls://dns.example.com",
+            "tls://a.example.org:8853",
+        ] {
+            assert_eq!(parse_custom_server(text).unwrap().text(), text);
+        }
+        assert_eq!(
+            parse_custom_server("https://dns.example.com")
+                .unwrap()
+                .text(),
+            "https://dns.example.com/dns-query"
+        );
     }
 
     /// The slot carries no address of its own (like a DoH provider): it must never

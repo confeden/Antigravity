@@ -147,22 +147,26 @@ fn main() {
     println!("cargo::rustc-check-cfg=cfg(exits)");
     println!("cargo:rerun-if-changed=.exits");
     println!("cargo:rerun-if-changed=src/exits.rs");
-    let exits = Path::new("src/exits.rs").exists() && Path::new(".exits").exists();
-    if exits {
-        println!("cargo:rustc-cfg=exits");
-        let list = fs::read_to_string(".exits").expect("read .exits");
-        // Comments and blank lines are stripped here rather than at runtime, so
-        // nothing but addresses is ever inside the binary.
-        let cleaned = list
+    // Comments and blank lines are stripped here rather than at runtime, so
+    // nothing but addresses is ever inside the binary. A list with no address
+    // left (every exit measured dead and struck off) is the same as no file: the
+    // route compiles out like it does in a public clone, instead of failing the
+    // build.
+    let exit_list = if Path::new("src/exits.rs").exists() && Path::new(".exits").exists() {
+        fs::read_to_string(".exits")
+            .expect("read .exits")
             .lines()
             .map(str::trim)
             .filter(|l| !l.is_empty() && !l.starts_with('#'))
             .collect::<Vec<_>>()
-            .join("\n");
-        if cleaned.is_empty() {
-            panic!(".exits exists but lists no addresses");
-        }
-        bake_secret("exits_gen.rs", "EXITS", &cleaned);
+            .join("\n")
+    } else {
+        String::new()
+    };
+    let exits = !exit_list.is_empty();
+    if exits {
+        println!("cargo:rustc-cfg=exits");
+        bake_secret("exits_gen.rs", "EXITS", &exit_list);
     }
 
     println!("cargo:rerun-if-changed=.group");

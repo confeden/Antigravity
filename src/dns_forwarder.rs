@@ -155,7 +155,19 @@ pub const LISTEN_PORT: u16 = 53;
 ///     added, and an address that fails sits out of the DoH walk for a while
 ///     (`doh::plan`). An older relay still spends 2.5 s of every walk on two
 ///     dead addresses - the slow start of the 400 bypass.
-pub const RELAY_VERSION: u32 = 44;
+/// 45 = per-host DNS proxy checks off the warm loop, ten-minute route probes,
+///     region evidence per DNS endpoint, and serialised patch writers.
+/// 46 = the pool is eu.geohide.ru + dns-ai.ru + the user's own server (IPv4,
+///     DoH or DoT); a provider switch reaches the relay within 2 s and drops its
+///     cached decisions. An older relay still races comss and geohide.ru and
+///     reads the switches every 20 s.
+/// 47 = the sign-in refusal (`onboardUser` 403 UNSUPPORTED_LOCATION) is a region
+///     refusal like the 400, so the route that carried it is benched (G91); no
+///     built-in exits. An older relay keeps the refused route.
+/// 48 = the update watchdog closes the whole app (not just its server) to free a
+///     locked language server and starts it again after the patch (G92). An older
+///     one kills the server alone and the app gives up on it after three restarts.
+pub const RELAY_VERSION: u32 = 48;
 
 /// Written where an unelevated relay can write and an unelevated unlocker can
 /// read. Absent means a relay from before versioning, i.e. older than anything.
@@ -458,7 +470,7 @@ const WARM_EVERY: Duration = Duration::from_secs(15);
 /// re-timed while healthy. Rare, because a working route needs no supervision
 /// and each probe is a real request. The relay is deliberately kept off this
 /// clock - see the warm loop below for why.
-const PROBE_HEALTHY_EVERY: Duration = Duration::from_secs(2 * 60);
+const PROBE_HEALTHY_EVERY: Duration = Duration::from_secs(10 * 60);
 
 /// Where the relay asks the routing table to send a packet, to notice a tunnel
 /// coming up or going down between the full scans. Any public address works;
@@ -641,12 +653,17 @@ fn warm_forever() {
         // network wiped every bench - and put back first the route the gate had
         // just refused - twice per hiccup.
         if egress != 0 && routes::set_context(network_fingerprint(egress, best, net::tunnel_up())) {
+            crate::dns_route::network_changed();
+            since_upstream = PROBE_HEALTHY_EVERY;
+            since_exits = PROBE_HEALTHY_EVERY;
+            since_direct = PROBE_HEALTHY_EVERY;
             log_proxy("сеть изменилась — что работает, выясняется заново");
         }
         // The client logs are watched on a thread of their own every two
         // seconds (`watch_client_logs`), not here: a refusal costs the user
         // every request until it is answered, and a warm pass is fifteen
         // seconds plus its probes.
+        crate::dns_route::refresh_settings();
         resolvers::warm(dns::core_namespaces(), egress);
         // The relay is somebody else's server, so it is the one route we never
         // probe on a timer. A health check every two minutes, from every machine
@@ -664,7 +681,7 @@ fn warm_forever() {
         // it must be stood down before a request meets it, and picked back up
         // the moment it works again - which is what they asked for when they
         // gave us one.
-        if upstream::OWN.health.is_benched() || since_upstream >= PROBE_HEALTHY_EVERY {
+        if since_upstream >= PROBE_HEALTHY_EVERY {
             upstream::probe_health();
             since_upstream = Duration::ZERO;
         }
@@ -685,7 +702,6 @@ fn warm_forever() {
         // route table compares like with like. Not more often while penalised:
         // a region penalty is a clock, and no measurement shortens it.
         if since_direct >= PROBE_HEALTHY_EVERY {
-            proxy::probe_direct(egress);
             proxy::probe_vpn();
             since_direct = Duration::ZERO;
         }
@@ -921,6 +937,11 @@ fn on_refusals(count: usize, at: Instant, host: Option<&str>) {
             let shape = routes::tunnel_shape(tunnel);
             log_proxy(&connection_note(kind, tunnel, shape));
             let blamed = routes::blame(kind);
+            if matches!(blamed, routes::Blamed::Benched(_) | routes::Blamed::AlreadyBenched) {
+                if let Some((host, ip)) = routes::dns_endpoint(tunnel) {
+                    crate::dns_route::feedback(&host, ip, false);
+                }
+            }
             // A route-wide bench is not enough for the group: the same server
             // would be picked again when it ends. Bench the server itself.
             if matches!(kind, routes::Kind::Group)
@@ -1051,6 +1072,9 @@ fn on_answers(count: usize, at: Instant, host: Option<&str>) {
         // The tunnel as well as the route: while *it* is open the answer is
         // still arriving, and nothing is allowed to bench or cut it (D32).
         routes::credit_tunnel(tunnel);
+        if let Some((host, ip)) = routes::dns_endpoint(tunnel) {
+            crate::dns_route::feedback(&host, ip, true);
+        }
         // A model answer is the one thing that settles whether the relay works,
         // so it clears the relay's dud streak and lifts any bench: a client fans
         // out several gate tunnels and the short ancillary ones the relay closes
@@ -1143,6 +1167,7 @@ pub fn run() -> Result<(), String> {
     // process from its own watchdog by the age of what it writes (P54).
     gate::note_started();
     thread::spawn(warm_forever);
+    crate::dns_route::start();
     // The proxy variable is user-wide and must never outlive the listener it
     // names, so the watchdog takes it off when the listener is dead for a while
     // (G20). This is the other half: the listener is up, so the route is back.
@@ -1190,6 +1215,7 @@ pub fn run_proxy_service() -> Result<(), String> {
     record_version();
     gate::note_started();
     thread::spawn(warm_forever);
+    crate::dns_route::start();
     thread::spawn(watch_client_logs);
     spawn_proxy_env_maintainer();
     proxy::run(0)

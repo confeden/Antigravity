@@ -154,6 +154,50 @@ pub fn hint(ui: &mut egui::Ui, text: &str) {
     ui.label(egui::RichText::new(text).color(theme::MUTED).size(12.5));
 }
 
+/// A title followed by a small round «i»; the explanation is behind the button
+/// and opens under the title only when asked for. The text used to sit under
+/// every switch all the time, and the screen was mostly small print.
+///
+/// The «i» is drawn, not typed: no font the window may end up with is promised
+/// to carry a circled letter.
+pub fn title_info(ui: &mut egui::Ui, title: &str, hint_text: &str) {
+    let id = egui::Id::new(("info", title));
+    let mut open = ui.data(|d| d.get_temp::<bool>(id)).unwrap_or(false);
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(title).size(14.0));
+        if info_button(ui, open).clicked() {
+            open = !open;
+        }
+    });
+    if open {
+        hint(ui, hint_text);
+    }
+    ui.data_mut(|d| d.insert_temp(id, open));
+}
+
+/// The round «i» itself. `lit` while its text is showing.
+pub fn info_button(ui: &mut egui::Ui, lit: bool) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), Sense::click());
+    if ui.is_rect_visible(rect) {
+        let color = if lit || resp.hovered() {
+            theme::ACCENT
+        } else {
+            theme::MUTED
+        };
+        let painter = ui.painter();
+        painter.circle_stroke(rect.center(), 7.0, Stroke::new(1.2, color));
+        painter.text(
+            rect.center() + egui::vec2(0.0, 0.5),
+            egui::Align2::CENTER_CENTER,
+            "i",
+            egui::FontId::proportional(11.0),
+            color,
+        );
+    }
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text("Что это")
+}
+
 /// A coloured status dot, for install rows and provider rows.
 pub fn dot(ui: &mut egui::Ui, color: egui::Color32) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), Sense::hover());
