@@ -567,9 +567,7 @@ fn run_worker(
                 }
                 #[cfg(windows)]
                 if is_admin() && ctx.settings.auto_patch_wanted() && background::is_watchdog_enabled() {
-                    if let Err(e) = crate::launch_guard::install() {
-                        ctx.log(Level::Warn, format!("Защита запуска Desktop не обновлена: {e}"));
-                    }
+                    let _ = crate::launch_guard::uninstall();
                 }
                 ctx.busy(Some("Проверка установок"));
                 push_status(&mut ctx, Scan::Deep);
@@ -704,6 +702,8 @@ fn run_worker(
 /// invisible and harmless; in a window it reads as the tool spontaneously
 /// disabling itself, so the flip is watched for and explained.
 fn startup_housekeeping(ctx: &mut Ctx) {
+    #[cfg(windows)]
+    let _ = crate::launch_guard::uninstall();
     if !cfg!(target_os = "windows") || !is_admin() {
         return;
     }

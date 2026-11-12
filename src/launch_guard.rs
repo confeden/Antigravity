@@ -1,30 +1,18 @@
-//! A Desktop launch barrier. IFEO redirects only known Desktop paths here;
-//! polling alone cannot run before the updater's immediate --force-run launch.
+//! A Desktop launch barrier cleanup. IFEO is retired: intercepting Chromium
+//! child processes breaks Mojo IPC and Sandbox (N38, G94).
 use std::ffi::OsStr;
-use std::fs;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::ptr;
-use std::thread;
-use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
-use windows_sys::Win32::System::Diagnostics::Debug::DebugActiveProcessStop;
 use windows_sys::Win32::System::Threading::*;
 
-use crate::patch_binary::RepatchOutcome;
-
 pub const FLAG: &str = "--desktop-launch";
-const IFEO: &str = r"HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\Antigravity.exe";
 const OWNER: &str = "AGUnlocker";
-const WAIT: Duration = Duration::from_secs(120);
-
-fn ps_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "''"))
-}
 
 fn registry(script: &str) -> Result<(), String> {
-    let script = format!("$ErrorActionPreference='Stop'; {script}");
+    let script = format!("$ErrorActionPreference='Continue'; {script}");
     let out = crate::utils::powershell(&script)
         .ok_or_else(|| "launch guard: PowerShell did not complete".to_string())?;
     if out.status.success() {
@@ -37,63 +25,47 @@ fn registry(script: &str) -> Result<(), String> {
     }
 }
 
-/// A path filter avoids intercepting another user's installation or the IDE.
-/// Never overwrite a debugger installed by another tool, or remove its values.
+/// Retired: IFEO Debugger breaks Chromium/Electron multi-process architecture (N38).
+/// Always uninstalls any lingering filters.
+#[allow(dead_code)]
 pub fn install() -> Result<(), String> {
-    use sha2::{Digest, Sha256};
-    let mut roots = crate::discover_installs_fast();
-    for manual in crate::settings::manual_paths() {
-        if let Some(root) = crate::resolve_install_root(&manual) {
-            if !roots.contains(&root) {
-                roots.push(root);
-            }
-        }
-    }
-    let debugger = format!(
-        "\"{}\" {FLAG}",
-        crate::background::installed_exe().display()
-    );
-    let mut script = format!(
-        "$root={}; if (!(Test-Path -LiteralPath $root)) {{ New-Item -Path $root | Out-Null }}; \
-         $p=Get-ItemProperty -LiteralPath $root; \
-         if ($p.Debugger) {{ throw 'Antigravity already has an IFEO debugger' }}; \
-         if ($null -ne $p.UseFilter -and $p.UseFilter -ne 1) {{ throw 'IFEO UseFilter conflicts' }}; \
-         New-ItemProperty -LiteralPath $root -Name UseFilter -Value 1 -PropertyType DWord -Force | Out-Null; ",
-        ps_quote(IFEO)
-    );
-    for root in roots {
-        let exe = root.join("Antigravity.exe");
-        if !exe.is_file() || !root.join("resources/bin/language_server.exe").is_file() {
-            continue;
-        }
-        let path = exe.to_string_lossy();
-        let id = hex::encode(Sha256::digest(path.to_lowercase().as_bytes()));
-        script.push_str(&format!(
-            "$key=Join-Path $root '{}_{}'; \
-             if (Test-Path -LiteralPath $key) {{ \
-               $old=Get-ItemProperty -LiteralPath $key; \
-               if ($old.AGUnlockerOwner -ne '{}') {{ throw 'IFEO filter is not ours' }} \
-             }}; \
-             if (!(Test-Path -LiteralPath $key)) {{ New-Item -Path $key | Out-Null }}; \
-             New-ItemProperty -LiteralPath $key -Name AGUnlockerOwner -Value '{}' -PropertyType String -Force | Out-Null; \
-             New-ItemProperty -LiteralPath $key -Name FilterFullPath -Value {} -PropertyType String -Force | Out-Null; \
-             New-ItemProperty -LiteralPath $key -Name Debugger -Value {} -PropertyType String -Force | Out-Null; ",
-            OWNER, &id[..16], OWNER, OWNER, ps_quote(&path), ps_quote(&debugger)
-        ));
-    }
-    registry(&script)
+    uninstall()
 }
 
 pub fn uninstall() -> Result<(), String> {
     registry(&format!(
-        "$root={}; if (Test-Path -LiteralPath $root) {{ \
-           Get-ChildItem -LiteralPath $root | ForEach-Object {{ \
-             $p=Get-ItemProperty -LiteralPath $_.PSPath; \
-             if ($p.AGUnlockerOwner -eq '{}') {{ Remove-Item -LiteralPath $_.PSPath -Recurse }} \
-           }} \
+        "@('HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options\\Antigravity.exe', \
+           'HKLM:\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options\\Antigravity.exe') | ForEach-Object {{ \
+             $root = $_; \
+             if (Test-Path -LiteralPath $root) {{ \
+               try {{ \
+                 Get-ChildItem -LiteralPath $root -ErrorAction SilentlyContinue | ForEach-Object {{ \
+                   $p = Get-ItemProperty -LiteralPath $_.PSPath -ErrorAction SilentlyContinue; \
+                   if ($p.AGUnlockerOwner -eq '{owner}' -or $_.PSChildName -like '{owner}_*') {{ \
+                     Remove-Item -LiteralPath $_.PSPath -Recurse -Force -ErrorAction SilentlyContinue \
+                   }} \
+                 }}; \
+                 $remaining = Get-ChildItem -LiteralPath $root -ErrorAction SilentlyContinue; \
+                 $prop = Get-ItemProperty -LiteralPath $root -ErrorAction SilentlyContinue; \
+                 if (($null -eq $remaining -or $remaining.Count -eq 0) -and ($null -eq $prop.Debugger -or $prop.Debugger -like '*ag_dns*')) {{ \
+                   Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue \
+                 }} \
+               }} catch {{}} \
+             }} \
+           }}; \
+         $compat = 'HKCU:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\AppCompatFlags\\Layers'; \
+         if (Test-Path -LiteralPath $compat) {{ \
+           try {{ \
+             (Get-ItemProperty -LiteralPath $compat -ErrorAction SilentlyContinue).PSObject.Properties | \
+               Where-Object {{ $_.Name -like '*Antigravity.exe' }} | \
+               ForEach-Object {{ \
+                 if ($_.Value -match '640X480|256COLOR') {{ \
+                   Remove-ItemProperty -LiteralPath $compat -Name $_.Name -ErrorAction SilentlyContinue \
+                 }} \
+               }} \
+           }} catch {{}} \
          }}",
-        ps_quote(IFEO),
-        OWNER
+        owner = OWNER
     ))
 }
 
@@ -130,59 +102,6 @@ fn command_tail(raw: &[u16]) -> Option<Vec<u16>> {
     (i < raw.len()).then(|| raw[i..].to_vec())
 }
 
-fn prepare(exe: &Path) -> Result<(), String> {
-    let root = exe.parent().ok_or("Desktop has no parent directory")?;
-    let target = root.join("resources/bin/language_server.exe");
-    let deadline = Instant::now() + WAIT;
-    let mut previous = None;
-    let mut last = "updater is still writing files".to_string();
-    crate::watchdog::log("Desktop launch: waiting for update completion and patch");
-    loop {
-        if !crate::settings::auto_patch_wanted() {
-            return Ok(());
-        }
-        let shape = fs::metadata(&target)
-            .and_then(|m| Ok((m.len(), m.modified()?)))
-            .ok();
-        if !crate::watchdog::updater_busy(&crate::watchdog::updater_dirs())
-            && shape.is_some()
-            && shape == previous
-        {
-            match crate::patch_binary::repatch_before_launch(&target) {
-                RepatchOutcome::AlreadyPatched | RepatchOutcome::Repatched(_) => {
-                    check_stamp(&target)?;
-                    crate::watchdog::log("Desktop launch: patch ready, launch allowed");
-                    return Ok(());
-                }
-                RepatchOutcome::SignatureMissing => return Err("Эта версия Language Server не поддерживается. Обновите анлокер; запуск остановлен.".into()),
-                RepatchOutcome::Failed(e) | RepatchOutcome::Deferred(e) => last = e,
-            }
-        }
-        previous = shape;
-        if Instant::now() >= deadline {
-            return Err(format!("Не удалось подготовить Language Server: {last}"));
-        }
-        thread::sleep(Duration::from_millis(500));
-    }
-}
-
-fn check_stamp(target: &Path) -> Result<(), String> {
-    let mut cmd = std::process::Command::new(target);
-    cmd.arg("--stamp");
-    let out =
-        crate::utils::bounded_output(crate::utils::no_window(&mut cmd), Duration::from_secs(15))
-            .ok_or("Language Server --stamp did not complete; Desktop launch stopped")?;
-    if out.status.success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "Language Server --stamp failed ({}): {}",
-            out.status,
-            crate::utils::mask_path(String::from_utf8_lossy(&out.stderr).trim())
-        ))
-    }
-}
-
 struct Handle(HANDLE);
 impl Drop for Handle {
     fn drop(&mut self) {
@@ -192,16 +111,12 @@ impl Drop for Handle {
     }
 }
 
-/// DEBUG_ONLY_THIS_PROCESS bypasses IFEO recursively. Detach before the first
-/// instruction executes, then release the explicitly suspended primary thread.
 fn launch(exe: &Path, command: &mut [u16]) -> Result<Handle, String> {
     let mut si: STARTUPINFOW = unsafe { std::mem::zeroed() };
     unsafe {
         GetStartupInfoW(&mut si);
     }
     si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
-    // The parent's CRT handle table is private to that process; forwarding its
-    // reserved blob makes a console child initialise invalid descriptors.
     si.lpReserved = ptr::null_mut();
     si.cbReserved2 = 0;
     si.lpReserved2 = ptr::null_mut();
@@ -213,7 +128,7 @@ fn launch(exe: &Path, command: &mut [u16]) -> Result<Handle, String> {
             ptr::null(),
             ptr::null(),
             (si.dwFlags & STARTF_USESTDHANDLES != 0) as i32,
-            DEBUG_ONLY_THIS_PROCESS | CREATE_SUSPENDED,
+            CREATE_SUSPENDED,
             ptr::null(),
             ptr::null(),
             &si,
@@ -228,14 +143,6 @@ fn launch(exe: &Path, command: &mut [u16]) -> Result<Handle, String> {
     }
     let process = Handle(pi.hProcess);
     let thread = Handle(pi.hThread);
-    let detached = unsafe { DebugActiveProcessStop(pi.dwProcessId) };
-    if detached == 0 {
-        let error = std::io::Error::last_os_error();
-        unsafe {
-            TerminateProcess(process.0, 1);
-        }
-        return Err(format!("Detach Desktop: {error}"));
-    }
     if unsafe { ResumeThread(thread.0) } == u32::MAX {
         let error = std::io::Error::last_os_error();
         unsafe {
@@ -257,15 +164,10 @@ pub fn run() {
         {
             return Err("Unexpected Desktop path".to_string());
         }
-        // Chromium starts its helpers through the same image. They must not
-        // wait for the updater or rescan a 150 MB binary on every renderer.
-        if !args
-            .iter()
-            .skip(3)
-            .any(|a| a.to_string_lossy().starts_with("--type="))
-        {
-            prepare(&exe)?;
-        }
+        // Remove lingering IFEO filter and bad compat flags so that child
+        // processes and future launches run natively.
+        let _ = uninstall();
+
         unsafe extern "system" {
             fn GetCommandLineW() -> *const u16;
         }

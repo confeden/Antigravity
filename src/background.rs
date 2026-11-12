@@ -362,6 +362,7 @@ mod windows_impl {
             return Ok(());
         }
         enable()?;
+        let _ = crate::launch_guard::uninstall();
         if is_watchdog_enabled() && crate::settings::auto_patch_wanted() {
             if let Err(e) = enable_watchdog() {
                 // DNS is already running. A launch-filter conflict must not
@@ -420,7 +421,7 @@ mod windows_impl {
         if !exe.exists() {
             return Err("exe не установлен в %ProgramData%".to_string());
         }
-        crate::launch_guard::install()?;
+        let _ = crate::launch_guard::uninstall();
         let cmd = format!(
             "Stop-ScheduledTask -TaskName '{task}' -ErrorAction SilentlyContinue; \
              $a=New-ScheduledTaskAction -Execute '{exe}' -Argument '{flag}'; \

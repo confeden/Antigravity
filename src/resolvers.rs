@@ -3002,8 +3002,8 @@ mod tests {
     /// ten-minute verdict meant the relay advertised a corpse for nine of them.
     #[test]
     fn the_warm_path_re_probes_instead_of_trusting_what_it_knows() {
-        let addr = v4("203.0.113.9");
-        // A blackhole address in TEST-NET-3: nothing there, so a probe says dead.
+        let addr = v4("127.0.0.254");
+        // A blackhole address: nothing there, so a probe says dead.
         remember_liveness(addr, true);
         assert_eq!(cached_liveness(&addr), Some(true));
 
