@@ -112,6 +112,9 @@ pub struct App {
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         theme::apply(&cc.egui_ctx);
+        if let Some(rs) = cc.wgpu_render_state.as_ref() {
+            renderer::watch_device(&rs.device);
+        }
 
         let (up_tx, update_rx) = channel();
         let up_ctx = cc.egui_ctx.clone();
@@ -337,7 +340,11 @@ pub fn run() -> Result<(), String> {
             viewport: {
                 let mut vp = egui::ViewportBuilder::default()
                     .with_inner_size([WIN_W, WIN_H])
-                    .with_min_inner_size([520.0, 620.0])
+                    // Width is fixed: the layout is built for one width, and
+                    // only the height is the user's to change.
+                    .with_min_inner_size([WIN_W, 620.0])
+                    .with_max_inner_size([WIN_W, 4000.0])
+                    .with_maximize_button(false)
                     .with_title(title());
                 // The exe resource covers Explorer and the taskbar; this is what
                 // puts the same picture in the title bar and Alt-Tab.

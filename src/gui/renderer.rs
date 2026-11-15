@@ -299,6 +299,13 @@ pub fn install() {
                 }
             }
         }
+        // The window was up and the GPU went away under it: not a bug to show,
+        // a device to replace. The panic then ends this process as usual.
+        if drawing && CONFIRMED.load(Ordering::SeqCst) && is_gpu_loss_panic(&what) {
+            if restart_after_gpu_loss() {
+                return;
+            }
+        }
         crate::utils::message_box(
             "Antigravity Unlocker",
             &format!("Программа аварийно завершилась.\n\n{what}"),
@@ -322,19 +329,89 @@ fn panic_text(info: &std::panic::PanicHookInfo<'_>) -> String {
 /// Starts this exe again with the same arguments and `kind` forced. Same token,
 /// so an elevated window comes back elevated with no prompt.
 fn relaunch_with(kind: Kind) -> bool {
+    relaunch_with_env(kind, None)
+}
+
+fn relaunch_with_env(kind: Kind, restarts: Option<u32>) -> bool {
     let Ok(exe) = std::env::current_exe() else {
         return false;
     };
-    std::process::Command::new(exe)
-        .args(std::env::args_os().skip(1))
-        .env(ENV, kind.name())
-        .spawn()
-        .is_ok()
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(std::env::args_os().skip(1)).env(ENV, kind.name());
+    if let Some(n) = restarts {
+        cmd.env(RESTARTS_ENV, n.to_string());
+    }
+    cmd.spawn().is_ok()
+}
+
+// ---------------------------------------------------------------------------
+// The GPU going away under a window that was fine
+// ---------------------------------------------------------------------------
+
+/// How many times in a row this exe has been started again because its GPU
+/// device was lost, so a driver that keeps resetting cannot make a loop.
+const RESTARTS_ENV: &str = "AG_UNLOCKER_GPU_RESTARTS";
+const MAX_RESTARTS: u32 = 3;
+/// Both the device-lost callback (its own thread) and the panic hook (the main
+/// one) can see the same loss; only the first starts the new window.
+static RESTARTING: AtomicBool = AtomicBool::new(false);
+
+/// A driver reinstall, a TDR reset, or the display going to sleep can take the
+/// GPU device away from a window that has been drawing for hours. wgpu then
+/// refuses every allocation, and egui-wgpu turns the refusal into a panic
+/// ("Failed to create staging buffer for index data", measured after an Nvidia
+/// driver reinstall). The window cannot be repaired in place - its device, its
+/// surface and every texture are gone - but a new process gets a fresh device,
+/// so that is what happens, instead of a crash dialog on a screen that was off.
+fn restart_after_gpu_loss() -> bool {
+    let Some(kind) = active() else {
+        return false;
+    };
+    let done = std::env::var(RESTARTS_ENV)
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(0);
+    if done >= MAX_RESTARTS || RESTARTING.swap(true, Ordering::SeqCst) {
+        return false;
+    }
+    if relaunch_with_env(kind, Some(done + 1)) {
+        return true;
+    }
+    RESTARTING.store(false, Ordering::SeqCst);
+    false
+}
+
+/// Whether a panic message is the wgpu allocation failure a lost device ends in.
+fn is_gpu_loss_panic(msg: &str) -> bool {
+    msg.contains("Failed to create staging buffer")
+        || msg.contains("Device is lost")
+        || msg.contains("device is lost")
+        || msg.contains("DeviceLost")
+}
+
+/// Called from `App::new` with the window's own device: when it is lost for any
+/// reason but our own `destroy`, this process is replaced by a new one.
+pub fn watch_device(device: &wgpu::Device) {
+    device.set_device_lost_callback(|reason, _msg| {
+        if reason != wgpu::DeviceLostReason::Destroyed && restart_after_gpu_loss() {
+            std::process::exit(0);
+        }
+    });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_staging_buffer_panic_of_a_lost_device_is_recognised() {
+        // Verbatim from a crash after an Nvidia driver reinstall.
+        assert!(is_gpu_loss_panic(
+            "Failed to create staging buffer for index data. Index count: 19776. \
+             Required index buffer size: 79104. Actual size 171528 and capacity: 171528 (bytes)"
+        ));
+        assert!(!is_gpu_loss_panic("index out of bounds: the len is 3"));
+    }
 
     #[test]
     fn every_renderer_round_trips_through_its_name() {
