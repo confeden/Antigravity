@@ -122,6 +122,7 @@ enum Input {
     Path { text: String, error: Option<String> },
     OwnProxy { text: String },
     CustomDns { text: String },
+    GroupKey { text: String },
 }
 
 /// One selectable line of the main list.
@@ -335,7 +336,8 @@ impl App {
         } else if let Some(
             Input::Path { text: t, .. }
             | Input::OwnProxy { text: t }
-            | Input::CustomDns { text: t },
+            | Input::CustomDns { text: t }
+            | Input::GroupKey { text: t },
         ) = &mut self.input
         {
             t.push_str(text);
@@ -388,7 +390,10 @@ impl App {
     fn on_input_key(&mut self, k: KeyEvent, ctrl: bool) {
         let Some(input) = &mut self.input else { return };
         let text = match input {
-            Input::Path { text, .. } | Input::OwnProxy { text } | Input::CustomDns { text } => text,
+            Input::Path { text, .. }
+            | Input::OwnProxy { text }
+            | Input::CustomDns { text }
+            | Input::GroupKey { text } => text,
         };
         match k.code {
             KeyCode::Esc => self.input = None,
@@ -424,6 +429,12 @@ impl App {
             }
             Some(Input::CustomDns { text }) => {
                 self.worker.send(Cmd::SetCustomDns(text.trim().to_string()))
+            }
+            Some(Input::GroupKey { text }) => {
+                let key = text.trim().to_string();
+                if !key.is_empty() {
+                    self.worker.send(Cmd::SetGroupKey(key));
+                }
             }
             None => {}
         }
@@ -578,10 +589,16 @@ impl App {
                 ));
             }
             Row::GroupProxyPaste => {
-                if let Some(text) = crate::utils::clipboard_text() {
-                    self.worker.send(Cmd::SetGroupKey(text));
-                } else {
-                    self.toast("Буфер обмена пуст");
+                // Over SSH (or with no display) there is no clipboard to read:
+                // the key is then typed or pasted into a field, which the
+                // terminal delivers as a bracketed paste.
+                match crate::utils::clipboard_text().filter(|t| !t.trim().is_empty()) {
+                    Some(text) => self.worker.send(Cmd::SetGroupKey(text)),
+                    None => {
+                        self.input = Some(Input::GroupKey {
+                            text: String::new(),
+                        })
+                    }
                 }
             }
             Row::GroupProxyText => {}
@@ -788,7 +805,7 @@ impl App {
             Row::GroupProxyText => "Код этого ПК и состояние ключа.".into(),
             Row::GroupProxyOpenRoom => "Открыть Telegram-комнату для получения ключа.".into(),
             Row::GroupProxyCopy => "Скопировать команду для получения ключа.".into(),
-            Row::GroupProxyPaste => "Вставить полученный ключ из буфера обмена.".into(),
+            Row::GroupProxyPaste => "Вставить полученный ключ (из буфера обмена или в поле ввода).".into(),
             Row::CustomDnsText => "Enter — задать свой DNS: IPv4, https://… (DoH) или tls://… (DoT) через пробел.".into(),
             Row::OwnProxyText => {
                 "Enter — изменить адрес: логин:пароль@адрес:порт (или адрес:порт без пароля).".into()
@@ -880,8 +897,10 @@ impl App {
                 let pc = crate::hwid::pc_code();
                 let key_text = if crate::settings::group_key().is_empty() {
                     "ключа нет"
+                } else if crate::group::key_rejected() {
+                    "код перестал работать - получите новый в группе"
                 } else {
-                    "ключ принят"
+                    "ключ есть"
                 };
                 ListItem::new(Line::from(vec![
                     Span::raw("      Код ПК: "),
@@ -1207,6 +1226,12 @@ impl App {
                 "Формат: логин:пароль@адрес:порт — или просто адрес:порт, если пароля нет. \
                  Например ivan:secret@203.0.113.9:3128. Только HTTP-прокси. \
                  Пустая строка — убрать прокси.",
+                text,
+                None,
+            ),
+            Some(Input::GroupKey { text }) => (
+                " Ключ группового прокси ",
+                "Буфер обмена недоступен или пуст. Вставьте ключ сюда (Ctrl+Shift+V или правая кнопка мыши в терминале) или наберите его.",
                 text,
                 None,
             ),

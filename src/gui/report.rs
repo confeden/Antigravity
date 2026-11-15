@@ -185,6 +185,8 @@ fn status_part(out: &mut String, s: &Status) {
     let _ = writeln!(out, "Локальный прокси: {}", onoff(&s.local_proxy));
     let key_present = if crate::settings::group_key().is_empty() {
         "нет"
+    } else if crate::group::key_rejected() {
+        "есть, но сервер его не принимает (перестал работать)"
     } else {
         "есть"
     };

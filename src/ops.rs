@@ -255,18 +255,9 @@ impl Status {
 pub fn bypass_order(on: bool) -> Vec<Cap> {
     if on {
         // The user's own proxy is theirs to switch on: it needs an address.
-        vec![
-            Cap::Dns,
-            Cap::LocalProxy,
-            Cap::GroupProxy,
-        ]
+        vec![Cap::Dns, Cap::LocalProxy, Cap::GroupProxy]
     } else {
-        vec![
-            Cap::LocalProxy,
-            Cap::OwnProxy,
-            Cap::GroupProxy,
-            Cap::Dns,
-        ]
+        vec![Cap::LocalProxy, Cap::OwnProxy, Cap::GroupProxy, Cap::Dns]
     }
 }
 
@@ -566,7 +557,10 @@ fn run_worker(
                     ctx.settings.save();
                 }
                 #[cfg(windows)]
-                if is_admin() && ctx.settings.auto_patch_wanted() && background::is_watchdog_enabled() {
+                if is_admin()
+                    && ctx.settings.auto_patch_wanted()
+                    && background::is_watchdog_enabled()
+                {
                     let _ = crate::launch_guard::uninstall();
                 }
                 ctx.busy(Some("Проверка установок"));
@@ -845,7 +839,13 @@ impl Status {
     /// `settings_only_status` cannot drift apart — the bug that would produce is
     /// a switch that answers differently depending on which path drew it.
     fn with_settings_switches(mut self, s: &Settings) -> Self {
-        self.group_proxy = on_off(s.group_proxy);
+        // On, but the pool refuses this key (replaced by a newer one, or the PC
+        // changed): said on the switch itself, where the user looks.
+        self.group_proxy = if s.group_proxy && crate::group::key_rejected() {
+            State::Partial(crate::group::KEY_DEAD_NOTE.into())
+        } else {
+            on_off(s.group_proxy)
+        };
         self.custom_dns_text = s.custom_dns.clone();
         self.dns_rotation = if s.rotate_providers {
             State::On
@@ -1527,7 +1527,8 @@ fn patch_found(ctx: &mut Ctx, found: Vec<(&'static str, PathBuf)>) -> bool {
                 patch_binary::RepatchOutcome::Repatched(_) => patched += 1,
                 patch_binary::RepatchOutcome::AlreadyPatched => {}
                 patch_binary::RepatchOutcome::SignatureMissing => unknown += 1,
-                patch_binary::RepatchOutcome::Failed(e) | patch_binary::RepatchOutcome::Deferred(e) => failed = Some(e),
+                patch_binary::RepatchOutcome::Failed(e)
+                | patch_binary::RepatchOutcome::Deferred(e) => failed = Some(e),
             }
         }
         let where_ = crate::utils::mask_path(&inst.display().to_string());
@@ -1552,8 +1553,9 @@ fn patch_found(ctx: &mut Ctx, found: Vec<(&'static str, PathBuf)>) -> bool {
             ctx.log(
                 Level::Warn,
                 format!(
-                    "Автопатч: {} — эта сборка Antigravity анлокеру ещё не знакома, файлы не тронуты. Нужна новая версия анлокера.",
-                    label
+                    "Автопатч: {} — эта сборка Antigravity анлокеру ещё не знакома, файлы не тронуты. Нужна новая версия анлокера. [{}]",
+                    label,
+                    patch_binary::describe_targets(&inst)
                 ),
             );
         }
@@ -2209,11 +2211,7 @@ fn set_custom_dns(ctx: &mut Ctx, text: &str) {
             return;
         }
     };
-    ctx.settings.custom_dns = found
-        .iter()
-        .map(|s| s.text())
-        .collect::<Vec<_>>()
-        .join(" ");
+    ctx.settings.custom_dns = found.iter().map(|s| s.text()).collect::<Vec<_>>().join(" ");
     ctx.settings
         .set_provider_enabled(crate::resolvers::CUSTOM_NAME, true);
     ctx.log(

@@ -425,6 +425,45 @@ fn rewrite(bin_path: &Path, from: &[u8], to: &[u8]) -> Result<usize, String> {
     Ok(replaced)
 }
 
+/// What each patch target of an install is, for the line that says a build is
+/// not known: its kind (ELF / script / PE / other), size, and where a symlink
+/// really points. A report of "не знакома" without this cannot tell a changed
+/// binary from a launcher stub or a symlink to the real file elsewhere.
+pub fn describe_targets(inst: &Path) -> String {
+    let mut parts = Vec::new();
+    for bin in binary_targets(inst) {
+        let Ok(meta) = fs::symlink_metadata(&bin) else {
+            continue;
+        };
+        let mut head = [0u8; 4];
+        let n = fs::File::open(&bin)
+            .and_then(|mut f| std::io::Read::read(&mut f, &mut head))
+            .unwrap_or(0);
+        let kind = match &head[..n] {
+            [0x7f, b'E', b'L', b'F'] => "ELF",
+            [b'#', b'!', ..] => "скрипт",
+            [b'M', b'Z', ..] => "PE",
+            [0xcf | 0xca, 0xfa | 0xfe, ..] => "Mach-O",
+            _ => "другое",
+        };
+        let name = bin.file_name().unwrap_or_default().to_string_lossy();
+        let link = if meta.file_type().is_symlink() {
+            match fs::canonicalize(&bin) {
+                Ok(t) => format!(
+                    ", ссылка → {}",
+                    crate::utils::mask_path(&t.display().to_string())
+                ),
+                Err(_) => ", битая ссылка".to_string(),
+            }
+        } else {
+            String::new()
+        };
+        let size = fs::metadata(&bin).map(|m| m.len()).unwrap_or(0);
+        parts.push(format!("{name}: {kind}, {} КБ{link}", size / 1024));
+    }
+    parts.join("; ")
+}
+
 pub fn patch_binary(_inst: &Path, bin_path: &Path) -> Result<usize, String> {
     let (old_bytes, new_bytes) = field_signatures();
     rewrite(bin_path, &old_bytes, &new_bytes)

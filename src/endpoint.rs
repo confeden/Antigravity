@@ -390,7 +390,12 @@ pub fn apply_proxy(url: &str, _ca_path: &str) -> Result<Outcome, String> {
     );
     let already = fs::read_to_string(&path).ok().as_deref() == Some(body.as_str());
     let migrated = remove_legacy_proxy_env(url).unwrap_or(false);
-    if already && !migrated {
+    // `environment.d` is read only by the systemd *user manager*. A session that
+    // lightdm/xfce4-session starts (Linux Mint XFCE) and a terminal or `agy`
+    // launched from it never see it, so the patched CLI stayed on the direct
+    // route and kept its 400 (P51). The shells source the same file.
+    let hooked = ensure_shell_hooks(&path);
+    if already && !migrated && !hooked {
         return Ok(Outcome::AlreadySet);
     }
     if !already {
@@ -409,6 +414,92 @@ pub fn apply_proxy(url: &str, _ca_path: &str) -> Result<Outcome, String> {
         .status()
         .ok();
     Ok(Outcome::Applied)
+}
+
+const SHELL_BEGIN: &str = "# >>> ag-unlocker >>>";
+const SHELL_END: &str = "# <<< ag-unlocker <<<";
+
+/// The block put into a shell startup file: it sources the same `KEY=value`
+/// drop-in `environment.d` reads, so the port lives in one place and the block
+/// itself never changes. A missing file (after a revert) makes it a no-op.
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+fn shell_block(conf: &Path) -> String {
+    format!(
+        "{SHELL_BEGIN}\n[ -r '{p}' ] && {{ set -a; . '{p}'; set +a; }}\n{SHELL_END}\n",
+        p = conf.display()
+    )
+}
+
+/// `text` with our block replaced by `block` (or removed when `block` is None).
+/// Returns None when nothing would change.
+fn rewrite_shell_block(text: &str, block: Option<&str>) -> Option<String> {
+    let out = match (text.find(SHELL_BEGIN), text.find(SHELL_END)) {
+        (Some(b), Some(e)) if e > b => {
+            let end = e + SHELL_END.len();
+            let end = if text[end..].starts_with('\n') {
+                end + 1
+            } else {
+                end
+            };
+            format!("{}{}{}", &text[..b], block.unwrap_or(""), &text[end..])
+        }
+        _ => match block {
+            Some(blk) => {
+                let sep = if text.is_empty() || text.ends_with('\n') {
+                    ""
+                } else {
+                    "\n"
+                };
+                format!("{text}{sep}{blk}")
+            }
+            None => return None,
+        },
+    };
+    (out != text).then_some(out)
+}
+
+/// Shell files that reach what `environment.d` does not: `~/.profile` (lightdm
+/// and login shells) and `~/.bashrc` (a terminal's non-login shell). `.profile`
+/// is created when missing; `.bashrc` only edited if the user has one.
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+fn shell_files(home: &Path) -> [(PathBuf, bool); 2] {
+    [(home.join(".profile"), true), (home.join(".bashrc"), false)]
+}
+
+/// True when any file was changed.
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+fn ensure_shell_hooks(conf: &Path) -> bool {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return false;
+    };
+    let block = shell_block(conf);
+    let mut changed = false;
+    for (file, create) in shell_files(&home) {
+        let text = match fs::read_to_string(&file) {
+            Ok(t) => t,
+            Err(_) if create && !file.exists() => String::new(),
+            Err(_) => continue,
+        };
+        if let Some(new) = rewrite_shell_block(&text, Some(&block)) {
+            changed |= fs::write(&file, new).is_ok();
+        }
+    }
+    changed
+}
+
+/// Takes our block back out of the shell files (revert).
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+fn remove_shell_hooks() {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return;
+    };
+    for (file, _) in shell_files(&home) {
+        if let Ok(text) = fs::read_to_string(&file) {
+            if let Some(new) = rewrite_shell_block(&text, None) {
+                let _ = fs::write(&file, new);
+            }
+        }
+    }
 }
 
 /// `~/.config/environment.d/ag-unlocker.conf`, honouring `XDG_CONFIG_HOME`.
@@ -465,6 +556,7 @@ pub fn remove_proxy(url: &str, ca_path: &str) -> Result<(), String> {
 #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 pub fn remove_proxy(url: &str, _ca_path: &str) -> Result<(), String> {
     use std::process::Command;
+    remove_shell_hooks();
     if let Ok(path) = environment_d_path() {
         if fs::remove_file(&path).is_ok() {
             // Measured (WSL, systemd user manager): a variable the environment.d
@@ -943,6 +1035,20 @@ pub fn proxy_env_is_ours() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The shell block is added once, is idempotent, keeps the user's own lines
+    /// and comes out again exactly as it went in.
+    #[test]
+    fn the_shell_block_round_trips() {
+        let block = format!("{SHELL_BEGIN}\nx\n{SHELL_END}\n");
+        let user = "export A=1\nalias l='ls'";
+        let added = rewrite_shell_block(user, Some(&block)).unwrap();
+        assert!(added.starts_with("export A=1\nalias l='ls'\n# >>>"));
+        assert_eq!(rewrite_shell_block(&added, Some(&block)), None);
+        let removed = rewrite_shell_block(&added, None).unwrap();
+        assert_eq!(removed, format!("{user}\n"));
+        assert_eq!(rewrite_shell_block("", None), None);
+    }
 
     /// The user's own `http.proxy` is read as intent: set means set, empty or
     /// commented out means nothing, and a URL's own `//` is not a comment.

@@ -69,6 +69,10 @@ struct GroupState {
     /// The server new tunnels go to. Changes only while no tunnel is open, or
     /// when it stops answering — a switch never cuts a model answer midway.
     current: Option<usize>,
+    /// Servers that answered this key with a refusal (a plain 404, the way they
+    /// answer anyone who is not a patcher) since one last accepted it. Network
+    /// trouble never counts: only an answer does.
+    refusals: u32,
 }
 
 fn group_state() -> &'static Mutex<GroupState> {
@@ -79,8 +83,47 @@ fn group_state() -> &'static Mutex<GroupState> {
             parsed: None,
             servers: Vec::new(),
             current: None,
+            refusals: 0,
         })
     })
+}
+
+/// Refusals in a row, with no acceptance between, after which the key counts as
+/// dead. A poll asks up to `STATUS_TRIES` servers, so one poll of a two-server
+/// pool already gets there; a single stray answer does not.
+const REJECT_AFTER: u32 = 2;
+
+/// What the switch says once the pool refuses this PC's key: the key was
+/// replaced by a newer one (one PC per user), or this PC's code changed.
+pub const KEY_DEAD_NOTE: &str = "код перестал работать — получите новый в группе и вставьте его";
+
+/// A server answered this key with a refusal.
+fn note_refused(key: &GroupKey) {
+    let mut state = group_state().lock().unwrap();
+    if state.parsed.as_ref().map(key_id) == Some(key_id(key)) {
+        state.refusals = state.refusals.saturating_add(1);
+    }
+}
+
+/// A server accepted this key (a signed status answer, or a CONNECT that
+/// opened): whatever refusals came before were not about the key.
+fn note_accepted(key: &GroupKey) {
+    let mut state = group_state().lock().unwrap();
+    if state.parsed.as_ref().map(key_id) == Some(key_id(key)) {
+        state.refusals = 0;
+    }
+}
+
+/// The saved key is one the pool no longer accepts. False with no key, with a
+/// key just pasted (the count starts over with it) and while servers merely
+/// do not answer.
+pub fn key_rejected() -> bool {
+    let saved = settings::group_key();
+    if saved.is_empty() {
+        return false;
+    }
+    let state = group_state().lock().unwrap();
+    state.key_string == saved && state.parsed.is_some() && state.refusals >= REJECT_AFTER
 }
 
 /// Tunnels open through the group right now (any server).
@@ -387,6 +430,7 @@ pub fn get_active_key() -> Option<GroupKey> {
         state.parsed = parsed;
         state.servers = servers;
         state.current = None;
+        state.refusals = 0;
     }
     state.parsed.clone()
 }
@@ -599,8 +643,14 @@ fn open_agu2(
         .unwrap_or_default();
 
     if !status.contains(" 200") {
+        // An HTTP answer that is not 200 is the server's refusal of the key;
+        // a closed connection above is not, and does not count.
+        if status.starts_with("HTTP/") {
+            note_refused(key);
+        }
         return Err(format!("сервер группы отказал: {}", status));
     }
+    note_accepted(key);
 
     STAGES.with(|c| {
         let mut v = c.get();
@@ -960,6 +1010,7 @@ fn fetch_status(key: &GroupKey, server: &str) -> Result<Status, String> {
     let head = String::from_utf8_lossy(&raw[..end]).into_owned();
     let body = &raw[end + 4..];
     if !head.lines().next().unwrap_or("").contains(" 200") {
+        note_refused(key);
         return Err("сервер отказал".to_string());
     }
     let sig = head
@@ -974,6 +1025,7 @@ fn fetch_status(key: &GroupKey, server: &str) -> Result<Status, String> {
     if !crate::group_key::ct_eq(want.as_bytes(), sig.as_bytes()) {
         return Err("подпись не сходится".to_string());
     }
+    note_accepted(key);
     let v: serde_json::Value = serde_json::from_slice(body).map_err(|e| e.to_string())?;
     Ok(Status {
         cpu: v["cpu"].as_i64().unwrap_or(-1),
@@ -1181,6 +1233,34 @@ fn probe_via(key: &GroupKey, server: &str, force_refresh: bool) -> Result<(), St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refusals_count_until_a_server_accepts_the_key() {
+        let key = GroupKey {
+            host: "h.example".into(),
+            port: 443,
+            tg: 777_001,
+            code: "aaaaaaaa".into(),
+            issued: 1,
+            user_key: [0; 32],
+        };
+        let other = GroupKey { issued: 2, ..key.clone() };
+        {
+            let mut st = group_state().lock().unwrap();
+            st.parsed = Some(key.clone());
+            st.refusals = 0;
+        }
+        note_refused(&key);
+        note_refused(&other); // another key's refusal is not this key's
+        assert_eq!(group_state().lock().unwrap().refusals, 1);
+        note_refused(&key);
+        assert!(group_state().lock().unwrap().refusals >= REJECT_AFTER);
+        note_accepted(&other); // nor does another key's acceptance clear it
+        assert!(group_state().lock().unwrap().refusals >= REJECT_AFTER);
+        note_accepted(&key);
+        assert_eq!(group_state().lock().unwrap().refusals, 0);
+        group_state().lock().unwrap().parsed = None;
+    }
 
     #[test]
     fn a_server_the_pool_no_longer_lists_is_dropped() {

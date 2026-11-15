@@ -736,6 +736,18 @@ fn group_proxy_field(app: &mut App, ui: &mut egui::Ui) {
         app.group_key_input = text.clone();
         app.group_key_sent = text;
     }
+    if crate::group::key_rejected() {
+        ui.add_space(2.0);
+        ui.label(
+            egui::RichText::new(format!(
+                "Код для прокси из группы перестал работать: {}.",
+                crate::group::KEY_DEAD_NOTE
+                    .trim_start_matches("код перестал работать — ")
+            ))
+            .size(12.0)
+            .color(theme::BAD),
+        );
+    }
 }
 
 /// The group's topic where the bot answers the command.
