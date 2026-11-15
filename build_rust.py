@@ -12,7 +12,7 @@ if hasattr(sys.stderr, 'reconfigure'):
     sys.stderr.reconfigure(encoding='utf-8', errors='replace')
 
 # Must match src\auth.rs (LICENSE_VERSION_SEP): the license key is derived from
-# base_secret + SEP + version, so keys are unique per release.
+# base_secret + SEP + MAJOR.MINOR, so a key holds for every patch of a minor.
 LICENSE_VERSION_SEP = "::"
 
 
@@ -1071,7 +1071,7 @@ def main():
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
     print("[INFO] Starting build process...")
 
-    VERSION = "2.31.2"
+    VERSION = "2.32.1"
     version = VERSION
     # env!("CARGO_PKG_VERSION") only sees MAJOR.MINOR.PATCH, so the key salt uses
     # the same trimmed value the binary will compile with.
@@ -1097,7 +1097,10 @@ def main():
     # The secret is committed in the sources; the key generator derives from the
     # exact same base + version salt, so its keys always match this build.
     base_secret = read_base_secret(auth_rs_path)
-    key_secret_phrase = f"{base_secret}{LICENSE_VERSION_SEP}{cargo_version}"
+    # Keys are bound to MAJOR.MINOR only (src/auth.rs::license_version): 2.32.1's
+    # key also opens 2.32.4.
+    license_version = ".".join(cargo_version.split(".")[:2])
+    key_secret_phrase = f"{base_secret}{LICENSE_VERSION_SEP}{license_version}"
 
     keygen_code = "SECRET_PHRASE = " + repr(key_secret_phrase) + chr(10) + """
 import hashlib
@@ -1123,13 +1126,13 @@ def generate_key():
 
 def telegram_text(key):
     # Backticks make the key monospace (tap-to-copy) once sent in Telegram.
-    return 'Ключ для v' + VERSION + '+' + NL + NL + '`' + key + '`'
+    return 'Ключ для v' + VERSION + '.x' + NL + NL + '`' + key + '`'
 
 
 def html_clip(key):
     # CF_HTML: only the key is <code>, the sentence stays plain.
     crlf = chr(13) + chr(10)
-    frag = 'Ключ для v' + VERSION + '+<br><br><code>' + key + '</code>'
+    frag = 'Ключ для v' + VERSION + '.x<br><br><code>' + key + '</code>'
     pre = '<html><body><!--StartFragment-->'
     post = '<!--EndFragment--></body></html>'
     head = 'Version:0.9' + crlf + 'StartHTML:%010d' + crlf + 'EndHTML:%010d' + crlf + 'StartFragment:%010d' + crlf + 'EndFragment:%010d' + crlf
@@ -1344,8 +1347,8 @@ if __name__ == '__main__':
 
         if is_owner:
             print(f"Ваш генератор ключей для этой версии: {dist_keygen_path}")
-            print(f"\n[i] Ключи привязаны к версии {cargo_version}: на следующем релизе")
-            print("    (после смены VERSION здесь) они перестанут подходить, и людям")
+            print(f"\n[i] Ключи привязаны к линейке {license_version}.x: подходят ко всем")
+            print("    патчам линейки; после смены первых двух чисел VERSION людям")
             print("    понадобится новый ключ из t.me/nova_txt.")
             # Auto-generate some keys for convenience.
             print(f"\n5 ключей для версии {cargo_version}:")

@@ -5,23 +5,28 @@ use sha2::{Digest, Sha256};
 // * The base secret below is COMMITTED on purpose. A build made from the public
 //   GitHub sources must accept the very same keys the author hands out in
 //   Telegram, which is only possible if the secret ships in the source.
-// * Keys are salted with the crate version (env!("CARGO_PKG_VERSION")), so a key
-//   minted for one release does NOT validate on any other release. After every
-//   update users grab a fresh, free key from t.me/nova_txt.
+// * Keys are salted with the crate's MAJOR.MINOR (env!("CARGO_PKG_VERSION") cut
+//   to two parts), so a key minted for 2.32.1 also opens 2.32.4 but NOT 2.33.0.
+//   After a minor/major bump users grab a fresh, free key from t.me/nova_txt.
 //
 // This is not DRM: a determined user could derive keys from these public
 // sources. The point is simply to route ordinary users through the Telegram
 // group for their per-version key.
 const LICENSE_BASE_SECRET: &str = ")Q.QFyU+oOs#Z:jmtxonGfZi+w#|XG4<";
-// Must match dist_keygen.py exactly (base + separator + version).
+// Must match build_rust.py / dist_keygen.py exactly (base + separator + MAJOR.MINOR).
 const LICENSE_VERSION_SEP: &str = "::";
+
+/// The part of a version a key is bound to: `2.32.1` -> `2.32`.
+fn license_version(version: &str) -> String {
+    version.split('.').take(2).collect::<Vec<_>>().join(".")
+}
 
 fn key_secret() -> String {
     format!(
         "{}{}{}",
         LICENSE_BASE_SECRET,
         LICENSE_VERSION_SEP,
-        env!("CARGO_PKG_VERSION")
+        license_version(env!("CARGO_PKG_VERSION"))
     )
 }
 
@@ -82,6 +87,14 @@ mod tests {
         assert_ne!(other, key_secret());
         let stale = mint_key("ABCDEF123456", &other);
         assert!(!verify_key(&stale));
+    }
+
+    #[test]
+    fn a_key_survives_patch_versions_but_not_a_minor_bump() {
+        assert_eq!(license_version("2.32.1"), "2.32");
+        assert_eq!(license_version("2.32.1"), license_version("2.32.4"));
+        assert_ne!(license_version("2.32.1"), license_version("2.33.0"));
+        assert_ne!(license_version("2.32.1"), license_version("3.32.1"));
     }
 
     #[test]

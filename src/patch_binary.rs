@@ -16,15 +16,29 @@ impl PatchLock {
         use sha2::{Digest, Sha256};
         use windows_sys::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
         let absolute = fs::canonicalize(path).map_err(|e| e.to_string())?;
-        let id = hex::encode(Sha256::digest(absolute.to_string_lossy().to_lowercase().as_bytes()));
-        let name: Vec<_> = format!("Global\\AGUnlocker.Patch.{id}").encode_utf16().chain(Some(0)).collect();
+        let id = hex::encode(Sha256::digest(
+            absolute.to_string_lossy().to_lowercase().as_bytes(),
+        ));
+        let name: Vec<_> = format!("Global\\AGUnlocker.Patch.{id}")
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
         let handle = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
-        if handle.is_null() { return Err(std::io::Error::last_os_error().to_string()); }
+        if handle.is_null() {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
         let waited = unsafe { WaitForSingleObject(handle, 15_000) };
-        if waited == 0 || waited == 0x80 { return Ok(Self(handle)); }
-        let error = if waited == 258 { "another patch writer is still busy".into() }
-            else { std::io::Error::last_os_error().to_string() };
-        unsafe { windows_sys::Win32::Foundation::CloseHandle(handle); }
+        if waited == 0 || waited == 0x80 {
+            return Ok(Self(handle));
+        }
+        let error = if waited == 258 {
+            "another patch writer is still busy".into()
+        } else {
+            std::io::Error::last_os_error().to_string()
+        };
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(handle);
+        }
         Err(error)
     }
 }
@@ -187,12 +201,78 @@ pub fn quit_app(app: &Path) {
 #[cfg(not(target_os = "windows"))]
 pub fn quit_app(_app: &Path) {}
 
+/// True when this process runs in Windows session 0 - the non-interactive one
+/// the S4U tasks (watchdog, relay) live in. Anything started from there has no
+/// desktop to draw on.
+#[cfg(target_os = "windows")]
+fn in_service_session() -> bool {
+    use windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId;
+    use windows_sys::Win32::System::Threading::GetCurrentProcessId;
+    let mut sid: u32 = u32::MAX;
+    // SAFETY: plain out-parameter call with a valid pointer.
+    let ok = unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut sid) };
+    ok != 0 && sid == 0
+}
+
+/// Starts the app in the user's own session through a one-shot Interactive
+/// scheduled task (no password, no SeTcb privilege needed; the user must be
+/// signed in, which they are when there is something to reopen). Succeeds only
+/// when the app's process is seen in a session other than 0.
+#[cfg(target_os = "windows")]
+fn launch_in_user_session(app: &Path) -> std::io::Result<()> {
+    let q = |p: &Path| p.to_string_lossy().replace('\'', "''");
+    let stem = app
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .replace('\'', "''");
+    let script = format!(
+        "$ErrorActionPreference='Stop'; $n='AG Unlocker Reopen'; \
+         $a=New-ScheduledTaskAction -Execute '{exe}' -WorkingDirectory '{dir}'; \
+         $p=New-ScheduledTaskPrincipal -UserId \"$env:USERDOMAIN\\$env:USERNAME\" \
+              -LogonType Interactive -RunLevel Limited; \
+         $s=New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries \
+              -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew \
+              -ExecutionTimeLimit ([TimeSpan]::Zero); \
+         Register-ScheduledTask -TaskName $n -Action $a -Principal $p -Settings $s \
+              -Description 'Antigravity Unlocker: reopen the app in the user session' \
+              -Force | Out-Null; \
+         Start-ScheduledTask -TaskName $n; \
+         for ($i=0; $i -lt 20; $i++) {{ \
+           if (Get-Process -Name '{stem}' -ErrorAction SilentlyContinue \
+                 | Where-Object {{ $_.SessionId -ne 0 }}) {{ exit 0 }}; \
+           Start-Sleep -Milliseconds 500 }}; \
+         [Console]::Error.WriteLine('process not seen in a user session'); exit 1",
+        exe = q(app),
+        dir = q(app.parent().unwrap_or(Path::new("."))),
+        stem = stem,
+    );
+    let out = crate::utils::powershell_within(&script, std::time::Duration::from_secs(45))
+        .ok_or_else(|| std::io::Error::other("powershell did not answer"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(
+            String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        ))
+    }
+}
+
 /// Starts the app again, detached from whoever asks (the watchdog's task).
+///
+/// From session 0 (the watchdog is an S4U task) a plain spawn starts the app on
+/// no desktop: no window, yet it holds Electron's single-instance lock, so every
+/// later launch by the user is silently forwarded to it and nothing appears
+/// (G96, seen after the 2.32.1 update). There the app is started through the
+/// user's own session instead, and never by a plain spawn.
 #[cfg(target_os = "windows")]
 pub fn launch_app(app: &Path) -> std::io::Result<()> {
     use std::os::windows::process::CommandExt;
     const DETACHED_PROCESS: u32 = 0x0000_0008;
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    if in_service_session() {
+        return launch_in_user_session(app);
+    }
     Command::new(app)
         .current_dir(app.parent().unwrap_or(Path::new(".")))
         .stdin(Stdio::null())
@@ -502,8 +582,11 @@ fn repatch_with(bin_path: &Path, kill_locked: bool) -> RepatchOutcome {
         }
         return RepatchOutcome::AlreadyPatched;
     }
-    let written = if kill_locked { write_binary(bin_path, &data) }
-        else { write_atomic(bin_path, &data).map_err(|e| e.to_string()) };
+    let written = if kill_locked {
+        write_binary(bin_path, &data)
+    } else {
+        write_atomic(bin_path, &data).map_err(|e| e.to_string())
+    };
     match written {
         Ok(()) => RepatchOutcome::Repatched(replaced),
         Err(e) => RepatchOutcome::Failed(e),
@@ -892,16 +975,25 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn competing_writers_wait_then_read_the_committed_patch() {
-        let path = std::env::temp_dir().join(format!("ag_patch_transaction_{}.bin", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("ag_patch_transaction_{}.bin", std::process::id()));
         fs::write(&path, b"..ineligible..https_proxy..").unwrap();
         let lock = PatchLock::acquire(&path).unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
         let other = path.clone();
-        let worker = std::thread::spawn(move || { tx.send(repatch_before_launch(&other)).unwrap(); });
-        assert!(matches!(rx.recv_timeout(Duration::from_millis(150)), Err(std::sync::mpsc::RecvTimeoutError::Timeout)));
+        let worker = std::thread::spawn(move || {
+            tx.send(repatch_before_launch(&other)).unwrap();
+        });
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_millis(150)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
         assert_eq!(fs::read(&path).unwrap(), b"..ineligible..https_proxy..");
         drop(lock);
-        assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), RepatchOutcome::Repatched(1));
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            RepatchOutcome::Repatched(1)
+        );
         worker.join().unwrap();
         assert_eq!(repatch_before_launch(&path), RepatchOutcome::AlreadyPatched);
         assert_eq!(fs::read(&path).unwrap(), b"..inexigible..AG_LS_PROXY..");
@@ -912,10 +1004,18 @@ mod tests {
     #[test]
     fn a_locked_proxy_only_edit_is_deferred_and_retried() {
         use std::os::windows::fs::OpenOptionsExt;
-        let path = std::env::temp_dir().join(format!("ag_proxy_deferred_{}.bin", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("ag_proxy_deferred_{}.bin", std::process::id()));
         fs::write(&path, b"..inexigible..https_proxy..").unwrap();
-        let reader = fs::OpenOptions::new().read(true).share_mode(1).open(&path).unwrap();
-        assert!(matches!(repatch_if_needed(&path), RepatchOutcome::Deferred(_)));
+        let reader = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1)
+            .open(&path)
+            .unwrap();
+        assert!(matches!(
+            repatch_if_needed(&path),
+            RepatchOutcome::Deferred(_)
+        ));
         assert_eq!(fs::read(&path).unwrap(), b"..inexigible..https_proxy..");
         drop(reader);
         assert_eq!(repatch_if_needed(&path), RepatchOutcome::AlreadyPatched);
