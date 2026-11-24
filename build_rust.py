@@ -420,18 +420,20 @@ def prune_dev_cache(target_dir, release_profile):
 
 
 def prune_old_releases(release_dir, version):
-    """Deletes other versions' build outputs from release/ - the .exe, the Linux
-    and macOS bundle directories and their .tar.gz - and nothing else: the release notes and
-    scripts kept beside them are not the build's to delete. Every published
-    version is on GitHub Releases; the others were test builds.
+    """Deletes other versions' build outputs from release/ - the .exe, the Linux,
+    ARM64 Linux and macOS bundle directories and their .tar.gz - and nothing else: the
+    release notes and scripts kept beside them are not the build's to delete. Every
+    published version is on GitHub Releases; the others were test builds.
     Returns (entries removed, bytes freed)."""
-    output = re.compile(r"^AG_(.+?)(\.exe|_(?:linux|macos)\.tar\.gz|_linux|_macos)$")
+    output = re.compile(
+        r"^AG_(.+?)(\.exe|_(?:linux_arm64|linux|macos)\.tar\.gz|_(?:linux_arm64|linux|macos))$")
     removed = freed = 0
     for entry in _entries(release_dir):
         m = output.match(entry.name)
         if not m or m.group(1) == version:
             continue
-        if entry.is_dir(follow_symlinks=False) != (m.group(2) in ("_linux", "_macos")):
+        if entry.is_dir(follow_symlinks=False) != (
+                m.group(2) in ("_linux", "_linux_arm64", "_macos")):
             continue
         freed += _remove(entry.path)
         if not os.path.exists(entry.path):
@@ -458,8 +460,8 @@ def prune_wsl_cache(target_dir, label):
     print_prune(label, target_dir, prune_release_cache(target_dir, report, whole_dir=True))
 
 
-def prune_linux_cache(target_dir):
-    prune_wsl_cache(target_dir, "Linux")
+def prune_linux_cache(target_dir, label="Linux"):
+    prune_wsl_cache(target_dir, label)
 
 
 # UPX packing is OFF (owner, `_4`). A packed exe is the single biggest source of
@@ -660,11 +662,24 @@ def check_shipped_binary(path, needles, windows):
 # quietly: `linux_glibc_baseline` below is what proves the pin held.
 LINUX_GLIBC = "2.17"
 LINUX_TARGET = "x86_64-unknown-linux-gnu"
+LINUX_ARM64_TARGET = "aarch64-unknown-linux-gnu"
 
-# The Linux build's cache, on the WSL distro's own filesystem. It used to be
+# The Linux builds' caches, on the WSL distro's own filesystem. They used to be
 # target-linux\ beside the sources, where every file rustc wrote crossed the 9P
 # bridge onto the Windows drive - and was deleted after every build anyway.
+# One cache per architecture: the post-build prune keeps only the units of the
+# build that just finished, so a shared directory would delete the other arch.
 LINUX_CACHE = "${XDG_CACHE_HOME:-$HOME/.cache}/ag_unlocker/target-linux"
+LINUX_ARM64_CACHE = "${XDG_CACHE_HOME:-$HOME/.cache}/ag_unlocker/target-linux-arm64"
+
+# arch -> target triple, cache and the release/ name suffix. Kept together so a
+# new Linux architecture is one entry rather than three edits that can drift.
+LINUX_TARGETS = {
+    "x86_64": {"triple": LINUX_TARGET, "cache": LINUX_CACHE,
+               "suffix": "linux", "label": "Linux"},
+    "arm64": {"triple": LINUX_ARM64_TARGET, "cache": LINUX_ARM64_CACHE,
+              "suffix": "linux_arm64", "label": "Linux ARM64"},
+}
 
 
 def _version_tuple(v):
@@ -696,11 +711,17 @@ def linux_glibc_baseline(distro, elf_wsl_path):
     return found[len("GLIBC_"):] if found.startswith("GLIBC_") else None
 
 
-def build_linux_bundle(version):
-    """Builds the Linux ELF in WSL and assembles release/AG_<ver>_linux/ (+ .tar.gz)
-    with the double-click launcher assets. Best-effort; returns the bundle dir or
-    None. Never raises - the Windows build must not depend on it."""
+def build_linux_bundle(version, arch="x86_64"):
+    """Builds the Linux ELF in WSL and assembles release/AG_<ver>_<suffix>/ (+ .tar.gz)
+    with the double-click launcher assets. `arch` is "x86_64" or "arm64"; the arm64
+    bundle is cross-built with zigbuild and is skipped without it. Best-effort;
+    returns the bundle dir or None. Never raises - the Windows build must not depend
+    on it."""
     import tarfile
+
+    target = LINUX_TARGETS[arch]
+    triple, cache = target["triple"], target["cache"]
+    label, suffix = target["label"], target["suffix"]
 
     # Where the Linux target dir lived before LINUX_CACHE.
     shutil.rmtree("target-linux", ignore_errors=True)
@@ -708,10 +729,10 @@ def build_linux_bundle(version):
     try:
         distro = find_wsl_distro()
         if not distro:
-            print("[i] Linux-сборка пропущена: не найден WSL-дистрибутив с cargo "
+            print(f"[i] {label}-сборка пропущена: не найден WSL-дистрибутив с cargo "
                   "(установите rustup в WSL: 'curl https://sh.rustup.rs -sSf | sh').")
             return None
-        print(f"[INFO] Сборка Linux-версии в WSL ({distro})...")
+        print(f"[INFO] Сборка {label} в WSL ({distro})...")
 
         repo_wsl = _win_to_wsl_path(os.getcwd())
         probe = _wsl_run(
@@ -723,8 +744,17 @@ def build_linux_bundle(version):
 
         if has_zigbuild:
             cargo_cmd = "cargo zigbuild --release --bin ag_unlocker --target %s.%s" % (
-                LINUX_TARGET, LINUX_GLIBC)
-            elf_in_cache = "%s/release/ag_unlocker" % LINUX_TARGET
+                triple, LINUX_GLIBC)
+            elf_in_cache = "%s/release/ag_unlocker" % triple
+        elif arch == "arm64":
+            # x86_64-WSL has no aarch64 linker of its own. The native fallback
+            # below cannot help: it would quietly build the wrong architecture
+            # and ship it under the arm64 name.
+            print("[WARNING] cargo-zigbuild не найден в WSL - ARM64-сборка пропущена: "
+                  "нативная сборка в x86_64-WSL даёт x86_64-бинарь.")
+            print("          Поставить: pip3 install --user --break-system-packages ziglang "
+                  "&& cargo install cargo-zigbuild")
+            return None
         else:
             # Still build - the bundle is better than no bundle - but say plainly
             # what the fallback costs, because the damage is invisible in the
@@ -762,7 +792,7 @@ def build_linux_bundle(version):
             '%s --target-dir "$T" %s >"$T/messages.json" 2>"$T/build.log"; rc=$?; '
             'if [ $rc -eq 0 ]; then tail -n 3 "$T/build.log"; else tail -n 40 "$T/build.log"; fi; '
             'exit $rc'
-        ) % (repo_wsl, LINUX_CACHE, cargo_cmd, CARGO_JSON)
+        ) % (repo_wsl, cache, cargo_cmd, CARGO_JSON)
         res = _wsl_run(distro, build_cmd, capture=True)
         lines = [l.rstrip() for l in (res.stdout or "").splitlines() if l.strip()]
         marker = [l.strip() for l in lines if l.strip().startswith("TARGET_DIR=")]
@@ -771,12 +801,12 @@ def build_linux_bundle(version):
         if shown:
             print(shown)
         if res.returncode != 0 or not target_dir:
-            print("[WARNING] Linux-сборка не удалась (см. вывод выше) - отгружён только .exe.")
+            print(f"[WARNING] {label}-сборка не удалась (см. вывод выше).")
             return None
 
         elf = "%s/%s" % (target_dir, elf_in_cache)
         if _wsl_run(distro, 'test -f "%s"' % elf).returncode != 0:
-            print(f"[WARNING] ELF не найден по пути {elf} - Linux-бандл не собран.")
+            print(f"[WARNING] ELF не найден по пути {elf} - {label}-бандл не собран.")
             return None
 
         # Report the baseline that was actually produced, and complain when it is
@@ -789,9 +819,9 @@ def build_linux_bundle(version):
             print(f"[WARNING] ELF требует glibc {baseline}, хотя собирался под "
                   f"{LINUX_GLIBC} - планка не удержана, проверьте цель сборки.")
         else:
-            print(f"[INFO] Linux-бандл требует glibc {baseline} и старше.")
+            print(f"[INFO] {label}-бандл требует glibc {baseline} и старше.")
 
-        bundle = os.path.abspath(os.path.join("release", f"AG_{version}_linux"))
+        bundle = os.path.abspath(os.path.join("release", f"AG_{version}_{suffix}"))
         if os.path.exists(bundle):
             shutil.rmtree(bundle, ignore_errors=True)
         os.makedirs(bundle, exist_ok=True)
@@ -838,7 +868,7 @@ def build_linux_bundle(version):
             return tarinfo
 
         with tarfile.open(tar_path, "w:gz") as tar:
-            tar.add(bundle, arcname=f"AG_{version}_linux", filter=_exec_bits)
+            tar.add(bundle, arcname=f"AG_{version}_{suffix}", filter=_exec_bits)
 
         wsl_home = _wsl_run(distro, 'printf %s "$HOME"')
         wsl_home = ((wsl_home.stdout or "").strip().splitlines() or [""])[-1].strip() if wsl_home else ""
@@ -846,7 +876,7 @@ def build_linux_bundle(version):
                              [wsl_home + "/", "/.cargo/registry"], windows=False)
 
         elf_size = os.path.getsize(os.path.join(bundle, "ag_unlocker")) // 1024
-        print(f"[УСПЕХ] Linux-бандл: {bundle} (ELF {elf_size} КБ)")
+        print(f"[УСПЕХ] {label}-бандл: {bundle} (ELF {elf_size} КБ)")
         print(f"        Архив для переноса на машину: {tar_path}")
 
         # The bundle is assembled; only now is it known what the cache must keep.
@@ -854,18 +884,19 @@ def build_linux_bundle(version):
         pruned = _wsl_run(
             distro,
             'python3 -B -c "import sys; sys.path.insert(0, sys.argv[1]); '
-            'import build_rust; build_rust.prune_linux_cache(sys.argv[2])" "%s" "%s"'
-            % (repo_wsl, target_dir),
+            'import build_rust; build_rust.prune_linux_cache(sys.argv[2], sys.argv[3])" '
+            '"%s" "%s" "%s"'
+            % (repo_wsl, target_dir, label),
         )
         said = (pruned.stdout or "").strip().splitlines()
         if pruned.returncode == 0:
             print("\n".join(said))
         else:
-            print("[i] Кэш Linux-сборки не почищен (нужен python3 в WSL): %s"
+            print(f"[i] Кэш {label}-сборки не почищен (нужен python3 в WSL): %s"
                   % (said[-1] if said else "нет ответа"))
         return bundle
     except Exception as e:
-        print(f"[WARNING] Linux-сборка пропущена из-за ошибки: {e}")
+        print(f"[WARNING] {label}-сборка пропущена из-за ошибки: {e}")
         return None
 
 
@@ -1331,9 +1362,12 @@ if __name__ == '__main__':
         print()
         print_prune("Windows", target_dir, prune_release_cache(target_dir, build, whole_dir=False))
 
-        # Linux bundle, built via WSL alongside the exe. Best-effort: a machine
+        # Linux bundles, built via WSL alongside the exe. Best-effort: a machine
         # without WSL/cargo still ships the Windows build above.
         build_linux_bundle(version)
+        # ARM64 is cross-built with the same zigbuild toolchain (native x86_64 WSL
+        # cannot link it); without cargo-zigbuild this one is skipped with a note.
+        build_linux_bundle(version, arch="arm64")
         # The Apple-Silicon bundle, cross-built in the same distro.
         build_macos_bundle(version)
 
