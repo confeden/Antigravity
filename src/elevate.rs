@@ -50,9 +50,7 @@ pub fn revert_files(inst: &Path) -> Reverted {
     for (label, res) in crate::patch_ide::unpatch_ide_js(inst) {
         match res {
             Ok(true) => out.files += 1,
-            Ok(false) => out
-                .warnings
-                .push(format!("{label}: бэкапа нет, снят только маркер")),
+            Ok(false) => {},
             Err(e) => out.errors.push(format!("{label}: {e}")),
         }
     }

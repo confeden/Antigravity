@@ -363,25 +363,6 @@ pub const PROVIDERS: &[Provider] = &[
         v6: &[],
         transport: Transport::Doh(&DNS_AI),
     },
-    // `eu.geohide.ru` replaced `geohide.ru` and `comss.one` in 2.31.0 (owner):
-    // comss no longer lifts the gate, and geohide is reached through its
-    // European resolver. Measured 2026-11-11 over UDP:53: it answers
-    // `daily-cloudcode-pa` with its own proxy addresses and passes
-    // `cloudcode-pa` through, so it carries one of the two gate names; the pool
-    // still decides per query, and dns-ai.ru is the one that carries both. Four
-    // of its seven A records answered; the rest (45.13.237.213, 5.175.161.40,
-    // 37.221.93.128) timed out and stay out until measured live (P14).
-    Provider {
-        name: "eu.geohide.ru",
-        v4: &[
-            "31.25.239.132",
-            "143.20.64.192",
-            "5.175.161.3",
-            "37.221.93.141",
-        ],
-        v6: &[],
-        transport: Transport::Udp,
-    },
     // Last on purpose: the user's own server(s). Not a provider at all until
     // they type one in: `provider_disabled` keeps it out of the race, the
     // rotation and the head-of-list choice while the field is empty.
@@ -2360,6 +2341,16 @@ mod tests {
     }
 
     #[test]
+    fn dns_ai_is_the_only_builtin_and_no_doh_address_leaks_to_nrpt() {
+        let builtin: Vec<_> = PROVIDERS.iter().filter(|p| !matches!(p.transport, Transport::Custom)).collect();
+        assert_eq!(builtin.len(), 1);
+        assert_eq!(builtin[0].name, "dns-ai.ru");
+        assert!(matches!(builtin[0].transport, Transport::Doh(_)));
+        assert!(fallback_v4().is_empty());
+        assert!(all_v6().is_empty());
+    }
+
+    #[test]
     fn every_udp_provider_has_at_least_one_address() {
         assert!(!PROVIDERS.is_empty());
         for p in udp_providers() {
@@ -2478,12 +2469,14 @@ mod tests {
             .iter()
             .find(|p| matches!(p.transport, Transport::Doh(_)))
             .expect("a DoH provider");
-        let udp = PROVIDERS
-            .iter()
-            .find(|p| matches!(p.transport, Transport::Udp))
-            .expect("a UDP provider");
+        let udp = Provider {
+            name: "fixture",
+            v4: &["192.0.2.53"],
+            v6: &[],
+            transport: Transport::Udp,
+        };
         assert_eq!(one_shot_floor(doh, FAST_PATH_TIMEOUT), DOH_FAST_TIMEOUT);
-        assert_eq!(one_shot_floor(udp, FAST_PATH_TIMEOUT), FAST_PATH_TIMEOUT);
+        assert_eq!(one_shot_floor(&udp, FAST_PATH_TIMEOUT), FAST_PATH_TIMEOUT);
         // A caller that already budgeted more keeps it.
         assert_eq!(one_shot_floor(doh, QUERY_TIMEOUT), QUERY_TIMEOUT);
         // And the whole thing still fits inside the second Windows waits (I23).

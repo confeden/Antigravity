@@ -151,6 +151,14 @@ fn run() {
         if cycles > 0 && cycles % LISTENER_CHECK_EVERY == 0 {
             listener.check();
         }
+        #[cfg(windows)]
+        if cycles % 15 == 0 {
+            match crate::sidecar::reap_orphans() {
+                Ok(n) if n > 0 => log(&format!("Removed {n} orphaned Antigravity sidecar(s)")),
+                Ok(_) => {}
+                Err(e) => log(&format!("Sidecar cleanup failed: {e}")),
+            }
+        }
         cycles = cycles.wrapping_add(1);
 
         // Read per cycle rather than once at start: the task stays registered

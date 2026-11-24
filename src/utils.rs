@@ -336,8 +336,25 @@ pub fn clipboard_text() -> Option<String> {
 /// Puts `text` on the clipboard; false when there is no clipboard to reach (a
 /// Linux box with no X11 or Wayland session).
 pub fn set_clipboard_text(text: &str) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        // X11 serves clipboard contents from the owner when another app pastes.
+        // Dropping the last handle can release the selection before that happens.
+        static OWNER: std::sync::Mutex<Option<arboard::Clipboard>> = std::sync::Mutex::new(None);
+        let Ok(mut owner) = OWNER.lock() else {
+            return false;
+        };
+        return arboard::Clipboard::new()
+            .and_then(|mut clipboard| {
+                clipboard.set_text(text)?;
+                *owner = Some(clipboard);
+                Ok(())
+            })
+            .is_ok();
+    }
+    #[cfg(not(target_os = "linux"))]
     arboard::Clipboard::new()
-        .and_then(|mut cb| cb.set_text(text.to_string()))
+        .and_then(|mut cb| cb.set_text(text))
         .is_ok()
 }
 

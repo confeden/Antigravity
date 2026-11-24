@@ -22,6 +22,9 @@ use std::time::Duration;
 use crate::gate::View;
 use crate::ops::{Cap, Status};
 
+pub const VPN_TRAFFIC_NOTICE: &str = "Трафик анлокера идёт через VPN.\n\
+    Если возникают ошибки, добавьте анлокер в исключения приложения VPN.";
+
 /// How the card is coloured, and how loud it is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tone {
@@ -92,6 +95,7 @@ pub struct Facts {
     /// once the relay answers the gate hosts.
     pub bypass_on: bool,
     pub relay_running: bool,
+    pub relay_uses_vpn: bool,
     pub relay_outdated: bool,
     /// Our DNS rules are in. Without them nothing on the machine asks the
     /// service anything, however healthy it is.
@@ -215,6 +219,12 @@ impl Facts {
             patch_on: s.client_patch.is_on(),
             bypass_on: s.bypass_on(),
             relay_running: s.relay_running,
+            relay_uses_vpn: s.relay_running
+                && (relay.is_some_and(|r| r.vpn_traffic)
+                    || matches!(
+                        s.relay_egress,
+                        Some(crate::egress::ClientEgress::Tunnel | crate::egress::ClientEgress::Mixed)
+                    )),
             relay_outdated: s.relay_outdated,
             // Rules are only owed while the DNS switch is on: a route running alone
             // (own proxy, group, exits) has none by design.
@@ -247,10 +257,9 @@ fn blocker(relay: Option<&crate::gate::Report>, what: &str) -> Option<crate::gat
 /// A provider's name as it is shown: an acronym stays one, anything else gets
 /// one capital.
 pub fn provider_name(name: &str) -> String {
-    // The two the pool carries are written the way their owners write them.
+    // Keep the built-in provider name as its owner writes it.
     match name {
         "dns-ai.ru" => return "DNS-AI.ru".to_string(),
-        "eu.geohide.ru" => return "eu.GeoHide.ru".to_string(),
         _ => {}
     }
     let lead: String = name.chars().take_while(|c| c.is_alphabetic()).collect();
@@ -971,7 +980,6 @@ mod tests {
     #[test]
     fn an_acronym_stays_an_acronym_and_everything_else_gets_one_capital() {
         assert_eq!(provider_name("dns-ai.ru"), "DNS-AI.ru");
-        assert_eq!(provider_name("eu.geohide.ru"), "eu.GeoHide.ru");
         assert_eq!(provider_name("свой DNS"), "Свой DNS");
         assert_eq!(provider_name("dns.example"), "DNS.EXAMPLE");
         // Must not panic on a name the pool could grow later.

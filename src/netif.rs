@@ -19,7 +19,7 @@
 //! bridge carrying the real NIC is the ISP link on some desktops.
 
 use std::ffi::CStr;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 
 /// Any public address: only ever used for a route lookup, never contacted.
 const PROBE_DEST: Ipv4Addr = Ipv4Addr::new(8, 8, 8, 8);
@@ -28,11 +28,11 @@ const PROBE_DEST: Ipv4Addr = Ipv4Addr::new(8, 8, 8, 8);
 pub struct Iface {
     pub name: String,
     pub index: u32,
-    pub v4: Vec<Ipv4Addr>,
+    pub addresses: Vec<IpAddr>,
     pub flags: u32,
 }
 
-/// Every interface with its IPv4 addresses. Empty when `getifaddrs` fails.
+/// Every interface with its IP addresses. Empty when `getifaddrs` fails.
 pub fn interfaces() -> Vec<Iface> {
     let mut out: Vec<Iface> = Vec::new();
     let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
@@ -52,16 +52,24 @@ pub fn interfaces() -> Vec<Iface> {
         let name = unsafe { CStr::from_ptr(ifa.ifa_name) }
             .to_string_lossy()
             .into_owned();
-        let v4 = if ifa.ifa_addr.is_null() {
+        let address = if ifa.ifa_addr.is_null() {
             None
         } else {
             // SAFETY: ifa_addr points at a sockaddr; its family says how to read it.
             let family = unsafe { (*ifa.ifa_addr).sa_family } as i32;
-            (family == libc::AF_INET).then(|| {
-                // SAFETY: AF_INET means the sockaddr is a sockaddr_in.
-                let sin = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_in) };
-                Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr))
-            })
+            match family {
+                libc::AF_INET => {
+                    // SAFETY: AF_INET identifies a sockaddr_in.
+                    let sin = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_in) };
+                    Some(Ipv4Addr::from(sin.sin_addr.s_addr.to_ne_bytes()).into())
+                }
+                libc::AF_INET6 => {
+                    // SAFETY: AF_INET6 identifies a sockaddr_in6.
+                    let sin6 = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_in6) };
+                    Some(Ipv6Addr::from(sin6.sin6_addr.s6_addr).into())
+                }
+                _ => None,
+            }
         };
         let pos = match out.iter().position(|i| i.name == name) {
             Some(p) => p,
@@ -71,14 +79,14 @@ pub fn interfaces() -> Vec<Iface> {
                 out.push(Iface {
                     name,
                     index,
-                    v4: Vec::new(),
+                    addresses: Vec::new(),
                     flags: ifa.ifa_flags as u32,
                 });
                 out.len() - 1
             }
         };
-        if let Some(a) = v4 {
-            out[pos].v4.push(a);
+        if let Some(a) = address {
+            out[pos].addresses.push(a);
         }
     }
     // SAFETY: the list getifaddrs allocated, freed once.
@@ -97,7 +105,9 @@ fn local_addr_toward(dest: Ipv4Addr) -> Option<Ipv4Addr> {
 }
 
 fn owner_of(addr: Ipv4Addr, ifaces: &[Iface]) -> Option<&Iface> {
-    ifaces.iter().find(|i| i.index != 0 && i.v4.contains(&addr))
+    ifaces
+        .iter()
+        .find(|i| i.index != 0 && i.addresses.contains(&IpAddr::V4(addr)))
 }
 
 /// The interface the routing table would send a packet to `dest` through.
@@ -151,6 +161,22 @@ pub fn is_tunnel(iface: &Iface) -> bool {
     iface.flags & libc::IFF_POINTOPOINT as u32 != 0
         || tunnel_hw_type(&iface.name)
         || named_like_tunnel(&iface.name)
+}
+
+pub fn sources_use_vpn(sources: &[IpAddr]) -> bool {
+    !sources.is_empty() && vpn_carries(sources, &interfaces())
+}
+
+fn vpn_carries(sources: &[IpAddr], ifaces: &[Iface]) -> bool {
+    let up = libc::IFF_UP as u32;
+    let loopback = libc::IFF_LOOPBACK as u32;
+    ifaces.iter().any(|iface| {
+        iface.flags & (up | loopback) == up
+            && sources
+                .iter()
+                .any(|ip| iface.addresses.contains(&ip.to_canonical()))
+            && is_tunnel(iface)
+    })
 }
 
 fn is_tunnel_name(name: &str, ifaces: &[Iface]) -> bool {
@@ -294,6 +320,31 @@ default            192.168.1.1        UGScIg                en0\n\
         }
     }
 
+    #[test]
+    fn a_running_vpn_only_counts_when_it_owns_a_connection_source() {
+        let isp = "192.0.2.2".parse().unwrap();
+        let vpn4 = "198.51.100.2".parse().unwrap();
+        let vpn6 = "2001:db8::2".parse().unwrap();
+        let ifaces = [
+            Iface {
+                name: "eth0".into(),
+                index: 2,
+                flags: libc::IFF_UP as u32,
+                addresses: vec![isp],
+            },
+            Iface {
+                name: "tun0".into(),
+                index: 3,
+                flags: libc::IFF_UP as u32,
+                addresses: vec![vpn4, vpn6],
+            },
+        ];
+        assert!(!vpn_carries(&[], &ifaces));
+        assert!(!vpn_carries(&[isp], &ifaces));
+        assert!(vpn_carries(&[isp, vpn4], &ifaces));
+        assert!(vpn_carries(&[vpn6], &ifaces));
+    }
+
     /// Live: what this machine reports. `cargo test netif_live -- --ignored --nocapture`
     #[test]
     #[ignore]
@@ -303,7 +354,7 @@ default            192.168.1.1        UGScIg                en0\n\
                 "{:>3} {:<12} {:?} tunnel={}",
                 i.index,
                 i.name,
-                i.v4,
+                i.addresses,
                 is_tunnel(&i)
             );
         }

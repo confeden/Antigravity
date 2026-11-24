@@ -202,6 +202,10 @@ pub fn read() -> Reading {
          if ($ids.Count -eq 0 -and $rid.Count -eq 0) {{ 'none' }} else {{ \
            $phys=@(Get-NetAdapter -Physical -ErrorAction SilentlyContinue | \
              Where-Object {{$_.Status -eq 'Up'}} | ForEach-Object {{$_.ifIndex}}); \
+           $vpn=@(Get-NetAdapter -IncludeHidden -ErrorAction SilentlyContinue | \
+             Where-Object {{$_.Status -eq 'Up' -and ($_.InterfaceType -in 23,131 -or \
+               \"$($_.Name) $($_.InterfaceDescription)\" -match 'Wintun|WireGuard|Amnezia|Happ|OpenVPN|TAP-Windows|Tailscale|tun2proxy|sing-box|\\bVPN\\b')}} | \
+             ForEach-Object {{$_.ifIndex}}); \
            $ix=@{{}}; \
            foreach ($a in @(Get-NetIPAddress -ErrorAction SilentlyContinue)) {{ \
              $ix[($a.IPAddress -split '%')[0]]=$a.InterfaceIndex }}; \
@@ -212,13 +216,16 @@ pub fn read() -> Reading {
              if (-not $mine -and -not $ours) {{ continue }}; \
              if ($mine -and $c.RemotePort -eq {port} -and $c.RemoteAddress -eq '{listen}') {{ \
                $l++; continue }}; \
-             if ($c.RemotePort -ne 443) {{ continue }}; \
-             if ($c.RemoteAddress -like '127.*') {{ if ($mine) {{ $l++ }}; continue }}; \
-             $i=$ix[($c.LocalAddress -split '%')[0]]; \
+             if ($mine -and $c.RemotePort -ne 443) {{ continue }}; \
+             $remote=$c.RemoteAddress -split '%'; \
+             $local=$c.LocalAddress -split '%'; \
+             if ([System.Net.IPAddress]::IsLoopback($remote[0])) {{ if ($mine) {{ $l++ }}; continue }}; \
+             if ([System.Net.IPAddress]::IsLoopback($local[0])) {{ continue }}; \
+             $i=$ix[$local[0]]; \
              if ($null -eq $i) {{ continue }}; \
              $hw = $phys -contains $i; \
              if ($mine) {{ if ($hw) {{ $p++ }} else {{ $t++ }} }} \
-             else {{ if ($hw) {{ $rp++ }} else {{ $rt++ }} }} }}; \
+             else {{ if ($vpn -contains $i) {{ $rt++ }} elseif ($hw) {{ $rp++ }} }} }}; \
            '{{0}}|{{1}}|{{2}}|{{3}}|{{4}}' -f $p,$t,$l,$rp,$rt }}",
         glob = CLIENT_PROCESS_GLOB,
         relay = relay_process_name(),
@@ -345,6 +352,22 @@ pub fn vpn_verdict(egress: Option<&Egress>) -> (bool, ClientEgress) {
 /// Drops the host routes an earlier build pinned. Deleted per interface rather
 /// than by prefix alone, so a route stranded on an adapter the machine no longer
 /// uses goes too; netsh cleans up whatever the cmdlet could not.
+pub fn remove_legacy_routes_checked() -> Result<(), String> {
+    let list = LEGACY_PINNED_PREFIXES.iter().map(|p| format!("'{p}'")).collect::<Vec<_>>().join(",");
+    let script = format!(
+        "$ErrorActionPreference='Stop'; \
+         foreach ($store in @('ActiveStore','PersistentStore')) {{ \
+           Get-NetRoute -PolicyStore $store | Where-Object {{$_.DestinationPrefix -in @({list})}} | \
+             Remove-NetRoute -Confirm:$false \
+         }}"
+    );
+    let out = powershell(&script).ok_or("legacy route removal timed out")?;
+    if out.status.success() { Ok(()) } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
+#[cfg(target_os = "windows")]
 pub fn remove_legacy_routes() {
     let list = LEGACY_PINNED_PREFIXES
         .iter()

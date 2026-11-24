@@ -4,6 +4,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 
 if hasattr(sys.stdout, 'reconfigure'):
@@ -419,15 +420,52 @@ def prune_dev_cache(target_dir, release_profile):
     return freed
 
 
+def publish_windows_exe(source, destination):
+    """Publish the new image without stopping a running copy of the old one."""
+    directory, filename = os.path.split(destination)
+    with tempfile.TemporaryDirectory(prefix="ag-build-", dir=directory) as staging:
+        # Cargo's convenience copy is a hardlink into its cache. Ship a copy.
+        fresh = os.path.join(staging, filename)
+        shutil.copy2(source, fresh)
+        try:
+            os.replace(fresh, destination)
+        except PermissionError:
+            if not os.path.isfile(destination):
+                raise
+            # Windows permits renaming a mapped image but denies deleting it.
+            previous = os.path.join(directory, f".{filename}.{os.path.basename(staging)}.previous")
+            os.replace(destination, previous)
+            try:
+                os.replace(fresh, destination)
+            except OSError as error:
+                try:
+                    os.replace(previous, destination)
+                except OSError as rollback:
+                    raise RuntimeError(
+                        f"Не удалось вернуть прежний EXE из {previous}: {rollback}"
+                    ) from error
+                raise
+            try:
+                os.remove(previous)
+            except PermissionError:
+                print(f"[INFO] Предыдущий EXE занят запущенным процессом: {previous}")
+
+
 def prune_old_releases(release_dir, version):
-    """Deletes other versions' build outputs from release/ - the .exe, the Linux
-    and macOS bundle directories and their .tar.gz - and nothing else: the release notes and
-    scripts kept beside them are not the build's to delete. Every published
-    version is on GitHub Releases; the others were test builds.
+    """Removes older build outputs and Windows images left by a rebuild.
+
+    The release notes and scripts beside the .exe files and bundles stay.
+    Every published version is on GitHub Releases; the others were test builds.
     Returns (entries removed, bytes freed)."""
     output = re.compile(r"^AG_(.+?)(\.exe|_(?:linux|macos)\.tar\.gz|_linux|_macos)$")
+    previous_exe = re.compile(r"^\.AG_.+\.exe\.ag-build-[a-z0-9_]+\.previous$")
     removed = freed = 0
     for entry in _entries(release_dir):
+        if previous_exe.fullmatch(entry.name) and entry.is_file(follow_symlinks=False):
+            freed += _remove(entry.path)
+            if not os.path.exists(entry.path):
+                removed += 1
+            continue
         m = output.match(entry.name)
         if not m or m.group(1) == version:
             continue
@@ -1071,7 +1109,7 @@ def main():
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
     print("[INFO] Starting build process...")
 
-    VERSION = "2.32.2"
+    VERSION = "2.35.0"
     version = VERSION
     # env!("CARGO_PKG_VERSION") only sees MAJOR.MINOR.PATCH, so the key salt uses
     # the same trimmed value the binary will compile with.
@@ -1294,15 +1332,7 @@ if __name__ == '__main__':
 
         os.makedirs("release", exist_ok=True)
         out_path = os.path.abspath(os.path.join("release", f"AG_{version}.exe"))
-        # Terminate any running instance of the previous exe to avoid PermissionError
-        subprocess.run(["taskkill", "/F", "/IM", f"AG_{version}.exe"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        time.sleep(0.5)
-        if os.path.exists(out_path):
-            os.remove(out_path)
-        # Copy, never move. The exe cargo uplifts is a hardlink to its copy in
-        # deps\, which the cache keeps now; moved, the shipped exe would stay one
-        # file with the cache's, and whatever touches either touches both.
-        shutil.copy2(built_exe, out_path)
+        publish_windows_exe(built_exe, out_path)
         check_shipped_binary(out_path, [home + "\\", "\\.cargo\\registry"], windows=True)
 
         # Shrink the exe in place; it stays a runnable AG_<ver>.exe.
@@ -1360,8 +1390,10 @@ if __name__ == '__main__':
     except subprocess.CalledProcessError as e:
         # No cache is pruned after a failed build: see "Build caches" above.
         print(f"\n[ОШИБКА] Сборка завершилась с ошибкой: {e}")
+        return 1
     except Exception as e:
         print(f"\n[ОШИБКА] Непредвиденная ошибка сборки: {e}")
+        return 1
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

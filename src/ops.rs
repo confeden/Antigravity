@@ -196,6 +196,8 @@ pub struct Status {
     pub local_proxy: State,
     pub own_proxy: State,
     pub group_proxy: State,
+    pub own_proxy_configured: bool,
+    pub group_proxy_configured: bool,
     pub dns_rotation: State,
     /// What the last measurement saw. `None` means it has not been taken yet;
     /// taking it spawns PowerShell, so it is not done on every refresh.
@@ -252,10 +254,14 @@ impl Status {
 /// proxy variable may name it (I53) â€” the worker runs these in order, so DNS
 /// finishes first. OFF: the variable comes off *before* the listener it names
 /// goes away, or a sign-in that lands in between dials a dead port (G31).
-pub fn bypass_order(on: bool) -> Vec<Cap> {
+pub fn bypass_order(on: bool, group_configured: bool) -> Vec<Cap> {
     if on {
         // The user's own proxy is theirs to switch on: it needs an address.
-        vec![Cap::Dns, Cap::LocalProxy, Cap::GroupProxy]
+        let mut caps = vec![Cap::Dns, Cap::LocalProxy];
+        if group_configured {
+            caps.push(Cap::GroupProxy);
+        }
+        caps
     } else {
         vec![Cap::LocalProxy, Cap::OwnProxy, Cap::GroupProxy, Cap::Dns]
     }
@@ -277,6 +283,8 @@ pub enum Event {
     /// `Some(what)` while an action runs, `None` when the queue drains. The UI
     /// dims the switches in between so a second click cannot queue a race.
     Busy(Option<String>),
+    ProxySaved(Cap, Result<(), String>),
+    Deactivated,
 }
 
 /// UI → worker.
@@ -287,6 +295,8 @@ pub enum Cmd {
     Unlocked,
     /// Store the licence key just accepted, so the next start skips the screen.
     RememberLicense(String),
+    /// Persist the user's UI theme preference.
+    SetTheme(crate::settings::ThemeMode),
     /// Ask the system again where the client's traffic leaves.
     ///
     /// Its own command because it is the one measurement that goes stale on its
@@ -316,9 +326,9 @@ pub enum Cmd {
     ForgetPath(PathBuf),
     /// The «Пропатчить» button of one install row.
     PatchInstall(PathBuf),
-    SetOwnProxy(String),
+    SetOwnProxy { text: String, enable: bool },
     SetCustomDns(String),
-    SetGroupKey(String),
+    SetGroupKey { text: String, enable: bool },
     SetProvider(String, bool),
     /// The whole pool in the order the user dragged it into.
     ReorderProviders(Vec<String>),
@@ -329,6 +339,7 @@ pub enum Cmd {
     /// the relay when it is missing, stopped or older than this build, rewrites
     /// the rules, restores the proxy variable.
     Repair,
+    Deactivate,
     #[allow(dead_code)]
     Stop,
 }
@@ -475,6 +486,12 @@ fn run_worker(
                     ctx.settings.save();
                 }
             }
+            Cmd::SetTheme(mode) => {
+                if ctx.settings.theme != mode {
+                    ctx.settings.theme = mode;
+                    ctx.settings.save();
+                }
+            }
             Cmd::Unlocked => {
                 // The first snapshot was taken while the licence screen was up;
                 // a fresh one either way, deep when auto-patch just wrote.
@@ -585,11 +602,14 @@ fn run_worker(
                 ctx.settings.save();
                 push_status(&mut ctx, Scan::System);
             }
-            Cmd::SetOwnProxy(text) => {
+            Cmd::SetOwnProxy { text, enable } => {
                 ctx.busy(Some("Проверка прокси"));
-                set_own_proxy(&mut ctx, &text);
-                ctx.settings.save();
+                let enable = enable
+                    || ctx.settings.own_proxy_enabled
+                    || ctx.last.as_ref().is_some_and(|status| status.own_proxy.is_on());
+                let result = set_own_proxy(&mut ctx, &text, enable);
                 push_status(&mut ctx, Scan::System);
+                proxy_saved(&ctx, Cap::OwnProxy, result);
                 ctx.busy(None);
             }
             Cmd::SetCustomDns(text) => {
@@ -597,28 +617,51 @@ fn run_worker(
                 ctx.settings.save();
                 push_status(&mut ctx, Scan::Settings);
             }
-            Cmd::SetGroupKey(text) => {
+            Cmd::SetGroupKey { text, enable } => {
                 ctx.busy(Some("Проверка ключа"));
-                match crate::group_key::parse_key(&text) {
-                    Ok(_) => {
-                        ctx.settings.group_key = text.trim().to_string();
-                        ctx.settings.group_key_at = crate::gate::now_unix();
-                        ctx.settings.group_proxy = true;
-                        ctx.settings.save();
-                        apply(&mut ctx, Cap::GroupProxy, true);
-                        ctx.log(crate::ops::Level::Ok, "Ключ принят.");
-                        push_status(&mut ctx, scan_after(Cap::GroupProxy));
-                    }
-                    Err(e) => {
-                        ctx.log(crate::ops::Level::Err, format!("{}", e));
-                    }
+                let result = set_group_key(&mut ctx, &text, enable);
+                if result.is_ok() {
+                    push_status(&mut ctx, scan_after(Cap::GroupProxy));
                 }
+                proxy_saved(&ctx, Cap::GroupProxy, result);
                 ctx.busy(None);
             }
             Cmd::EnableAll => {
                 ctx.busy(Some("Включаю"));
                 enable_all(&mut ctx);
                 ctx.settings.save();
+                push_status(&mut ctx, Scan::Deep);
+                ctx.busy(None);
+            }
+            Cmd::Deactivate => {
+                ctx.busy(Some("Полная деактивация"));
+                if cfg!(windows) && !is_admin() {
+                    ctx.log(Level::Err, "Для полной деактивации запустите анлокер от администратора.");
+                    ctx.busy(None);
+                    continue;
+                }
+                ctx.settings.client_patch = false;
+                ctx.settings.auto_patch = false;
+                ctx.settings.patch_declined = true;
+                ctx.settings.dns = false;
+                ctx.settings.local_proxy = false;
+                ctx.settings.group_proxy = false;
+                ctx.settings.own_proxy_enabled = false;
+                if !ctx.settings.save() {
+                    ctx.log(Level::Err, "Не удалось сохранить отключение автопатча; откат не начат.");
+                    ctx.busy(None);
+                    continue;
+                }
+                let errors = crate::deactivate::run(&ctx.settings.manual_paths);
+                if errors.is_empty() {
+                    let _ = ctx.events.send(Event::Deactivated);
+                    (ctx.wake)();
+                    return;
+                }
+                for error in errors {
+                    ctx.log(Level::Err, error);
+                }
+                ctx.log(Level::Warn, "Деактивация не завершена. Устраните ошибки и повторите.");
                 push_status(&mut ctx, Scan::Deep);
                 ctx.busy(None);
             }
@@ -700,6 +743,12 @@ fn startup_housekeeping(ctx: &mut Ctx) {
     let _ = crate::launch_guard::uninstall();
     if !cfg!(target_os = "windows") || !is_admin() {
         return;
+    }
+    #[cfg(windows)]
+    match crate::sidecar::reap_orphans() {
+        Ok(n) if n > 0 => ctx.log(Level::Info, format!("Закрыто осиротевших процессов Antigravity: {n}")),
+        Ok(_) => {},
+        Err(e) => ctx.log(Level::Warn, format!("Не удалось убрать фоновые процессы: {e}")),
     }
     let before = dns::is_nrpt_applied();
     dns::refresh_pinned_hosts();
@@ -823,9 +872,7 @@ fn settings_only_status(ctx: &Ctx, prev: Status) -> Status {
         // that died an hour ago is still running.
         relay_running: relay,
         rules,
-        own_proxy_text: upstream::configured()
-            .map(|u| u.display())
-            .unwrap_or_else(|| ctx.settings.own_proxy.clone()),
+        own_proxy_text: own_proxy_display(&ctx.settings),
         vpn: ctx.vpn,
         relay_egress: ctx.relay_egress,
         ..prev
@@ -841,10 +888,12 @@ impl Status {
     fn with_settings_switches(mut self, s: &Settings) -> Self {
         // On, but the pool refuses this key (replaced by a newer one, or the PC
         // changed): said on the switch itself, where the user looks.
-        self.group_proxy = if s.group_proxy && crate::group::key_rejected() {
+        self.own_proxy_configured = self.own_proxy.is_on() || upstream::parse(&s.own_proxy).is_ok();
+        self.group_proxy_configured = s.group_proxy_configured();
+        self.group_proxy = if s.group_proxy_wanted() && crate::group::key_rejected() {
             State::Partial(crate::group::KEY_DEAD_NOTE.into())
         } else {
-            on_off(s.group_proxy)
+            on_off(s.group_proxy_wanted())
         };
         self.custom_dns_text = s.custom_dns.clone();
         self.dns_rotation = if s.rotate_providers {
@@ -895,11 +944,7 @@ fn read_status(ctx: &mut Ctx, deep: bool) -> Status {
             let dns_probe = scope.spawn(probe_dns);
             let local_proxy = scope.spawn(move || read_local_proxy(settings));
             let own_proxy = scope.spawn(read_own_proxy);
-            let own_proxy_text = scope.spawn(move || {
-                upstream::configured()
-                    .map(|u| u.display())
-                    .unwrap_or_else(|| settings.own_proxy.clone())
-            });
+            let own_proxy_text = scope.spawn(move || own_proxy_display(settings));
             let relay_outdated = scope.spawn(background::relay_is_outdated);
             (
                 installs.join().unwrap_or_default(),
@@ -947,6 +992,8 @@ fn read_status(ctx: &mut Ctx, deep: bool) -> Status {
         own_proxy_text,
         custom_dns_text: ctx.settings.custom_dns.clone(),
         group_proxy: State::Off,
+        own_proxy_configured: false,
+        group_proxy_configured: false,
         vpn: ctx.vpn,
         dns_rotation: State::Off,
         relay_outdated,
@@ -959,17 +1006,15 @@ fn read_status(ctx: &mut Ctx, deep: bool) -> Status {
     .with_settings_switches(&ctx.settings)
 }
 
-/// Asks the system where the traffic actually leaves.
-///
-/// Deliberately the same call `setup_dns_nrpt` makes, so the indicator and the
-/// decision can never disagree: anything else would be a second opinion, and a
-/// second opinion is how a user ends up told one thing while the layer does
-/// another.
+/// Measure the relay even when a split tunnel does not own the default route.
+/// The client verdict still uses the default-route check shared with DNS.
+#[cfg(target_os = "windows")]
 fn measure_vpn() -> (VpnSeen, Option<crate::egress::ClientEgress>) {
     use crate::egress::ClientEgress;
     let egress = crate::egress::detect();
+    let reading = crate::egress::read();
     if !egress.as_ref().is_some_and(|e| e.vpn_active) {
-        return (VpnSeen::None, None);
+        return (VpnSeen::None, Some(reading.relay));
     }
     // One reading, both halves — the same call `egress::vpn_verdict` makes for
     // the DNS layer, so the row this colours and the decision that layer takes
@@ -978,7 +1023,6 @@ fn measure_vpn() -> (VpnSeen, Option<crate::egress::ClientEgress>) {
     // down" and "the client is outside the tunnel" are different questions, and
     // reading the first as the second is what made the indicator claim a
     // measurement nobody had taken.
-    let reading = crate::egress::read();
     let client = match reading.client {
         ClientEgress::Tunnel => VpnSeen::CarryingClient,
         ClientEgress::Mixed => VpnSeen::PartlyCarryingClient,
@@ -987,6 +1031,17 @@ fn measure_vpn() -> (VpnSeen, Option<crate::egress::ClientEgress>) {
         ClientEgress::Unknown => VpnSeen::Unmeasured,
     };
     (client, Some(reading.relay))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn measure_vpn() -> (VpnSeen, Option<crate::egress::ClientEgress>) {
+    let vpn = if crate::egress::detect().is_some_and(|e| e.vpn_active) {
+        VpnSeen::Unmeasured
+    } else {
+        VpnSeen::None
+    };
+    // The relay reports its own connections through gate.json.
+    (vpn, None)
 }
 
 /// The one line the journal gets when the answer changes. An `Unmeasured` is
@@ -1137,6 +1192,13 @@ fn read_own_proxy() -> State {
     } else {
         State::Off
     }
+}
+
+fn own_proxy_display(settings: &Settings) -> String {
+    upstream::configured()
+        .or_else(|| upstream::parse(&settings.own_proxy).ok())
+        .map(|proxy| proxy.display())
+        .unwrap_or_default()
 }
 
 /// The kinds, in the order the window lists them. VS Code is the Antigravity
@@ -1296,22 +1358,25 @@ fn apply(ctx: &mut Ctx, cap: Cap, on: bool) {
             }
         }
         (Cap::OwnProxy, on) => {
-            ctx.settings.own_proxy_enabled = on;
             if on {
                 let text = ctx.settings.own_proxy.clone();
-                if text.trim().is_empty() {
-                    ctx.log(
-                        Level::Warn,
-                        "Впишите адрес прокси, затем включите переключатель.",
-                    );
-                    ctx.settings.own_proxy_enabled = false;
+                let result = if text.trim().is_empty() {
+                    Err("Укажите адрес своего прокси в настройках.".into())
                 } else {
-                    set_own_proxy(ctx, &text);
+                    set_own_proxy(ctx, &text, true)
+                };
+                if let Err(error) = result {
+                    ctx.log(Level::Err, error);
                 }
             } else {
-                upstream::clear();
-                ctx.log(Level::Ok, "Свой прокси отключён.");
-                release_route_carrier(ctx);
+                match upstream::try_clear() {
+                    Ok(()) => {
+                        ctx.settings.own_proxy_enabled = false;
+                        ctx.log(Level::Ok, "Свой прокси отключён.");
+                        release_route_carrier(ctx);
+                    }
+                    Err(error) => ctx.log(Level::Err, format!("Свой прокси не отключён: {error}")),
+                }
             }
         }
         (Cap::DnsRotation, on) => {
@@ -1335,6 +1400,10 @@ fn apply(ctx: &mut Ctx, cap: Cap, on: bool) {
             );
         }
         (Cap::GroupProxy, on) => {
+            if on && !ctx.settings.group_proxy_configured() {
+                ctx.log(Level::Warn, "Добавьте код для прокси из группы.");
+                return;
+            }
             ctx.settings.group_proxy = on;
             ctx.log(
                 Level::Ok,
@@ -1372,7 +1441,7 @@ fn enable_all(ctx: &mut Ctx) {
     }
     // Nothing but a line in settings.json, so it needs nobody's permission.
     // The service they ride on is brought up below, with DNS.
-    ctx.settings.group_proxy = true;
+    ctx.settings.group_proxy = ctx.settings.group_proxy_configured();
     let dns_on =
         dns::is_nrpt_applied() && background::is_running() && !background::relay_is_outdated();
     if !dns_on {
@@ -1974,7 +2043,7 @@ fn launch_clean(path: &std::path::Path, var: &str) {
 /// back after, on a copy of its own: auto-patch is not part of the bypass,
 /// and switching the bypass off must not switch it off too.
 fn stop_relay(ctx: &mut Ctx) {
-    let restore_watchdog = ctx.settings.auto_patch && background::is_watchdog_enabled();
+    let restore_watchdog = ctx.settings.auto_patch_wanted();
     if restore_watchdog {
         background::disable_watchdog();
     }
@@ -1993,7 +2062,7 @@ fn stop_relay(ctx: &mut Ctx) {
 /// Whether something other than the DNS rules needs the relay running: the
 /// proxy listener and every route it serves live inside it.
 fn routes_want_relay(s: &Settings) -> bool {
-    s.local_proxy || s.own_proxy_enabled || s.group_proxy
+    s.local_proxy || routes_want_relay_without_proxy_var(s)
 }
 
 /// A route that was switched on by itself has to have something to ride on.
@@ -2061,7 +2130,7 @@ fn release_route_carrier(ctx: &mut Ctx) {
 /// `routes_want_relay` minus the proxy variable's own wish: a route's carrier
 /// sets that wish itself, so it must not count against letting go of it.
 fn routes_want_relay_without_proxy_var(s: &Settings) -> bool {
-    s.own_proxy_enabled || s.group_proxy
+    s.own_proxy_enabled || s.group_proxy_wanted()
 }
 
 /// Re-writes the NRPT rules when the pool they name has changed.
@@ -2223,37 +2292,66 @@ fn set_custom_dns(ctx: &mut Ctx, text: &str) {
     );
 }
 
-fn set_own_proxy(ctx: &mut Ctx, text: &str) {
-    ctx.settings.own_proxy = text.trim().to_string();
-    if ctx.settings.own_proxy.is_empty() {
-        upstream::clear();
-        ctx.settings.own_proxy_enabled = false;
+fn proxy_saved(ctx: &Ctx, cap: Cap, result: Result<(), String>) {
+    if let Err(error) = &result {
+        ctx.log(Level::Err, error);
+    }
+    let _ = ctx.events.send(Event::ProxySaved(cap, result));
+    (ctx.wake)();
+}
+
+fn set_group_key(ctx: &mut Ctx, text: &str, enable: bool) -> Result<(), String> {
+    crate::group_key::parse_key(text).map_err(|error| error.to_string())?;
+    let mut settings = ctx.settings.clone();
+    settings.group_proxy = enable || settings.group_proxy_wanted();
+    settings.group_key = text.trim().to_string();
+    settings.group_key_at = crate::gate::now_unix();
+    if !settings.save() {
+        return Err("Не удалось сохранить код из группы.".into());
+    }
+    ctx.settings = settings;
+    if ctx.settings.group_proxy_wanted() {
+        apply(ctx, Cap::GroupProxy, true);
+    }
+    ctx.log(Level::Ok, "Ключ принят.");
+    Ok(())
+}
+
+fn set_own_proxy(ctx: &mut Ctx, text: &str, enable: bool) -> Result<(), String> {
+    let text = text.trim();
+    let mut settings = ctx.settings.clone();
+    settings.own_proxy = text.to_string();
+    settings.own_proxy_enabled = enable && !text.is_empty();
+    if text.is_empty() {
+        upstream::try_clear().map_err(|error| format!("Не удалось убрать свой прокси: {error}"))?;
+        ctx.settings = settings;
+        if !ctx.settings.save() {
+            return Err("Свой прокси отключён, но не удалось удалить его адрес из настроек.".into());
+        }
         ctx.log(Level::Ok, "Свой прокси убран.");
         release_route_carrier(ctx);
-        return;
+        return Ok(());
     }
 
-    let up = match upstream::parse(&ctx.settings.own_proxy) {
-        Ok(u) => u,
-        Err(e) => {
-            ctx.log(Level::Err, format!("Адрес не разобран: {}", e));
-            ctx.settings.own_proxy_enabled = false;
-            return;
+    let up = upstream::parse(text).map_err(|error| format!("Адрес не разобран: {error}"))?;
+    if !enable {
+        if !settings.save() {
+            return Err("Не удалось сохранить адрес своего прокси.".into());
         }
-    };
+        ctx.settings = settings;
+        ctx.log(Level::Ok, "Адрес своего прокси сохранён.");
+        return Ok(());
+    }
 
-    // Saved and switched on whatever the checks below say: the user typed it in,
+    // Saved and switched on whatever the network probe says: the user typed it in,
     // and the route table is what decides whether it carries anything - a proxy
     // that does not open is stepped around on the connection that finds out, and
     // one that draws a region 400 is benched by the watch (G81). Refusing to save
     // it made the user keep a proxy they wanted out of the table altogether.
-    if let Err(e) = upstream::save(&up) {
-        ctx.log(Level::Err, format!("Не сохранён: {}", e));
-        ctx.settings.own_proxy_enabled = false;
-        return;
-    }
-    ctx.settings.own_proxy_enabled = true;
-    ctx.settings.own_proxy_at = crate::gate::now_unix();
+    upstream::save(&up).map_err(|error| format!("Прокси не сохранён: {error}"))?;
+    settings.own_proxy_at = crate::gate::now_unix();
+    ctx.settings = settings;
+    let saved = ctx.settings.save();
     ctx.log(Level::Ok, format!("Свой прокси включён: {}", up.display()));
     // Alone it needs the service and the variable; DNS is not part of it.
     ensure_route_carrier(ctx);
@@ -2275,6 +2373,11 @@ fn set_own_proxy(ctx: &mut Ctx, text: &str) {
                 ),
             );
         }
+    }
+    if saved {
+        Ok(())
+    } else {
+        Err("Свой прокси включён, но не удалось сохранить адрес в настройках.".into())
     }
 }
 
@@ -2359,7 +2462,9 @@ mod tests {
         // Turning the head off must move the choice down the list, not leave it
         // pointing at a provider that is switched off.
         s.set_provider_enabled(names[0], false);
-        assert_eq!(first_enabled_provider(&s), Some(names[1]));
+        assert_eq!(first_enabled_provider(&s), None, "an empty custom slot cannot answer");
+        s.custom_dns = "192.0.2.53".into();
+        assert_eq!(first_enabled_provider(&s), Some(crate::resolvers::CUSTOM_NAME));
 
         for n in &names {
             s.set_provider_enabled(n, false);
@@ -2439,10 +2544,12 @@ mod tests {
     /// with it) and the user's own proxy included, or it would draw itself on again.
     #[test]
     fn master_off_takes_every_way_down_and_on_never_picks_the_users_proxy() {
-        let off = bypass_order(false);
+        let off = bypass_order(false, false);
         assert_eq!(off.last(), Some(&Cap::Dns));
         assert!(off.contains(&Cap::OwnProxy) && off.contains(&Cap::GroupProxy));
-        assert!(!bypass_order(true).contains(&Cap::OwnProxy));
+        assert!(!bypass_order(true, false).contains(&Cap::OwnProxy));
+        assert!(!bypass_order(true, false).contains(&Cap::GroupProxy));
+        assert!(bypass_order(true, true).contains(&Cap::GroupProxy));
     }
 
     /// A service kept up for a route is not a half-installed DNS layer: with the
@@ -2517,6 +2624,8 @@ mod tests {
             local_proxy: State::Off,
             own_proxy: State::Off,
             group_proxy: State::Off,
+            own_proxy_configured: false,
+            group_proxy_configured: false,
             dns_rotation: State::Off,
             vpn: None,
             own_proxy_text: String::new(),

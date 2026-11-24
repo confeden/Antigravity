@@ -17,6 +17,20 @@ const ICON_W: u32 = 64;
 const ICON_H: u32 = 64;
 const ICON_RGBA: &[u8] = include_bytes!("../../assets/icon_64.rgba");
 
+const ANTIGRAVITY_SIZE: usize = 48;
+const ANTIGRAVITY_RGBA: &[u8] = include_bytes!("../../assets/antigravity_48.rgba");
+
+/// The Antigravity product badge shown next to the group heading in Integration.
+pub fn antigravity_image() -> Option<egui::ColorImage> {
+    if ANTIGRAVITY_RGBA.len() != ANTIGRAVITY_SIZE * ANTIGRAVITY_SIZE * 4 {
+        return None;
+    }
+    Some(egui::ColorImage::from_rgba_unmultiplied(
+        [ANTIGRAVITY_SIZE, ANTIGRAVITY_SIZE],
+        ANTIGRAVITY_RGBA,
+    ))
+}
+
 /// The window icon, or `None` if the baked asset is not the size it claims.
 ///
 /// Checked rather than trusted: a mismatched blob would have egui read past the
@@ -48,6 +62,16 @@ mod tests {
         assert!(
             icon.rgba.chunks_exact(4).any(|px| px[3] != 0),
             "the icon is entirely transparent"
+        );
+    }
+
+    #[test]
+    fn the_antigravity_icon_is_the_size_it_claims() {
+        let img = antigravity_image().expect("antigravity asset must match 48x48 RGBA");
+        assert_eq!(img.size, [ANTIGRAVITY_SIZE, ANTIGRAVITY_SIZE]);
+        assert!(
+            img.pixels.iter().any(|px| px.a() != 0),
+            "the antigravity icon is entirely transparent"
         );
     }
 }

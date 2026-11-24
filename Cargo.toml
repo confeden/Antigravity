@@ -1,6 +1,6 @@
 [package]
 name = "ag_unlocker"
-version = "2.32.2"
+version = "2.35.0"
 edition = "2021"
 description = "Antigravity Configuration Tool"
 authors = ["Brent t.me/nova_txt"]
@@ -55,6 +55,9 @@ wgpu = { version = "30", default-features = false, features = ["std", "parking_l
 libc = "0.2"
 # Linux has no DirectX: wgpu's default Vulkan + GL, then glow.
 eframe = { version = "0.36", features = ["glow"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+arboard = { version = "3.6", default-features = false, features = ["wayland-data-control"] }
 
 [build-dependencies]
 winres = "0.1"

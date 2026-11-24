@@ -25,6 +25,15 @@ use std::time::Instant;
 
 const FILE_NAME: &str = "settings.json";
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThemeMode {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -139,13 +148,15 @@ pub struct Settings {
     /// Installs the user pointed at by hand, on top of the ones found by the
     /// scan (the pencil next to each path).
     pub manual_paths: Vec<PathBuf>,
+
+    /// UI color theme preference (`system`, `light`, or `dark`).
+    #[serde(default)]
+    pub theme: ThemeMode,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        // Everything under the region bypass ships ON: spec item 3 — the
-        // switches are there to turn things *off*, not to make the user
-        // assemble a working setup out of parts.
+        // The built-in bypass ships on. Optional proxies need user configuration.
         Self {
             client_patch: false,
             auto_patch: true,
@@ -157,7 +168,7 @@ impl Default for Settings {
             decline_unrecorded: false,
             dns: true,
             local_proxy: true,
-            group_proxy: true,
+            group_proxy: false,
             debug_route: String::new(),
             disabled_providers: Vec::new(),
             custom_dns: String::new(),
@@ -168,6 +179,7 @@ impl Default for Settings {
             own_proxy: String::new(),
             own_proxy_enabled: false,
             manual_paths: Vec::new(),
+            theme: ThemeMode::System,
         }
     }
 }
@@ -224,6 +236,14 @@ impl Settings {
         self.auto_patch && !self.patch_declined
     }
 
+    pub fn group_proxy_configured(&self) -> bool {
+        !self.group_key.trim().is_empty()
+    }
+
+    pub fn group_proxy_wanted(&self) -> bool {
+        self.group_proxy && self.group_proxy_configured()
+    }
+
     pub fn provider_enabled(&self, name: &str) -> bool {
         !self
             .disabled_providers
@@ -276,10 +296,14 @@ fn parse(text: &str) -> Option<Settings> {
     let value: serde_json::Value =
         serde_json::from_str(text.trim_start_matches('\u{feff}')).ok()?;
     let unrecorded = value.get("patch_declined").is_none();
+    let group_unrecorded = value.get("group_proxy").is_none();
     let mut s: Settings = serde_json::from_value(value).ok()?;
     if unrecorded {
         s.patch_declined = !s.client_patch;
         s.decline_unrecorded = true;
+    }
+    if group_unrecorded || !s.group_proxy_configured() {
+        s.group_proxy = s.group_proxy_configured();
     }
     Some(s)
 }
@@ -452,13 +476,9 @@ pub fn local_proxy_wanted() -> bool {
     cached().local_proxy
 }
 
-/// Whether the built-in permitted-region exits may be used as a route.
-///
-/// Defaults to on: a missing settings file means a machine that never opened the
-/// window (the relay's first start races the first save), and the route being
-/// there is the shipped behaviour.
+/// Whether the configured group proxy may be used as a route.
 pub fn group_proxy_enabled() -> bool {
-    cached().group_proxy
+    cached().group_proxy_wanted()
 }
 
 /// The user's own proxy was set after the group code, so it goes first.
@@ -485,7 +505,8 @@ mod tests {
         // Nothing has been written in a test process, so this exercises the
         // "first run" path that every new user takes.
         let s = Settings::default();
-        assert!(s.dns && s.local_proxy && s.group_proxy && s.auto_patch);
+        assert!(s.dns && s.local_proxy && s.auto_patch);
+        assert!(!s.group_proxy_wanted());
         assert!(s.rotate_providers, "the pool races by default");
         assert!(
             !s.client_patch,
@@ -495,6 +516,18 @@ mod tests {
             s.auto_patch_wanted(),
             "a fresh install is patched unasked (D27): that is what auto-patch is for"
         );
+    }
+
+    #[test]
+    fn legacy_group_switch_requires_a_code_and_keeps_explicit_opt_out() {
+        let empty = parse(r#"{"group_proxy":true,"group_key":" "}"#).unwrap();
+        assert!(!empty.group_proxy);
+        assert!(!empty.group_proxy_wanted());
+        let enabled = parse(r#"{"group_proxy":true,"group_key":"saved"}"#).unwrap();
+        assert!(enabled.group_proxy_wanted());
+        let disabled = parse(r#"{"group_proxy":false,"group_key":"saved"}"#).unwrap();
+        assert!(disabled.group_proxy_configured());
+        assert!(!disabled.group_proxy_wanted());
     }
 
     /// G38 under D27: switching the patch off keeps it off, whatever auto-patch
@@ -593,5 +626,20 @@ mod tests {
         let s: Settings = serde_json::from_str(json).expect("unknown fields are ignored");
         assert!(!s.dns);
         assert!(s.local_proxy, "fields left out keep their default");
+        assert_eq!(s.theme, ThemeMode::System);
+    }
+
+    #[test]
+    fn theme_mode_defaults_to_system_and_round_trips() {
+        assert_eq!(Settings::default().theme, ThemeMode::System);
+        for mode in [ThemeMode::System, ThemeMode::Light, ThemeMode::Dark] {
+            let s = Settings {
+                theme: mode,
+                ..Settings::default()
+            };
+            let json = serde_json::to_string(&s).unwrap();
+            let parsed = parse(&json).unwrap();
+            assert_eq!(parsed.theme, mode);
+        }
     }
 }

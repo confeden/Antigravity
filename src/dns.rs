@@ -236,6 +236,39 @@ fn restore_ipv4_precedence() {
 #[cfg(not(target_os = "windows"))]
 pub fn remove_dns_nrpt() {}
 
+/// Full rollback must report errors instead of the legacy best-effort cleanup.
+#[cfg(not(target_os = "windows"))]
+pub fn remove_dns_nrpt_checked() -> Result<(), String> { Ok(()) }
+
+#[cfg(target_os = "windows")]
+pub fn remove_dns_nrpt_checked() -> Result<(), String> {
+    let mut errors = Vec::new();
+    if let Err(e) = hosts_pin::remove_entries() { errors.push(e); }
+    let script = format!(
+        "$ErrorActionPreference='Stop'; $fail=@(); \
+         try {{ Get-DnsClientNrptRule | Where-Object {{$_.Comment -in @({})}} | \
+           Remove-DnsClientNrptRule -Force }} catch {{ $fail += $_.Exception.Message }}; \
+         try {{ \
+           $p=Get-NetPrefixPolicy | Where-Object {{$_.Prefix -eq '::ffff:0:0/96'}}; \
+           if ($p.Precedence -eq 46) {{ \
+             netsh interface ipv6 set prefixpolicy ::ffff:0:0/96 35 4 | Out-Null; \
+             if ($LASTEXITCODE -ne 0) {{ throw 'Не восстановлен приоритет IPv4' }} \
+           }} \
+         }} catch {{ $fail += $_.Exception.Message }}; \
+         try {{ Clear-DnsClientCache }} catch {{ $fail += $_.Exception.Message }}; \
+         if ($fail.Count) {{ [Console]::Error.WriteLine(($fail -join '; ')); exit 1 }}",
+        ps_string_list(&all_tags())
+    );
+    match powershell(&script) {
+        Some(out) if out.status.success() => {},
+        Some(out) => errors.push(String::from_utf8_lossy(&out.stderr).trim().to_string()),
+        None => errors.push("DNS cleanup timed out".into()),
+    }
+    if let Err(e) = egress::remove_legacy_routes_checked() { errors.push(e); }
+    invalidate_cache();
+    if errors.is_empty() { Ok(()) } else { Err(errors.join("; ")) }
+}
+
 #[cfg(target_os = "windows")]
 pub fn remove_dns_nrpt() {
     restore_ipv4_precedence();

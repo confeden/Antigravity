@@ -270,7 +270,9 @@ pub fn launch_app(app: &Path) -> std::io::Result<()> {
     use std::os::windows::process::CommandExt;
     const DETACHED_PROCESS: u32 = 0x0000_0008;
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-    if in_service_session() {
+    // Keep the client at user integrity even when the patch window is elevated.
+    // Otherwise its orphaned sidecars cannot be reaped by the Limited agent.
+    if in_service_session() || crate::utils::is_admin() {
         return launch_in_user_session(app);
     }
     Command::new(app)

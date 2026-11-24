@@ -136,7 +136,7 @@ pub fn view(app: &mut App, ui: &mut egui::Ui) {
             ui.add_space(8.0);
             ui.label(
                 egui::RichText::new("Ключ не подходит к этой версии анлокера.")
-                    .color(theme::BAD)
+                    .color(theme::palette(ui).bad)
                     .size(13.0),
             );
         }
@@ -156,14 +156,14 @@ pub fn view(app: &mut App, ui: &mut egui::Ui) {
         ui.add_space(8.0);
         ui.label(
             egui::RichText::new("Подождите…")
-                .color(theme::MUTED)
+                .color(theme::palette(ui).muted)
                 .size(12.5),
         );
     } else if !app.key_input.trim().is_empty() && normalized_len != 24 {
         ui.add_space(8.0);
         ui.label(
             egui::RichText::new("Введите ключ подходящей длины")
-                .color(theme::MUTED)
+                .color(theme::palette(ui).muted)
                 .size(12.5),
         );
     }

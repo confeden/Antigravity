@@ -268,9 +268,7 @@ pub fn parse(input: &str) -> Result<Upstream, String> {
     if host.is_empty() {
         return Err("не указан адрес".to_string());
     }
-    let port: u16 = port
-        .parse()
-        .map_err(|_| format!("порт «{}» не число", port))?;
+    let port: u16 = port.parse().map_err(|_| "порт должен быть числом от 1 до 65535".to_string())?;
     if port == 0 {
         return Err("порт не может быть 0".to_string());
     }
@@ -300,8 +298,11 @@ pub fn save(up: &Upstream) -> Result<(), String> {
     fs::write(&path, up.as_line()).map_err(|e| e.to_string())
 }
 
-pub fn clear() {
-    fs::remove_file(config_path()).ok();
+pub fn try_clear() -> std::io::Result<()> {
+    match fs::remove_file(config_path()) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        result => result,
+    }
 }
 
 /// The configured proxy, or `None` when the user skipped the question.

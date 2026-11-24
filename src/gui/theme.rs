@@ -1,37 +1,71 @@
-//! One place for every colour, radius and spacing the GUI uses.
-//!
-//! The design brief was "simple, buttons": one dark surface, one accent, and a
-//! green/red pair that only ever means on/off. Anything that needs a *fourth*
-//! colour is a sign the screen is doing too much.
+//! Shared palettes and typography for the native window.
 
 use eframe::egui::{self, Color32, CornerRadius, Stroke};
 
-/// Window background — the darkest surface, nothing sits behind it.
-pub const BG: Color32 = Color32::from_rgb(0x14, 0x16, 0x1A);
-/// A card: one step lighter than the window so its edge reads without a border.
-pub const CARD: Color32 = Color32::from_rgb(0x1C, 0x1F, 0x26);
-/// A control inside a card (text field, inactive switch track).
-pub const SUNKEN: Color32 = Color32::from_rgb(0x24, 0x28, 0x31);
-/// Hairline between rows. Deliberately barely visible.
-pub const LINE: Color32 = Color32::from_rgb(0x2E, 0x33, 0x3D);
+pub struct Palette {
+    pub bg: Color32,
+    pub chrome: Color32,
+    pub card: Color32,
+    pub sunken: Color32,
+    pub line: Color32,
+    pub text: Color32,
+    pub muted: Color32,
+    pub accent: Color32,
+    pub accent_text: Color32,
+    pub on_accent: Color32,
+    pub soft: Color32,
+    pub ok: Color32,
+    pub warn: Color32,
+    pub bad: Color32,
+}
 
-/// Primary text.
-pub const TEXT: Color32 = Color32::from_rgb(0xE6, 0xE9, 0xEF);
-/// Secondary text: descriptions, paths, hints.
-pub const MUTED: Color32 = Color32::from_rgb(0x8B, 0x93, 0xA3);
+const fn rgb(hex: u32) -> Color32 {
+    Color32::from_rgb((hex >> 16) as u8, (hex >> 8) as u8, hex as u8)
+}
 
-/// The accent. Used for the active switch, focus rings and primary buttons.
-pub const ACCENT: Color32 = Color32::from_rgb(0x4C, 0x8D, 0xFF);
-pub const ACCENT_HOVER: Color32 = Color32::from_rgb(0x6A, 0xA1, 0xFF);
+const LIGHT: Palette = Palette {
+    bg: rgb(0xfbfcfe),
+    chrome: rgb(0xeef1f5),
+    card: rgb(0xf0f4f8),
+    sunken: rgb(0xffffff),
+    line: rgb(0xdce2ea),
+    text: rgb(0x242a35),
+    muted: rgb(0x586474),
+    accent: rgb(0x245d98),
+    accent_text: rgb(0x145ca1),
+    on_accent: rgb(0xffffff),
+    soft: rgb(0xe1eefb),
+    ok: rgb(0x257346),
+    warn: rgb(0x875018),
+    bad: rgb(0xa22b34),
+};
 
-/// "On / succeeded".
-pub const OK: Color32 = Color32::from_rgb(0x3F, 0xC1, 0x7C);
-/// "Needs attention" — admin missing, a provider that stopped answering.
-pub const WARN: Color32 = Color32::from_rgb(0xE8, 0xB3, 0x39);
-/// "Off / failed".
-pub const BAD: Color32 = Color32::from_rgb(0xE5, 0x63, 0x5F);
+const DARK: Palette = Palette {
+    bg: rgb(0x24272f),
+    chrome: rgb(0x1e2129),
+    card: rgb(0x2d323d),
+    sunken: rgb(0x222630),
+    line: rgb(0x3c424e),
+    text: rgb(0xf0f3fa),
+    muted: rgb(0xb1bdce),
+    accent: rgb(0xa8d4ff),
+    accent_text: rgb(0x9cd0ff),
+    on_accent: rgb(0x102842),
+    soft: rgb(0x273c51),
+    ok: rgb(0xa6dfb1),
+    warn: rgb(0xf5c48c),
+    bad: rgb(0xffaaa9),
+};
 
-pub const RADIUS: u8 = 10;
+pub fn palette(ui: &egui::Ui) -> &'static Palette {
+    if ui.visuals().dark_mode {
+        &DARK
+    } else {
+        &LIGHT
+    }
+}
+
+pub const RADIUS: u8 = 8;
 pub const RADIUS_SMALL: u8 = 6;
 
 /// Installs Segoe UI Semibold as the UI face, when the machine has it.
@@ -48,27 +82,48 @@ fn install_font(ctx: &egui::Context) {
     // Semibold first, as asked; plain Segoe UI is the near-miss worth taking
     // before falling all the way back to Ubuntu-Light.
     let candidates = ["seguisb.ttf", "segoeui.ttf"];
-    let Some((name, bytes)) = candidates.iter().find_map(|f| {
+    let segoe = candidates.iter().find_map(|f| {
         let path = std::path::Path::new(&dir).join("Fonts").join(f);
         std::fs::read(&path).ok().map(|b| (*f, b))
-    }) else {
-        return;
-    };
+    });
 
     let mut fonts = egui::FontDefinitions::default();
+    if let Some((name, bytes)) = segoe {
+        fonts.font_data.insert(
+            name.to_string(),
+            std::sync::Arc::new(egui::FontData::from_owned(bytes)),
+        );
+        fonts
+            .families
+            .entry(egui::FontFamily::Proportional)
+            .or_default()
+            .insert(0, name.to_string());
+    }
     fonts.font_data.insert(
-        name.to_string(),
-        std::sync::Arc::new(egui::FontData::from_owned(bytes)),
+        "Lucide".into(),
+        std::sync::Arc::new(egui::FontData::from_static(include_bytes!(
+            "../../assets/lucide-panel.ttf"
+        ))),
     );
-    // Proportional only. Segoe UI is not a monospaced face, and the two places
-    // that ask for one — the licence key field and the install paths — are
-    // exactly the places where columns lining up is the point.
-    fonts
-        .families
-        .entry(egui::FontFamily::Proportional)
-        .or_default()
-        .insert(0, name.to_string());
+    fonts.families.insert(
+        egui::FontFamily::Name("Lucide".into()),
+        vec!["Lucide".into()],
+    );
     ctx.set_fonts(fonts);
+}
+
+pub fn icon_font(size: f32) -> egui::FontId {
+    egui::FontId::new(size, egui::FontFamily::Name("Lucide".into()))
+}
+
+/// Updates the context's theme preference from persisted settings or user toggle.
+pub fn set_preference(ctx: &egui::Context, mode: crate::settings::ThemeMode) {
+    let pref = match mode {
+        crate::settings::ThemeMode::System => egui::ThemePreference::System,
+        crate::settings::ThemeMode::Light => egui::ThemePreference::Light,
+        crate::settings::ThemeMode::Dark => egui::ThemePreference::Dark,
+    };
+    ctx.set_theme(pref);
 }
 
 /// Applies the theme to a context. Called once at startup.
@@ -79,42 +134,38 @@ fn install_font(ctx: &egui::Context) {
 pub fn apply(ctx: &egui::Context) {
     install_font(ctx);
 
-    let mut visuals = egui::Visuals::dark();
-
-    visuals.panel_fill = BG;
-    visuals.window_fill = BG;
-    visuals.extreme_bg_color = SUNKEN;
-    visuals.faint_bg_color = CARD;
-    visuals.override_text_color = Some(TEXT);
-    visuals.hyperlink_color = ACCENT;
-
-    let r = CornerRadius::same(RADIUS_SMALL);
-    visuals.widgets.noninteractive.bg_fill = CARD;
-    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, LINE);
-    visuals.widgets.noninteractive.corner_radius = r;
-
-    visuals.widgets.inactive.bg_fill = SUNKEN;
-    visuals.widgets.inactive.weak_bg_fill = SUNKEN;
-    visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, LINE);
-    visuals.widgets.inactive.corner_radius = r;
-
-    visuals.widgets.hovered.bg_fill = LINE;
-    visuals.widgets.hovered.weak_bg_fill = LINE;
-    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, ACCENT);
-    visuals.widgets.hovered.corner_radius = r;
-
-    visuals.widgets.active.bg_fill = ACCENT;
-    visuals.widgets.active.weak_bg_fill = ACCENT;
-    visuals.widgets.active.bg_stroke = Stroke::new(1.0, ACCENT_HOVER);
-    visuals.widgets.active.corner_radius = r;
-
-    visuals.selection.bg_fill = ACCENT.gamma_multiply(0.4);
-    visuals.selection.stroke = Stroke::new(1.0, TEXT);
-
-    // Pinned to dark rather than following the OS: every colour above was picked
-    // against BG, and half a theme is worse than the wrong one.
-    ctx.set_theme(egui::ThemePreference::Dark);
-    ctx.set_visuals_of(egui::Theme::Dark, visuals);
+    for (theme, colors, mut visuals) in [
+        (egui::Theme::Dark, &DARK, egui::Visuals::dark()),
+        (egui::Theme::Light, &LIGHT, egui::Visuals::light()),
+    ] {
+        visuals.panel_fill = colors.bg;
+        visuals.window_fill = colors.bg;
+        visuals.extreme_bg_color = colors.sunken;
+        visuals.faint_bg_color = colors.card;
+        visuals.override_text_color = Some(colors.text);
+        visuals.hyperlink_color = colors.accent_text;
+        let radius = CornerRadius::same(RADIUS_SMALL);
+        for (widget, fill, border) in [
+            (
+                &mut visuals.widgets.noninteractive,
+                colors.card,
+                colors.line,
+            ),
+            (&mut visuals.widgets.inactive, colors.sunken, colors.line),
+            (&mut visuals.widgets.hovered, colors.card, colors.accent),
+            (&mut visuals.widgets.active, colors.soft, colors.accent),
+            (&mut visuals.widgets.open, colors.soft, colors.accent),
+        ] {
+            widget.bg_fill = fill;
+            widget.weak_bg_fill = fill;
+            widget.bg_stroke = Stroke::new(1.0, border);
+            widget.corner_radius = radius;
+        }
+        visuals.selection.bg_fill = colors.soft;
+        visuals.selection.stroke = Stroke::new(1.0, colors.accent);
+        ctx.set_visuals_of(theme, visuals);
+    }
+    ctx.set_theme(egui::ThemePreference::System);
 
     ctx.all_styles_mut(|style| {
         use egui::{FontFamily::Proportional, FontId, TextStyle};
@@ -130,7 +181,7 @@ pub fn apply(ctx: &egui::Context) {
         ]
         .into();
         style.spacing.item_spacing = egui::vec2(8.0, 8.0);
-        style.spacing.button_padding = egui::vec2(12.0, 7.0);
+        style.spacing.button_padding = egui::vec2(10.0, 6.0);
         style.spacing.interact_size.y = 26.0;
         // Always visible and taking its own column, not floating over the
         // content: a bar that only appears on hover leaves no sign that there is

@@ -75,6 +75,8 @@ pub struct Report {
     /// code, empty until measured).
     pub tunnel: bool,
     pub vpn_exit: String,
+    /// At least one open gate connection uses a VPN source interface.
+    pub vpn_traffic: bool,
     /// The route table, best first, for the report the window copies out.
     pub routes: Vec<crate::routes::Row>,
     /// The relay generation that wrote this.
@@ -197,6 +199,7 @@ impl Report {
             && self.loopback == other.loopback
             && self.tunnel == other.tunnel
             && self.vpn_exit == other.vpn_exit
+            && self.vpn_traffic == other.vpn_traffic
             && self.blockers == other.blockers
             && self.reached_at == other.reached_at
             && self.started_at == other.started_at
@@ -297,6 +300,10 @@ pub fn publish(now: Now<'_>) {
         r.loopback = now.loopback;
         r.tunnel = now.tunnel;
         r.vpn_exit = now.vpn_exit.to_string();
+        #[cfg(not(target_os = "windows"))]
+        {
+            r.vpn_traffic = crate::netif::sources_use_vpn(&crate::routes::open_upstream_sources());
+        }
         r.routes = now.routes;
         r.version = crate::dns_forwarder::RELAY_VERSION;
         r.reached_at = crate::net::last_reached();
@@ -760,6 +767,10 @@ mod tests {
             ..base.clone()
         };
         assert!(!base.same_state_as(&rerouted));
+        assert!(!base.same_state_as(&Report {
+            vpn_traffic: true,
+            ..base.clone()
+        }));
         let answered = Report {
             last_400: Some(Episode {
                 at: 1_010,

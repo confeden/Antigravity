@@ -875,6 +875,9 @@ struct Tunnel {
     host: String,
     /// Kept after close, so delayed client log lines still identify a DNS IP.
     peer: Option<std::net::Ipv4Addr>,
+    /// The source address of the outbound socket, used to identify its interface.
+    #[cfg(not(target_os = "windows"))]
+    source: Option<std::net::IpAddr>,
     opened: Instant,
     closed: Option<Instant>,
     /// When a model answer was attributed to *this* tunnel. The one fact that
@@ -959,6 +962,10 @@ pub fn attach_upstream(upstream: &TcpStream) {
                 _ => None,
             });
             t.upstream = Some(clone);
+            #[cfg(not(target_os = "windows"))]
+            {
+                t.source = upstream.local_addr().ok().map(|addr| addr.ip());
+            }
         }
     }
 }
@@ -1062,6 +1069,8 @@ pub fn note_used(kind: Kind) {
             kind,
             host,
             peer: None,
+            #[cfg(not(target_os = "windows"))]
+            source: None,
             opened: now,
             closed: None,
             answered_at: None,
@@ -1102,6 +1111,31 @@ pub fn open_counts() -> [u32; N] {
         }
     }
     out
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn note_upstream_source(upstream: &TcpStream) {
+    let Some(id) = SERVING.with(|s| s.borrow().as_ref().and_then(|s| s.tunnel)) else {
+        return;
+    };
+    if let Ok(mut list) = TUNNELS.lock() {
+        if let Some(tunnel) = list.iter_mut().find(|t| t.id == id && t.closed.is_none()) {
+            tunnel.source = upstream.local_addr().ok().map(|addr| addr.ip());
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn open_upstream_sources() -> Vec<std::net::IpAddr> {
+    TUNNELS.lock().map_or_else(
+        |_| Vec::new(),
+        |list| {
+            list.iter()
+                .filter(|t| t.closed.is_none())
+                .filter_map(|t| t.source)
+                .collect()
+        },
+    )
 }
 
 /// Closes every open gate tunnel on `kind`. The splice under each ends on the

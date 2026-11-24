@@ -167,7 +167,9 @@ pub const LISTEN_PORT: u16 = 53;
 /// 48 = the update watchdog closes the whole app (not just its server) to free a
 ///     locked language server and starts it again after the patch (G92). An older
 ///     one kills the server alone and the app gives up on it after three restarts.
-pub const RELAY_VERSION: u32 = 48;
+/// 49 = DNS-AI is the only built-in DNS provider; NRPT has only the local relay.
+/// 50 = Report observed VPN egress for the relay's open gate connections.
+pub const RELAY_VERSION: u32 = 50;
 
 /// Written where an unelevated relay can write and an unelevated unlocker can
 /// read. Absent means a relay from before versioning, i.e. older than anything.

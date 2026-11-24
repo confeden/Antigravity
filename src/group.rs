@@ -908,6 +908,8 @@ pub fn tunnel(mut client: TcpStream, host: &str, _port: u16) -> Result<(), TcpSt
                         return Ok(());
                     }
                     crate::routes::note_used(crate::routes::Kind::Group);
+                    #[cfg(not(target_os = "windows"))]
+                    crate::routes::note_upstream_source(&sock);
                     crate::dns_forwarder::log_proxy(&format!(
                         "{} #{} -> {}",
                         route.label(),

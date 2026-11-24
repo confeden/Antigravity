@@ -115,6 +115,7 @@ mod windows_impl {
     #[allow(dead_code)]
     pub fn is_watchdog_enabled() -> bool {
         task_exists(WATCHDOG_TASK_NAME)
+            || (crate::settings::auto_patch_wanted() && task_exists(TASK_NAME))
     }
 
     pub fn is_running() -> bool {
@@ -359,18 +360,11 @@ mod windows_impl {
     /// it every time.
     pub fn ensure_running() -> Result<(), String> {
         if is_enabled() && is_running() && installed_copy_is_current() {
-            return Ok(());
+            return remove_watchdog_task();
         }
         enable()?;
-        let _ = crate::launch_guard::uninstall();
-        if is_watchdog_enabled() && crate::settings::auto_patch_wanted() {
-            if let Err(e) = enable_watchdog() {
-                // DNS is already running. A launch-filter conflict must not
-                // report a failed DNS start or prevent its rules being applied.
-                crate::watchdog::log(&format!("DNS helper upgraded; Desktop launch guard unavailable: {e}"));
-            }
-        }
-        Ok(())
+        crate::launch_guard::uninstall()?;
+        remove_watchdog_task()
     }
 
     /// Puts this build in `%ProgramData%` for the watchdog task **without**
@@ -405,18 +399,20 @@ mod windows_impl {
         Ok(())
     }
 
-    /// Registers the standalone watchdog logon task, pointing at the same installed
-    /// exe as the relay but with `--watchdog`. Additive: it runs a second copy of
-    /// the re-patch loop that survives the relay being stopped or absent (G9). The
-    /// relay's own in-process watchdog is left in place as well; both are
-    /// idempotent and settle-guarded, so a double poll re-applies the same rename
-    /// harmlessly.
+    /// Registers a standalone watchdog only without a running relay. The relay
+    /// already runs the same loop in-process; keeping both tasks duplicated work
+    /// and could close/reopen the client twice for one update.
     ///
     /// Assumes the exe is already in `%ProgramData%` - the relay's `enable()` put
     /// it there, and menu 1 always runs the relay first. Best-effort by design: a
     /// failure here must not fail the patch (the relay's watchdog still covers the
     /// common case), so the caller treats an error as non-fatal.
     pub fn enable_watchdog() -> Result<(), String> {
+        // The relay already owns a watchdog thread. A separate task is needed
+        // only on a patch-only installation.
+        if is_enabled() && is_running() && crate::gate::read().is_some_and(|r| !r.is_stale()) {
+            return remove_watchdog_task();
+        }
         let exe = installed_exe();
         if !exe.exists() {
             return Err("exe не установлен в %ProgramData%".to_string());
@@ -455,6 +451,18 @@ mod windows_impl {
     /// Removes the standalone watchdog task. `Stop-ScheduledTask` ends only this
     /// task's own process instance, so it does not disturb the relay (which shares
     /// the exe image name). Called by both undo paths alongside the relay teardown.
+    fn remove_watchdog_task() -> Result<(), String> {
+        let script = format!(
+            "$ErrorActionPreference='Stop'; \
+             $t=Get-ScheduledTask | Where-Object {{$_.TaskName -eq '{WATCHDOG_TASK_NAME}' -and $_.TaskPath -eq '\\'}}; \
+             if ($t) {{ $t | Stop-ScheduledTask; $t | Unregister-ScheduledTask -Confirm:$false }}"
+        );
+        let out = powershell(&script).ok_or("watchdog removal timed out")?;
+        if out.status.success() { Ok(()) } else {
+            Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+        }
+    }
+
     pub fn disable_watchdog() {
         if let Err(e) = crate::launch_guard::uninstall() {
             crate::watchdog::log(&format!("Could not remove Desktop launch guard: {e}"));

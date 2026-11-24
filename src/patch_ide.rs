@@ -61,9 +61,8 @@ fn write_atomic(path: &Path, content: &str) -> std::io::Result<()> {
 /// was nothing of ours to undo.
 ///
 /// A backup is the only faithful revert (the body was rewritten, not marked), so
-/// this prefers it. If the backup is gone but our marker is present, it strips
-/// the marker as a last resort and says so - the auth body then stays rewritten,
-/// which still lets Antigravity run; a clean restore needs a reinstall.
+/// this prefers it. Without a backup the rewritten body cannot be recovered;
+/// report that failure and retain the marker for the next attempt.
 fn restore_js(target: &Path) -> Result<bool, String> {
     let bak = backup_path(target);
     if bak.exists() {
@@ -71,21 +70,15 @@ fn restore_js(target: &Path) -> Result<bool, String> {
         let text = String::from_utf8_lossy(&data).into_owned();
         write_atomic(target, &text)
             .map_err(|e| format!("не записать {}: {}", target.display(), e))?;
-        fs::remove_file(&bak).ok();
+        fs::remove_file(&bak).map_err(|e| format!("не удалить бэкап: {e}"))?;
         return Ok(true);
     }
-    let Ok(content) = fs::read_to_string(target) else {
-        return Ok(false);
-    };
-    if let Some(stripped) = strip_marker(&content) {
-        write_atomic(target, &stripped)
-            .map_err(|e| format!("не записать {}: {}", target.display(), e))?;
-        eprintln!(
-            "  [WARN] {}: бэкап отсутствует — снят только маркер, тело патча осталось \
-             (для чистого возврата переустановите Antigravity)",
+    let content = fs::read_to_string(target).map_err(|e| format!("{}: {e}", target.display()))?;
+    if has_marker(&content) {
+        return Err(format!(
+            "{}: бэкап отсутствует — для полного отката переустановите Antigravity",
             target.display()
-        );
-        return Ok(true);
+        ));
     }
     Ok(false)
 }
@@ -563,17 +556,17 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
-    /// With no backup but our marker present, restore strips the marker as a last
-    /// resort (the body stays rewritten) rather than doing nothing.
+    /// A missing backup must not turn a partial restore into a clean result.
+    /// Keep the marker so that another attempt still detects the remaining edit.
     #[test]
-    fn restore_without_a_backup_at_least_strips_the_marker() {
+    fn restore_without_a_backup_reports_the_remaining_patch() {
         let dir = std::env::temp_dir().join("ag_js_restore_nombak");
         fs::create_dir_all(&dir).unwrap();
         let target = dir.join("main.js");
         fs::write(&target, "body\n// UNLOCKED").unwrap();
 
-        assert_eq!(restore_js(&target).unwrap(), true);
-        assert!(!has_marker(&fs::read_to_string(&target).unwrap()));
+        assert!(restore_js(&target).is_err());
+        assert!(has_marker(&fs::read_to_string(&target).unwrap()));
 
         fs::remove_dir_all(&dir).ok();
     }
