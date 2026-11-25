@@ -976,6 +976,40 @@ fn auto_update_row(app: &mut App, ui: &mut egui::Ui) {
     }) {
         app.worker.send(Cmd::SetAutoUpdate(on));
     }
+    ui.add_space(6.0);
+    ui.horizontal_wrapped(|ui| {
+        let busy_update = matches!(app.update_check, super::UpdateCheckState::Checking)
+            || app.update.as_ref().is_some_and(|b| b.is_busy());
+        if widgets::command(ui, widgets::REFRESH, "Проверить обновления", false, !busy_update)
+            .clicked()
+        {
+            app.update_check = super::UpdateCheckState::Checking;
+            app.update_handle.check_now();
+        }
+        let colors = theme::palette(ui);
+        ui.label(
+            egui::RichText::new(format!("Текущая: v{}", crate::update::current_version()))
+                .size(12.0)
+                .color(colors.muted),
+        );
+        match &app.update_check {
+            super::UpdateCheckState::Idle => {}
+            super::UpdateCheckState::Checking => {
+                ui.add(egui::Spinner::new().size(13.0));
+                ui.label(egui::RichText::new("Проверяю GitHub Releases…").size(12.0).color(colors.muted));
+            }
+            super::UpdateCheckState::UpToDate(label) => {
+                ui.label(egui::RichText::new(label).size(12.0).color(colors.ok));
+            }
+            super::UpdateCheckState::Failed(err) => {
+                ui.label(
+                    egui::RichText::new(format!("Ошибка проверки: {err}"))
+                        .size(12.0)
+                        .color(colors.bad),
+                );
+            }
+        }
+    });
 }
 
 fn proxy_configured(app: &App, cap: Cap) -> bool {

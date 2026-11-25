@@ -18,6 +18,7 @@ use sha2::{Digest, Sha256};
 
 pub const DEFAULT_REPO: &str = "soroka-ilya/Antigravity";
 pub const UPDATED_FROM_FLAG: &str = "--updated-from";
+pub const INSTALL_UPDATE_FLAG: &str = "--install-update";
 
 pub fn update_repo() -> &'static str {
     option_env!("AG_UPDATE_REPO").unwrap_or(DEFAULT_REPO)
@@ -91,6 +92,12 @@ impl ReleaseInfo {
 
 #[derive(Debug, Clone)]
 pub enum UpdateEvent {
+    Checking,
+    UpToDate {
+        version: String,
+        latest: String,
+    },
+    CheckFailed(String),
     Available(ReleaseInfo),
     Downloading {
         version: String,
@@ -104,7 +111,51 @@ pub enum UpdateEvent {
     Failed {
         release: ReleaseInfo,
         reason: String,
+        needs_elevation: bool,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateFailure {
+    pub reason: String,
+    pub needs_elevation: bool,
+}
+
+impl From<String> for UpdateFailure {
+    fn from(reason: String) -> Self {
+        Self {
+            reason,
+            needs_elevation: false,
+        }
+    }
+}
+
+enum UpdateCmd {
+    CheckNow,
+    Install(ReleaseInfo),
+}
+
+#[derive(Clone)]
+pub struct UpdateHandle {
+    tx: std::sync::mpsc::Sender<UpdateCmd>,
+}
+
+impl UpdateHandle {
+    pub fn check_now(&self) {
+        let _ = self.tx.send(UpdateCmd::CheckNow);
+    }
+
+    pub fn install_now(&self, rel: ReleaseInfo) {
+        let _ = self.tx.send(UpdateCmd::Install(rel));
+    }
+}
+
+pub fn up_to_date_label(version: &str, latest: &str) -> String {
+    if latest.is_empty() || version == latest {
+        format!("Установлена актуальная версия (v{version})")
+    } else {
+        format!("Версия v{version} (последний релиз v{latest})")
+    }
 }
 
 /// Compares two version strings (e.g. "v2.11.0_4" vs "2.11.0_1", "2.11.0" vs "2.10.0").
@@ -359,7 +410,29 @@ fn header_value<'a>(header_str: &'a str, name: &str) -> Option<&'a str> {
 
 enum FetchOutcome {
     Redirect(String),
-    Done,
+    NotModified,
+    Done { etag: Option<String> },
+}
+
+enum StreamOutcome {
+    NotModified,
+    Body { etag: Option<String> },
+}
+
+enum ConditionalFetch {
+    NotModified,
+    Body {
+        bytes: Vec<u8>,
+        etag: Option<String>,
+    },
+}
+
+fn sanitize_etag(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.contains(['\r', '\n']) {
+        return None;
+    }
+    Some(trimmed.to_string())
 }
 
 enum HttpEvent<'a> {
@@ -449,6 +522,7 @@ fn stream_body(
 fn http_get_once(
     url: &str,
     accept: &str,
+    if_none_match: Option<&str>,
     io_timeout: Duration,
     max_bytes: usize,
     on_event: &mut dyn FnMut(HttpEvent<'_>) -> Result<(), String>,
@@ -466,11 +540,16 @@ fn http_get_once(
     } else {
         format!("{host}:{port}")
     };
+    let inm_header = if_none_match
+        .and_then(sanitize_etag)
+        .map(|tag| format!("If-None-Match: {tag}\r\n"))
+        .unwrap_or_default();
     let req = format!(
         "GET {path} HTTP/1.1\r\n\
          Host: {host_header}\r\n\
          User-Agent: ag_unlocker/{}\r\n\
          Accept: {accept}\r\n\
+         {inm_header}\
          Connection: close\r\n\r\n",
         current_version()
     );
@@ -484,6 +563,9 @@ fn http_get_once(
     let (header_str, initial_body) = read_http_headers(&mut stream)?;
     let code = parse_status_code(&header_str)
         .ok_or_else(|| "invalid HTTP status line".to_string())?;
+    if code == 304 {
+        return Ok(FetchOutcome::NotModified);
+    }
     if matches!(code, 301 | 302 | 303 | 307 | 308) {
         let loc = header_value(&header_str, "location")
             .ok_or_else(|| format!("redirect HTTP {} without Location", code))?;
@@ -493,6 +575,7 @@ fn http_get_once(
         return Err(format!("HTTP {} while fetching {}", code, url));
     }
 
+    let etag = header_value(&header_str, "etag").and_then(sanitize_etag);
     let is_chunked = header_value(&header_str, "transfer-encoding")
         .is_some_and(|v| v.to_ascii_lowercase().contains("chunked"));
     let content_len = header_value(&header_str, "content-length")
@@ -509,43 +592,130 @@ fn http_get_once(
         max_bytes,
         on_event,
     )?;
-    Ok(FetchOutcome::Done)
+    Ok(FetchOutcome::Done { etag })
 }
 
 fn http_get_stream(
     url: &str,
     accept: &str,
+    if_none_match: Option<&str>,
     io_timeout: Duration,
     max_bytes: usize,
     on_event: &mut dyn FnMut(HttpEvent<'_>) -> Result<(), String>,
-) -> Result<(), String> {
+) -> Result<StreamOutcome, String> {
     let mut current = url.to_string();
-    for _ in 0..=MAX_REDIRECTS {
-        match http_get_once(&current, accept, io_timeout, max_bytes, on_event)? {
+    for attempt in 0..=MAX_REDIRECTS {
+        let etag_hdr = if attempt == 0 { if_none_match } else { None };
+        match http_get_once(&current, accept, etag_hdr, io_timeout, max_bytes, on_event)? {
             FetchOutcome::Redirect(next) => current = next,
-            FetchOutcome::Done => return Ok(()),
+            FetchOutcome::NotModified => return Ok(StreamOutcome::NotModified),
+            FetchOutcome::Done { etag } => return Ok(StreamOutcome::Body { etag }),
         }
     }
     Err("too many HTTP redirects".to_string())
 }
 
-fn fetch_bytes(url: &str, accept: &str, timeout: Duration, max_bytes: usize) -> Result<Vec<u8>, String> {
+fn fetch_conditional(
+    url: &str,
+    accept: &str,
+    if_none_match: Option<&str>,
+    timeout: Duration,
+    max_bytes: usize,
+) -> Result<ConditionalFetch, String> {
     let mut body = Vec::new();
-    http_get_stream(url, accept, timeout, max_bytes, &mut |ev| {
+    match http_get_stream(url, accept, if_none_match, timeout, max_bytes, &mut |ev| {
         if let HttpEvent::Chunk(slice) = ev {
             body.extend_from_slice(slice);
         }
         Ok(())
-    })?;
-    Ok(body)
+    })? {
+        StreamOutcome::NotModified => Ok(ConditionalFetch::NotModified),
+        StreamOutcome::Body { etag } => Ok(ConditionalFetch::Body { bytes: body, etag }),
+    }
 }
 
-/// Synchronously fetches the latest release from the GitHub API over HTTPS.
+fn fetch_bytes(url: &str, accept: &str, timeout: Duration, max_bytes: usize) -> Result<Vec<u8>, String> {
+    match fetch_conditional(url, accept, None, timeout, max_bytes)? {
+        ConditionalFetch::Body { bytes, .. } => Ok(bytes),
+        ConditionalFetch::NotModified => Err("unexpected HTTP 304 Not Modified".to_string()),
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CachedRelease {
+    repo: String,
+    etag: Option<String>,
+    release: ReleaseInfo,
+}
+
+fn default_cache_path() -> Option<PathBuf> {
+    if cfg!(test) {
+        return None;
+    }
+    let dir = crate::dns_forwarder::log_dir();
+    (!dir.as_os_str().is_empty()).then(|| dir.join("update_cache.json"))
+}
+
+fn load_cached_release(path: &Path, expected_repo: &str) -> Option<CachedRelease> {
+    let raw = fs::read_to_string(path).ok()?;
+    let cached: CachedRelease = serde_json::from_str(&raw).ok()?;
+    (cached.repo == expected_repo).then_some(cached)
+}
+
+fn save_cached_release(path: &Path, cached: &CachedRelease) {
+    if let Some(dir) = path.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    if let Ok(json) = serde_json::to_string(cached) {
+        let tmp = sibling_path(path, &format!(".{}.tmp", std::process::id()));
+        if fs::write(&tmp, json).is_ok() {
+            if fs::rename(&tmp, path).is_err() {
+                let _ = fs::remove_file(&tmp);
+            }
+        }
+    }
+}
+
+fn fetch_latest_with_cache<F>(
+    repo: &str,
+    cache_path: Option<&Path>,
+    mut fetch: F,
+) -> Result<ReleaseInfo, String>
+where
+    F: FnMut(Option<&str>) -> Result<ConditionalFetch, String>,
+{
+    let cached = cache_path.and_then(|p| load_cached_release(p, repo));
+    let etag_arg = cached.as_ref().and_then(|c| c.etag.as_deref());
+    let outcome = match (fetch(etag_arg)?, cached) {
+        (ConditionalFetch::NotModified, Some(hit)) => return Ok(hit.release),
+        (ConditionalFetch::NotModified, None) => fetch(None)?,
+        (other, _) => other,
+    };
+    let ConditionalFetch::Body { bytes, etag } = outcome else {
+        return Err("unexpected HTTP 304 without cached release".to_string());
+    };
+    let rel: ReleaseInfo = serde_json::from_slice(&bytes)
+        .map_err(|e| format!("failed to deserialize release JSON: {}", e))?;
+    if let Some(path) = cache_path {
+        save_cached_release(
+            path,
+            &CachedRelease {
+                repo: repo.to_string(),
+                etag,
+                release: rel.clone(),
+            },
+        );
+    }
+    Ok(rel)
+}
+
+/// Synchronously fetches the latest release from the GitHub API over HTTPS, using ETag cache.
 pub fn fetch_latest_release() -> Result<ReleaseInfo, String> {
     let url = format!("https://{}{}", API_HOST, api_path());
-    let body_bytes = fetch_bytes(&url, "application/vnd.github.v3+json", API_IO_TIMEOUT, MAX_API_BODY)?;
-    serde_json::from_slice(&body_bytes)
-        .map_err(|e| format!("failed to deserialize release JSON: {}", e))
+    let cache = default_cache_path();
+    fetch_latest_with_cache(update_repo(), cache.as_deref(), |etag| {
+        fetch_conditional(&url, "application/vnd.github.v3+json", etag, API_IO_TIMEOUT, MAX_API_BODY)
+    })
 }
 
 fn underscore_patch_ver(ver: &str) -> String {
@@ -657,8 +827,25 @@ fn sibling_path(exe: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(s)
 }
 
-fn can_self_replace(exe: &Path) -> bool {
-    let Some(dir) = exe.parent() else { return false };
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplaceAccess {
+    Writable,
+    NeedsElevation,
+    Blocked(String),
+}
+
+fn classify_write_error(err: &io::Error, can_elevate: bool) -> ReplaceAccess {
+    if can_elevate && err.kind() == io::ErrorKind::PermissionDenied {
+        ReplaceAccess::NeedsElevation
+    } else {
+        ReplaceAccess::Blocked(format!("нет прав на запись в папку программы: {err}"))
+    }
+}
+
+pub fn check_replace_access(exe: &Path) -> ReplaceAccess {
+    let Some(dir) = exe.parent() else {
+        return ReplaceAccess::Blocked("не определена папка программы".to_string());
+    };
     let probe = dir.join(format!(".ag_update_probe_{}", std::process::id()));
     match fs::OpenOptions::new()
         .write(true)
@@ -667,9 +854,12 @@ fn can_self_replace(exe: &Path) -> bool {
     {
         Ok(_) => {
             let _ = fs::remove_file(&probe);
-            true
+            ReplaceAccess::Writable
         }
-        Err(_) => false,
+        Err(e) => classify_write_error(
+            &e,
+            cfg!(target_os = "windows") && !crate::utils::is_admin(),
+        ),
     }
 }
 
@@ -699,16 +889,26 @@ fn has_valid_executable_magic(path: &Path) -> bool {
     }
 }
 
-fn replace_executable(current_exe: &Path, staged_bin: &Path) -> Result<(), String> {
+fn update_io_err(context: &str, err: &io::Error) -> UpdateFailure {
+    let needs_elevation = cfg!(target_os = "windows")
+        && !crate::utils::is_admin()
+        && err.kind() == io::ErrorKind::PermissionDenied;
+    UpdateFailure {
+        reason: format!("{context}: {err}"),
+        needs_elevation,
+    }
+}
+
+fn replace_executable(current_exe: &Path, staged_bin: &Path) -> Result<(), UpdateFailure> {
     #[cfg(target_os = "windows")]
     {
         let old_exe = sibling_path(current_exe, ".old");
         let _ = fs::remove_file(&old_exe);
         fs::rename(current_exe, &old_exe)
-            .map_err(|e| format!("не переименовать текущий файл: {e}"))?;
+            .map_err(|e| update_io_err("не переименовать текущий файл", &e))?;
         if let Err(e) = fs::rename(staged_bin, current_exe) {
             let _ = fs::rename(&old_exe, current_exe);
-            return Err(format!("не записать обновление: {e}"));
+            return Err(update_io_err("не записать обновление", &e));
         }
         Ok(())
     }
@@ -716,11 +916,11 @@ fn replace_executable(current_exe: &Path, staged_bin: &Path) -> Result<(), Strin
     {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(staged_bin, fs::Permissions::from_mode(0o755))
-            .map_err(|e| format!("chmod: {e}"))?;
+            .map_err(|e| update_io_err("chmod", &e))?;
         #[cfg(target_os = "macos")]
         crate::macos::strip_quarantine(staged_bin);
         fs::rename(staged_bin, current_exe)
-            .map_err(|e| format!("не заменить исполняемый файл: {e}"))?;
+            .map_err(|e| update_io_err("не заменить исполняемый файл", &e))?;
         Ok(())
     }
 }
@@ -794,6 +994,7 @@ fn download_to_file(
     http_get_stream(
         url,
         "application/octet-stream",
+        None,
         DOWNLOAD_IO_TIMEOUT,
         MAX_DOWNLOAD_BYTES,
         &mut |ev| match ev {
@@ -831,13 +1032,21 @@ fn download_to_file(
 pub fn perform_silent_update(
     rel: &ReleaseInfo,
     on_progress: impl FnMut(u64, Option<u64>),
-) -> Result<PathBuf, String> {
-    let exe = std::env::current_exe().map_err(|e| format!("не найден путь к программе: {e}"))?;
-    if !can_self_replace(&exe) {
-        return Err("нет прав на запись в папку программы".to_string());
+) -> Result<PathBuf, UpdateFailure> {
+    let exe = std::env::current_exe()
+        .map_err(|e| UpdateFailure::from(format!("не найден путь к программе: {e}")))?;
+    match check_replace_access(&exe) {
+        ReplaceAccess::Writable => {}
+        ReplaceAccess::NeedsElevation => {
+            return Err(UpdateFailure {
+                reason: "нужны права администратора для замены файла в папке программы".to_string(),
+                needs_elevation: true,
+            });
+        }
+        ReplaceAccess::Blocked(reason) => return Err(UpdateFailure::from(reason)),
     }
     let asset = select_asset(rel, std::env::consts::OS, std::env::consts::ARCH)
-        .ok_or_else(|| "в релизе нет сборки для этой платформы".to_string())?;
+        .ok_or_else(|| UpdateFailure::from("в релизе нет сборки для этой платформы".to_string()))?;
 
     let expected_sha = if let Some(sum_asset) = find_checksum_asset(rel, &asset.name) {
         let raw = fetch_bytes(
@@ -849,7 +1058,7 @@ pub fn perform_silent_update(
         let text = String::from_utf8_lossy(&raw);
         Some(
             parse_sha256_for_asset(&text, &asset.name)
-                .ok_or_else(|| "в SHA256SUMS не найден хеш сборки".to_string())?,
+                .ok_or_else(|| UpdateFailure::from("в SHA256SUMS не найден хеш сборки".to_string()))?,
         )
     } else {
         None
@@ -874,12 +1083,15 @@ pub fn perform_silent_update(
         Ok(n) => n,
         Err(e) => {
             let _ = fs::remove_file(&download_target);
-            return Err(e);
+            return Err(UpdateFailure::from(e));
         }
     };
     if asset.size > 0 && got != asset.size {
         let _ = fs::remove_file(&download_target);
-        return Err(format!("неполный файл ({got} из {} байт)", asset.size));
+        return Err(UpdateFailure::from(format!(
+            "неполный файл ({got} из {} байт)",
+            asset.size
+        )));
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -889,17 +1101,17 @@ pub fn perform_silent_update(
         let _ = fs::remove_file(&download_target);
         if let Err(e) = extracted {
             let _ = fs::remove_file(&part);
-            return Err(e);
+            return Err(UpdateFailure::from(e));
         }
     }
 
     if !has_valid_executable_magic(&part) {
         let _ = fs::remove_file(&part);
-        return Err("скачанный файл не является исполняемым".to_string());
+        return Err(UpdateFailure::from("скачанный файл не является исполняемым".to_string()));
     }
-    if let Err(e) = replace_executable(&exe, &part) {
+    if let Err(err) = replace_executable(&exe, &part) {
         let _ = fs::remove_file(&part);
-        return Err(e);
+        return Err(err);
     }
     Ok(exe)
 }
@@ -948,10 +1160,19 @@ pub fn cleanup_old_binaries() {
     }
 }
 
-pub fn relaunch_updated(exe: &Path, old_version: &str) -> Result<(), String> {
-    let mut args: Vec<std::ffi::OsString> = Vec::new();
+pub fn has_install_update_arg() -> bool {
+    std::env::args_os()
+        .skip(1)
+        .any(|a| a.to_string_lossy() == INSTALL_UPDATE_FLAG)
+}
+
+fn filter_relaunch_args(
+    args: impl IntoIterator<Item = std::ffi::OsString>,
+    old_version: &str,
+) -> Vec<std::ffi::OsString> {
+    let mut out: Vec<std::ffi::OsString> = Vec::new();
     let mut skip_next = false;
-    for arg in std::env::args_os().skip(1) {
+    for arg in args {
         if skip_next {
             skip_next = false;
             continue;
@@ -961,13 +1182,18 @@ pub fn relaunch_updated(exe: &Path, old_version: &str) -> Result<(), String> {
             skip_next = true;
             continue;
         }
-        if s.starts_with(&format!("{UPDATED_FROM_FLAG}=")) {
+        if s.starts_with(&format!("{UPDATED_FROM_FLAG}=")) || s == INSTALL_UPDATE_FLAG {
             continue;
         }
-        args.push(arg);
+        out.push(arg);
     }
-    args.push(UPDATED_FROM_FLAG.into());
-    args.push(old_version.into());
+    out.push(UPDATED_FROM_FLAG.into());
+    out.push(old_version.into());
+    out
+}
+
+pub fn relaunch_updated(exe: &Path, old_version: &str) -> Result<(), String> {
+    let args = filter_relaunch_args(std::env::args_os().skip(1), old_version);
     Command::new(exe)
         .args(&args)
         .spawn()
@@ -979,74 +1205,143 @@ fn should_auto_update() -> bool {
     if updated_from_arg().is_some() {
         return false;
     }
+    if has_install_update_arg() {
+        return true;
+    }
     if cfg!(debug_assertions) && std::env::var_os("AG_FORCE_AUTO_UPDATE").is_none() {
         return false;
     }
     crate::settings::Settings::load().auto_update
 }
 
-pub fn spawn_watch(tx: std::sync::mpsc::Sender<UpdateEvent>, wake: Box<dyn Fn() + Send>) {
-    std::thread::Builder::new()
-        .name("update-watch".to_string())
-        .spawn(move || loop {
-            match fetch_latest_release() {
-                Ok(rel) => {
-                    if rel.is_newer_than_current() {
-                        let ver = rel.display_version().to_string();
-                        if should_auto_update() {
-                            if tx
-                                .send(UpdateEvent::Downloading {
-                                    version: ver.clone(),
-                                    downloaded: 0,
-                                    total: None,
-                                })
-                                .is_err()
-                            {
-                                return;
-                            }
-                            wake();
-                            let tx_prog = tx.clone();
-                            let ver_prog = ver.clone();
-                            match perform_silent_update(&rel, |downloaded, total| {
-                                let _ = tx_prog.send(UpdateEvent::Downloading {
-                                    version: ver_prog.clone(),
-                                    downloaded,
-                                    total,
-                                });
-                                wake();
-                            }) {
-                                Ok(exe) => {
-                                    let _ = tx.send(UpdateEvent::ReadyToRestart {
-                                        version: ver,
-                                        exe,
-                                    });
-                                    wake();
-                                    return;
-                                }
-                                Err(reason) => {
-                                    if tx.send(UpdateEvent::Failed { release: rel, reason }).is_err()
-                                    {
-                                        return;
-                                    }
-                                    wake();
-                                }
-                            }
-                        } else {
-                            if tx.send(UpdateEvent::Available(rel)).is_err() {
-                                return;
-                            }
-                            wake();
-                        }
-                    }
+fn send_event(tx: &std::sync::mpsc::Sender<UpdateEvent>, wake: &dyn Fn(), ev: UpdateEvent) -> bool {
+    if tx.send(ev).is_err() {
+        return false;
+    }
+    wake();
+    true
+}
+
+fn install_release(
+    rel: ReleaseInfo,
+    tx: &std::sync::mpsc::Sender<UpdateEvent>,
+    wake: &dyn Fn(),
+) -> bool {
+    let ver = rel.display_version().to_string();
+    if !send_event(
+        tx,
+        wake,
+        UpdateEvent::Downloading {
+            version: ver.clone(),
+            downloaded: 0,
+            total: None,
+        },
+    ) {
+        return true;
+    }
+    let tx_prog = tx.clone();
+    let ver_prog = ver.clone();
+    match perform_silent_update(&rel, |downloaded, total| {
+        let _ = tx_prog.send(UpdateEvent::Downloading {
+            version: ver_prog.clone(),
+            downloaded,
+            total,
+        });
+        wake();
+    }) {
+        Ok(exe) => {
+            let _ = send_event(tx, wake, UpdateEvent::ReadyToRestart { version: ver, exe });
+            true
+        }
+        Err(err) => !send_event(
+            tx,
+            wake,
+            UpdateEvent::Failed {
+                release: rel,
+                reason: err.reason,
+                needs_elevation: err.needs_elevation,
+            },
+        ),
+    }
+}
+
+fn check_once(
+    manual: bool,
+    tx: &std::sync::mpsc::Sender<UpdateEvent>,
+    wake: &dyn Fn(),
+) -> bool {
+    if manual && !send_event(tx, wake, UpdateEvent::Checking) {
+        return true;
+    }
+    match fetch_latest_release() {
+        Ok(rel) => {
+            if rel.is_newer_than_current() {
+                if should_auto_update() {
+                    return install_release(rel, tx, wake);
                 }
-                Err(_e) => {
-                    #[cfg(debug_assertions)]
-                    eprintln!("update check failed: {}", _e);
+                if !send_event(tx, wake, UpdateEvent::Available(rel)) {
+                    return true;
+                }
+            } else if manual {
+                let latest = rel.display_version().to_string();
+                if !send_event(
+                    tx,
+                    wake,
+                    UpdateEvent::UpToDate {
+                        version: current_version().to_string(),
+                        latest,
+                    },
+                ) {
+                    return true;
                 }
             }
-            std::thread::sleep(CHECK_INTERVAL);
+        }
+        Err(e) => {
+            if manual {
+                if !send_event(tx, wake, UpdateEvent::CheckFailed(e)) {
+                    return true;
+                }
+            } else {
+                #[cfg(debug_assertions)]
+                eprintln!("update check failed: {}", e);
+            }
+        }
+    }
+    false
+}
+
+pub fn spawn_watch(tx: std::sync::mpsc::Sender<UpdateEvent>, wake: Box<dyn Fn() + Send>) -> UpdateHandle {
+    let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("update-watch".to_string())
+        .spawn(move || {
+            if check_once(false, &tx, &*wake) {
+                return;
+            }
+            loop {
+                let first = match cmd_rx.recv_timeout(CHECK_INTERVAL) {
+                    Ok(cmd) => Some(cmd),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                };
+                let mut cmd = first;
+                while let Ok(next) = cmd_rx.try_recv() {
+                    if matches!(next, UpdateCmd::Install(_)) || cmd.is_none() {
+                        cmd = Some(next);
+                    }
+                }
+                let stop = match cmd {
+                    Some(UpdateCmd::Install(rel)) => install_release(rel, &tx, &*wake),
+                    Some(UpdateCmd::CheckNow) => check_once(true, &tx, &*wake),
+                    None => check_once(false, &tx, &*wake),
+                };
+                if stop {
+                    return;
+                }
+            }
         })
         .ok();
+    UpdateHandle { tx: cmd_tx }
 }
 
 #[cfg(test)]
@@ -1191,5 +1486,73 @@ mod tests {
         let rel = fetch_latest_release().expect("live fetch succeeded");
         assert!(!rel.tag_name.is_empty());
         assert!(rel.html_url.contains("github.com"));
+    }
+
+    #[test]
+    fn test_etag_cache_uses_304_and_invalidates_on_repo_change() {
+        let dir = std::env::temp_dir().join("ag_update_etag_test");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let cache = dir.join("update_cache.json");
+
+        let body_json = br#"{
+            "tag_name": "v2.36.0",
+            "html_url": "https://github.com/soroka-ilya/Antigravity/releases/tag/v2.36.0",
+            "draft": false,
+            "prerelease": false,
+            "assets": []
+        }"#;
+        let mut seen_etag: Option<String> = None;
+        let rel = fetch_latest_with_cache("soroka-ilya/Antigravity", Some(&cache), |inm| {
+            seen_etag = inm.map(|s| s.to_string());
+            Ok(ConditionalFetch::Body {
+                bytes: body_json.to_vec(),
+                etag: Some("\"etag-1\"".to_string()),
+            })
+        })
+        .unwrap();
+        assert!(seen_etag.is_none());
+        assert_eq!(rel.tag_name, "v2.36.0");
+
+        let rel_cached = fetch_latest_with_cache("soroka-ilya/Antigravity", Some(&cache), |inm| {
+            seen_etag = inm.map(|s| s.to_string());
+            Ok(ConditionalFetch::NotModified)
+        })
+        .unwrap();
+        assert_eq!(seen_etag.as_deref(), Some("\"etag-1\""));
+        assert_eq!(rel_cached.tag_name, "v2.36.0");
+
+        let _ = fetch_latest_with_cache("other/Antigravity", Some(&cache), |inm| {
+            seen_etag = inm.map(|s| s.to_string());
+            Ok(ConditionalFetch::Body {
+                bytes: body_json.to_vec(),
+                etag: Some("\"etag-2\"".to_string()),
+            })
+        })
+        .unwrap();
+        assert!(seen_etag.is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_elevation_classification_and_arg_filtering() {
+        assert_eq!(sanitize_etag(" \"abc\" ").as_deref(), Some("\"abc\""));
+        assert!(sanitize_etag("bad\r\nX: 1").is_none());
+
+        let denied = io::Error::new(io::ErrorKind::PermissionDenied, "denied");
+        assert_eq!(classify_write_error(&denied, true), ReplaceAccess::NeedsElevation);
+        assert!(matches!(classify_write_error(&denied, false), ReplaceAccess::Blocked(_)));
+
+        let filtered = filter_relaunch_args(
+            [
+                std::ffi::OsString::from("--tui"),
+                std::ffi::OsString::from("--install-update"),
+                std::ffi::OsString::from("--updated-from"),
+                std::ffi::OsString::from("2.34.0"),
+            ],
+            "2.35.0",
+        );
+        let strs: Vec<String> = filtered.iter().map(|s| s.to_string_lossy().into_owned()).collect();
+        assert_eq!(strs, vec!["--tui", "--updated-from", "2.35.0"]);
     }
 }

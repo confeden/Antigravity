@@ -39,6 +39,13 @@ enum Screen {
     Deactivated,
 }
 
+pub(super) enum UpdateCheckState {
+    Idle,
+    Checking,
+    UpToDate(String),
+    Failed(String),
+}
+
 enum UpdateBanner {
     Available(ReleaseInfo),
     Downloading {
@@ -53,6 +60,7 @@ enum UpdateBanner {
     Failed {
         release: ReleaseInfo,
         reason: String,
+        needs_elevation: bool,
     },
 }
 
@@ -73,6 +81,8 @@ pub struct App {
     /// Raised once a newer release is on GitHub and never lowered — the banner
     /// has to survive the move from the licence screen to the main one.
     update: Option<UpdateBanner>,
+    pub(super) update_check: UpdateCheckState,
+    pub(super) update_handle: update::UpdateHandle,
     update_rx: Receiver<UpdateEvent>,
 
     worker: Worker,
@@ -125,6 +135,12 @@ pub struct App {
     theme: crate::settings::ThemeMode,
 }
 
+impl UpdateBanner {
+    pub(super) fn is_busy(&self) -> bool {
+        matches!(self, Self::Downloading { .. } | Self::PendingRestart { .. })
+    }
+}
+
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         theme::apply(&cc.egui_ctx);
@@ -134,7 +150,8 @@ impl App {
 
         let (up_tx, update_rx) = channel();
         let up_ctx = cc.egui_ctx.clone();
-        update::spawn_watch(up_tx, Box::new(move || up_ctx.request_repaint()));
+        let update_handle =
+            update::spawn_watch(up_tx, Box::new(move || up_ctx.request_repaint()));
 
         // The worker wakes the UI itself: egui sleeps until something asks it to
         // repaint, so an event that only lands in a channel is an event the user
@@ -171,6 +188,8 @@ impl App {
             key_attempts: Vec::new(),
             key_cooldown: std::time::Duration::from_millis(100),
             update: None,
+            update_check: UpdateCheckState::Idle,
+            update_handle,
             update_rx,
             worker,
             events,
@@ -207,16 +226,36 @@ impl App {
     fn update_banner(&self, ui: &mut egui::Ui) {
         let Some(state) = &self.update else { return };
         let colors = theme::palette(ui);
+        let release_url = |rel: &ReleaseInfo| {
+            if rel.html_url.trim().is_empty() {
+                update::releases_latest_url()
+            } else {
+                rel.html_url.clone()
+            }
+        };
         match state {
             UpdateBanner::Available(rel) => {
-                let label = format!("⬆  Доступна новая версия — {}", rel.display_version());
-                let btn = egui::Button::new(egui::RichText::new(label).color(colors.on_accent))
-                    .fill(colors.accent)
-                    .corner_radius(egui::CornerRadius::same(theme::RADIUS_SMALL))
-                    .min_size(egui::vec2(ui.available_width(), 32.0));
-                if ui.add(btn).clicked() {
-                    crate::utils::open_url(&update::releases_latest_url());
-                }
+                let label = format!("⬆  Доступна новая версия {} — скачать и обновить", rel.display_version());
+                let gh_w = 82.0;
+                let main_w = (ui.available_width() - gh_w - ui.spacing().item_spacing.x).max(160.0);
+                ui.horizontal(|ui| {
+                    let btn = egui::Button::new(egui::RichText::new(label).color(colors.on_accent))
+                        .fill(colors.accent)
+                        .corner_radius(egui::CornerRadius::same(theme::RADIUS_SMALL))
+                        .min_size(egui::vec2(main_w, 32.0));
+                    let resp = ui.add(btn);
+                    if let Some(body) = rel.body.as_deref().map(str::trim).filter(|b| !b.is_empty()) {
+                        if resp.clone().on_hover_text(body).clicked() {
+                            self.update_handle.install_now(rel.clone());
+                        }
+                    } else if resp.clicked() {
+                        self.update_handle.install_now(rel.clone());
+                    }
+                    let gh = egui::Button::new("GitHub").min_size(egui::vec2(gh_w, 32.0));
+                    if ui.add(gh).clicked() {
+                        crate::utils::open_url(&release_url(rel));
+                    }
+                });
             }
             UpdateBanner::Downloading {
                 version,
@@ -245,21 +284,59 @@ impl App {
                 );
                 ui.label(egui::RichText::new(text).color(colors.ok).size(13.0));
             }
-            UpdateBanner::Failed { release, reason } => {
-                let label = format!(
-                    "⬆  Обновление {} не поставилось само — открыть GitHub",
-                    release.display_version()
-                );
-                let btn = egui::Button::new(egui::RichText::new(label).color(colors.on_accent))
-                    .fill(colors.warn)
-                    .corner_radius(egui::CornerRadius::same(theme::RADIUS_SMALL))
-                    .min_size(egui::vec2(ui.available_width(), 32.0));
-                if ui.add(btn).on_hover_text(reason).clicked() {
-                    crate::utils::open_url(&update::releases_latest_url());
-                }
+            UpdateBanner::Failed {
+                release,
+                reason,
+                needs_elevation,
+            } => {
+                let label = if *needs_elevation {
+                    format!(
+                        "🛡  Обновление {} требует прав администратора — перезапустить",
+                        release.display_version()
+                    )
+                } else {
+                    format!(
+                        "⬆  Обновление {} не поставилось само — открыть GitHub",
+                        release.display_version()
+                    )
+                };
+                let gh_w = if *needs_elevation { 82.0 } else { 0.0 };
+                let main_w = if *needs_elevation {
+                    (ui.available_width() - gh_w - ui.spacing().item_spacing.x).max(160.0)
+                } else {
+                    ui.available_width()
+                };
+                ui.horizontal(|ui| {
+                    let btn = egui::Button::new(egui::RichText::new(label).color(colors.on_accent))
+                        .fill(colors.warn)
+                        .corner_radius(egui::CornerRadius::same(theme::RADIUS_SMALL))
+                        .min_size(egui::vec2(main_w, 32.0));
+                    if ui.add(btn).on_hover_text(reason).clicked() {
+                        if *needs_elevation {
+                            self.request_update_elevation();
+                        } else {
+                            crate::utils::open_url(&release_url(release));
+                        }
+                    }
+                    if *needs_elevation {
+                        let gh = egui::Button::new("GitHub").min_size(egui::vec2(gh_w, 32.0));
+                        if ui.add(gh).clicked() {
+                            crate::utils::open_url(&release_url(release));
+                        }
+                    }
+                });
             }
         }
         ui.add_space(10.0);
+    }
+
+    fn request_update_elevation(&self) {
+        #[cfg(target_os = "windows")]
+        {
+            if crate::utils::relaunch_elevated_with(update::INSTALL_UPDATE_FLAG) {
+                std::process::exit(0);
+            }
+        }
     }
 
     /// Re-launches this exe elevated and closes the current window.
@@ -279,24 +356,53 @@ impl App {
 
     fn drain_events(&mut self) {
         while let Ok(ev) = self.update_rx.try_recv() {
-            self.update = Some(match ev {
-                UpdateEvent::Available(rel) => UpdateBanner::Available(rel),
+            match ev {
+                UpdateEvent::Checking => {
+                    self.update_check = UpdateCheckState::Checking;
+                }
+                UpdateEvent::UpToDate { version, latest } => {
+                    self.update_check =
+                        UpdateCheckState::UpToDate(update::up_to_date_label(&version, &latest));
+                    if matches!(self.update, Some(UpdateBanner::Available(_))) {
+                        self.update = None;
+                    }
+                }
+                UpdateEvent::CheckFailed(reason) => {
+                    self.update_check = UpdateCheckState::Failed(reason);
+                }
+                UpdateEvent::Available(rel) => {
+                    self.update_check = UpdateCheckState::Idle;
+                    self.update = Some(UpdateBanner::Available(rel));
+                }
                 UpdateEvent::Downloading {
                     version,
                     downloaded,
                     total,
-                } => UpdateBanner::Downloading {
-                    version,
-                    downloaded,
-                    total,
-                },
+                } => {
+                    self.update_check = UpdateCheckState::Idle;
+                    self.update = Some(UpdateBanner::Downloading {
+                        version,
+                        downloaded,
+                        total,
+                    });
+                }
                 UpdateEvent::ReadyToRestart { version, exe } => {
-                    UpdateBanner::PendingRestart { version, exe }
+                    self.update_check = UpdateCheckState::Idle;
+                    self.update = Some(UpdateBanner::PendingRestart { version, exe });
                 }
-                UpdateEvent::Failed { release, reason } => {
-                    UpdateBanner::Failed { release, reason }
+                UpdateEvent::Failed {
+                    release,
+                    reason,
+                    needs_elevation,
+                } => {
+                    self.update_check = UpdateCheckState::Idle;
+                    self.update = Some(UpdateBanner::Failed {
+                        release,
+                        reason,
+                        needs_elevation,
+                    });
                 }
-            });
+            }
         }
         while let Ok(signal) = self.gate_rx.try_recv() {
             match signal {
@@ -364,7 +470,11 @@ impl App {
                     draft: false,
                     assets: Vec::new(),
                 };
-                self.update = Some(UpdateBanner::Failed { release, reason });
+                self.update = Some(UpdateBanner::Failed {
+                    release,
+                    reason,
+                    needs_elevation: false,
+                });
             }
         }
     }
