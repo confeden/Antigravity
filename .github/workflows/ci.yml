@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        shell: bash
+        run: |
+          rustup set profile minimal
+          rustup default stable
+          rustc -V
+          cargo -V
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check and test
+        shell: bash
+        env:
+          AG_UPDATE_REPO: ${{ github.repository }}
+        run: |
+          cargo check --all-targets --locked
+          cargo test --locked
