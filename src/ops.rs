@@ -71,13 +71,34 @@ impl Cap {
 
     pub fn title(self) -> &'static str {
         match self {
-            Cap::ClientPatch => "Разблокировать вход в аккаунт",
-            Cap::Watchdog => "Автопатч Antigravity",
-            Cap::Dns => "Обход через DNS",
-            Cap::LocalProxy => "Локальный прокси",
-            Cap::OwnProxy => "Свой HTTP-прокси",
-            Cap::GroupProxy => "Прокси из группы",
-            Cap::DnsRotation => "Ротация DNS-серверов",
+            Cap::ClientPatch => crate::i18n::tr(
+                "Разблокировать вход в аккаунт",
+                "Unlock account sign-in",
+            ),
+            Cap::Watchdog => crate::i18n::tr(
+                "Автопатч Antigravity",
+                "Antigravity auto-patch",
+            ),
+            Cap::Dns => crate::i18n::tr(
+                "Обход через DNS",
+                "DNS bypass",
+            ),
+            Cap::LocalProxy => crate::i18n::tr(
+                "Локальный прокси",
+                "Local proxy",
+            ),
+            Cap::OwnProxy => crate::i18n::tr(
+                "Свой HTTP-прокси",
+                "Own HTTP proxy",
+            ),
+            Cap::GroupProxy => crate::i18n::tr(
+                "Прокси из группы",
+                "Group proxy",
+            ),
+            Cap::DnsRotation => crate::i18n::tr(
+                "Ротация DNS-серверов",
+                "DNS server rotation",
+            ),
         }
     }
 }
@@ -297,6 +318,8 @@ pub enum Cmd {
     RememberLicense(String),
     /// Persist the user's UI theme preference.
     SetTheme(crate::settings::ThemeMode),
+    /// Persist the user's UI language preference.
+    SetLang(crate::i18n::Lang),
     /// Ask the system again where the client's traffic leaves.
     ///
     /// Its own command because it is the one measurement that goes stale on its
@@ -492,6 +515,14 @@ fn run_worker(
                     ctx.settings.save();
                 }
             }
+            Cmd::SetLang(lang) => {
+                crate::i18n::set_current(lang);
+                if ctx.settings.lang != lang {
+                    ctx.settings.lang = lang;
+                    ctx.settings.save();
+                }
+                push_status(&mut ctx, Scan::System);
+            }
             Cmd::Unlocked => {
                 // The first snapshot was taken while the licence screen was up;
                 // a fresh one either way, deep when auto-patch just wrote.
@@ -551,7 +582,10 @@ fn run_worker(
                 push_status(&mut ctx, Scan::Settings);
             }
             Cmd::DeepRefresh => {
-                ctx.busy(Some("Проверка установок"));
+                ctx.busy(Some(crate::i18n::tr(
+                    "Проверка установок",
+                    "Checking installations",
+                )));
                 push_status(&mut ctx, Scan::Deep);
                 ctx.busy(None);
             }
@@ -580,7 +614,10 @@ fn run_worker(
                 {
                     let _ = crate::launch_guard::uninstall();
                 }
-                ctx.busy(Some("Проверка установок"));
+                ctx.busy(Some(crate::i18n::tr(
+                    "Проверка установок",
+                    "Checking installations",
+                )));
                 push_status(&mut ctx, Scan::Deep);
                 // The path the user just pointed at is an install found at last.
                 if auto_patch_found(&mut ctx) {
@@ -589,10 +626,16 @@ fn run_worker(
                 ctx.busy(None);
             }
             Cmd::PatchInstall(p) => {
-                ctx.busy(Some("Патч"));
+                ctx.busy(Some(crate::i18n::tr("Патч", "Patching")));
                 let label = crate::install_label(&p);
                 if !patch_found(&mut ctx, vec![(label, p)]) {
-                    ctx.log(Level::Warn, format!("{}: патч не записан, см. выше", label));
+                    ctx.log(
+                        Level::Warn,
+                        match crate::i18n::current() {
+                            crate::i18n::Lang::Ru => format!("{label}: патч не записан, см. выше"),
+                            crate::i18n::Lang::En => format!("{label}: patch not written, see above"),
+                        },
+                    );
                 }
                 push_status(&mut ctx, Scan::Deep);
                 ctx.busy(None);
@@ -603,7 +646,10 @@ fn run_worker(
                 push_status(&mut ctx, Scan::System);
             }
             Cmd::SetOwnProxy { text, enable } => {
-                ctx.busy(Some("Проверка прокси"));
+                ctx.busy(Some(crate::i18n::tr(
+                    "Проверка прокси",
+                    "Checking proxy",
+                )));
                 let enable = enable
                     || ctx.settings.own_proxy_enabled
                     || ctx.last.as_ref().is_some_and(|status| status.own_proxy.is_on());
@@ -618,7 +664,10 @@ fn run_worker(
                 push_status(&mut ctx, Scan::Settings);
             }
             Cmd::SetGroupKey { text, enable } => {
-                ctx.busy(Some("Проверка ключа"));
+                ctx.busy(Some(crate::i18n::tr(
+                    "Проверка ключа",
+                    "Checking key",
+                )));
                 let result = set_group_key(&mut ctx, &text, enable);
                 if result.is_ok() {
                     push_status(&mut ctx, scan_after(Cap::GroupProxy));
@@ -627,16 +676,25 @@ fn run_worker(
                 ctx.busy(None);
             }
             Cmd::EnableAll => {
-                ctx.busy(Some("Включаю"));
+                ctx.busy(Some(crate::i18n::tr("Включаю", "Enabling")));
                 enable_all(&mut ctx);
                 ctx.settings.save();
                 push_status(&mut ctx, Scan::Deep);
                 ctx.busy(None);
             }
             Cmd::Deactivate => {
-                ctx.busy(Some("Полная деактивация"));
+                ctx.busy(Some(crate::i18n::tr(
+                    "Полная деактивация",
+                    "Full deactivation",
+                )));
                 if cfg!(windows) && !is_admin() {
-                    ctx.log(Level::Err, "Для полной деактивации запустите анлокер от администратора.");
+                    ctx.log(
+                        Level::Err,
+                        crate::i18n::tr(
+                            "Для полной деактивации запустите анлокер от администратора.",
+                            "Run the unlocker as administrator for full deactivation.",
+                        ),
+                    );
                     ctx.busy(None);
                     continue;
                 }
@@ -648,7 +706,13 @@ fn run_worker(
                 ctx.settings.group_proxy = false;
                 ctx.settings.own_proxy_enabled = false;
                 if !ctx.settings.save() {
-                    ctx.log(Level::Err, "Не удалось сохранить отключение автопатча; откат не начат.");
+                    ctx.log(
+                        Level::Err,
+                        crate::i18n::tr(
+                            "Не удалось сохранить отключение автопатча; откат не начат.",
+                            "Failed to save auto-patch disable; rollback not started.",
+                        ),
+                    );
                     ctx.busy(None);
                     continue;
                 }
@@ -661,12 +725,21 @@ fn run_worker(
                 for error in errors {
                     ctx.log(Level::Err, error);
                 }
-                ctx.log(Level::Warn, "Деактивация не завершена. Устраните ошибки и повторите.");
+                ctx.log(
+                    Level::Warn,
+                    crate::i18n::tr(
+                        "Деактивация не завершена. Устраните ошибки и повторите.",
+                        "Deactivation incomplete. Fix the errors and retry.",
+                    ),
+                );
                 push_status(&mut ctx, Scan::Deep);
                 ctx.busy(None);
             }
             Cmd::Repair => {
-                ctx.busy(Some("Чиню службу обхода"));
+                ctx.busy(Some(crate::i18n::tr(
+                    "Чиню службу обхода",
+                    "Repairing bypass service",
+                )));
                 repair(&mut ctx);
                 ctx.settings.save();
                 push_status(&mut ctx, Scan::System);
@@ -678,36 +751,43 @@ fn run_worker(
                 ctx.log(
                     Level::Info,
                     match first_enabled_provider(&ctx.settings) {
-                        Some(n) => format!("Порядок DNS изменён, первый — {}", n),
-                        None => "Порядок DNS изменён.".to_string(),
+                        Some(n) => match crate::i18n::current() {
+                            crate::i18n::Lang::Ru => format!("Порядок DNS изменён, первый — {n}"),
+                            crate::i18n::Lang::En => format!("DNS order updated, first — {n}"),
+                        },
+                        None => crate::i18n::tr(
+                            "Порядок DNS изменён.",
+                            "DNS order updated.",
+                        )
+                        .to_string(),
                     },
                 );
-                // The order is ours alone — nothing on the machine changed, so
-                // there is nothing on the machine to re-read.
                 push_status(&mut ctx, Scan::Settings);
             }
             Cmd::SetProvider(name, on) => {
                 ctx.settings.set_provider_enabled(&name, on);
-                // Never let the last one go: an empty pool is a dead DNS layer
-                // that still draws as installed.
                 if all_providers_disabled(&ctx.settings) {
                     ctx.settings.set_provider_enabled(&name, true);
                     ctx.log(
                         Level::Warn,
-                        "Нельзя отключить все DNS-серверы — хотя бы один должен остаться.",
+                        crate::i18n::tr(
+                            "Нельзя отключить все DNS-серверы — хотя бы один должен остаться.",
+                            "Cannot disable all DNS servers — at least one must remain.",
+                        ),
                     );
                 } else {
                     ctx.log(
                         Level::Info,
-                        format!(
-                            "DNS-сервер {} {}",
-                            name,
-                            if on {
-                                "включён"
-                            } else {
-                                "отключён"
-                            }
-                        ),
+                        match crate::i18n::current() {
+                            crate::i18n::Lang::Ru => format!(
+                                "DNS-сервер {name} {}",
+                                if on { "включён" } else { "отключён" }
+                            ),
+                            crate::i18n::Lang::En => format!(
+                                "DNS server {name} {}",
+                                if on { "enabled" } else { "disabled" }
+                            ),
+                        },
                     );
                 }
                 ctx.settings.save();
@@ -746,9 +826,21 @@ fn startup_housekeeping(ctx: &mut Ctx) {
     }
     #[cfg(windows)]
     match crate::sidecar::reap_orphans() {
-        Ok(n) if n > 0 => ctx.log(Level::Info, format!("Закрыто осиротевших процессов Antigravity: {n}")),
+        Ok(n) if n > 0 => ctx.log(
+            Level::Info,
+            match crate::i18n::current() {
+                crate::i18n::Lang::Ru => format!("Закрыто осиротевших процессов Antigravity: {n}"),
+                crate::i18n::Lang::En => format!("Closed orphaned Antigravity processes: {n}"),
+            },
+        ),
         Ok(_) => {},
-        Err(e) => ctx.log(Level::Warn, format!("Не удалось убрать фоновые процессы: {e}")),
+        Err(e) => ctx.log(
+            Level::Warn,
+            match crate::i18n::current() {
+                crate::i18n::Lang::Ru => format!("Не удалось убрать фоновые процессы: {e}"),
+                crate::i18n::Lang::En => format!("Failed to clean up background processes: {e}"),
+            },
+        ),
     }
     let before = dns::is_nrpt_applied();
     dns::refresh_pinned_hosts();
@@ -756,8 +848,10 @@ fn startup_housekeeping(ctx: &mut Ctx) {
     if before && !dns::is_nrpt_applied() {
         ctx.log(
             Level::Warn,
-            "Antigravity идёт через активный VPN — правила DNS сняты, чтобы не перебивать \
-             ваш туннель. Выключите VPN и включите «Обход через DNS» заново.",
+            crate::i18n::tr(
+                "Antigravity идёт через активный VPN — правила DNS сняты, чтобы не перебивать ваш туннель. Выключите VPN и включите «Обход через DNS» заново.",
+                "Antigravity is going through an active VPN — DNS rules were removed to avoid overriding your tunnel. Turn off VPN and re-enable \"DNS bypass\".",
+            ),
         );
     }
 }
@@ -891,7 +985,7 @@ impl Status {
         self.own_proxy_configured = self.own_proxy.is_on() || upstream::parse(&s.own_proxy).is_ok();
         self.group_proxy_configured = s.group_proxy_configured();
         self.group_proxy = if s.group_proxy_wanted() && crate::group::key_rejected() {
-            State::Partial(crate::group::KEY_DEAD_NOTE.into())
+            State::Partial(crate::group::key_dead_note().into())
         } else {
             on_off(s.group_proxy_wanted())
         };
@@ -903,8 +997,15 @@ impl Status {
             // rotation off, so the switch says which it is rather than leaving
             // the user to count down the list.
             State::OffNote(match first_enabled_provider(s) {
-                Some(name) => format!("используется только {}", name),
-                None => "ни один сервер не включён".to_string(),
+                Some(name) => match crate::i18n::current() {
+                    crate::i18n::Lang::Ru => format!("используется только {name}"),
+                    crate::i18n::Lang::En => format!("only {name} is used"),
+                },
+                None => crate::i18n::tr(
+                    "ни один сервер не включён",
+                    "no server enabled",
+                )
+                .to_string(),
             })
         };
         self.providers = crate::resolvers::ordered_provider_names()
@@ -963,14 +1064,26 @@ fn read_status(ctx: &mut Ctx, deep: bool) -> Status {
         // Not inspected yet, or nothing found. Fall back to what the user asked
         // for rather than claiming knowledge we do not have.
         if ctx.settings.client_patch {
-            State::Partial("состояние ещё не проверено".into())
+            State::Partial(
+                crate::i18n::tr(
+                    "состояние ещё не проверено",
+                    "state not checked yet",
+                )
+                .into(),
+            )
         } else {
             State::Off
         }
     } else if patched.iter().all(|p| *p) {
         State::On
     } else if patched.iter().any(|p| *p) {
-        State::Partial("пропатчены не все установки".into())
+        State::Partial(
+            crate::i18n::tr(
+                "пропатчены не все установки",
+                "not all installations patched",
+            )
+            .into(),
+        )
     } else {
         State::Off
     };
@@ -1048,18 +1161,26 @@ fn measure_vpn() -> (VpnSeen, Option<crate::egress::ClientEgress>) {
 /// not a change worth a line: it says only that Antigravity stopped running.
 fn vpn_change_line(now: VpnSeen) -> Option<&'static str> {
     match now {
-        VpnSeen::None => Some("VPN отключён — обход снова работает сам."),
-        VpnSeen::CarryingClient => Some(
+        VpnSeen::None => Some(crate::i18n::tr(
+            "VPN отключён — обход снова работает сам.",
+            "VPN disconnected — bypass is working on its own again.",
+        )),
+        VpnSeen::CarryingClient => Some(crate::i18n::tr(
             "Antigravity пошёл через VPN — снятие ошибки 400 теперь зависит от вашего сервера.",
-        ),
-        VpnSeen::NotCarryingClient => Some("Трафик Antigravity идёт мимо VPN — обход применяется."),
-        VpnSeen::ViaLocalProxy => Some(
-            "Antigravity ходит через локальный прокси — до серверов Google \
-             соединение открывает служба обхода, а не он сам.",
-        ),
-        VpnSeen::PartlyCarryingClient => {
-            Some("Часть трафика Antigravity пошла через VPN, часть идёт мимо.")
-        }
+            "Antigravity is routed through VPN — error 400 bypass now depends on your VPN server.",
+        )),
+        VpnSeen::NotCarryingClient => Some(crate::i18n::tr(
+            "Трафик Antigravity идёт мимо VPN — обход применяется.",
+            "Antigravity traffic bypasses VPN — unlocker bypass is active.",
+        )),
+        VpnSeen::ViaLocalProxy => Some(crate::i18n::tr(
+            "Antigravity ходит через локальный прокси — до серверов Google соединение открывает служба обхода, а не он сам.",
+            "Antigravity uses the local proxy — the bypass service opens connections to Google.",
+        )),
+        VpnSeen::PartlyCarryingClient => Some(crate::i18n::tr(
+            "Часть трафика Antigravity пошла через VPN, часть идёт мимо.",
+            "Part of Antigravity traffic goes through VPN, part bypasses it.",
+        )),
         VpnSeen::Unmeasured => None,
     }
 }
@@ -1076,7 +1197,13 @@ fn read_watchdog(admin: bool) -> State {
     if background::is_watchdog_enabled() {
         State::On
     } else if !admin && cfg!(target_os = "windows") {
-        State::Blocked("нужны права администратора".into())
+        State::Blocked(
+            crate::i18n::tr(
+                "нужны права администратора",
+                "administrator rights required",
+            )
+            .into(),
+        )
     } else {
         State::Off
     }
@@ -1123,19 +1250,30 @@ fn dns_state(
     let _ = (vpn, detect_on);
     match (rules, relay) {
         (true, true) => State::On,
-        // The rules name the relay first (I5). Rules without it resolve through
-        // the fallback providers only, which works but is not what was asked
-        // for — and it is exactly what a crashed relay looks like.
-        (true, false) => State::Partial("правила стоят, служба не запущена".into()),
-        // A service that runs for the sake of a route (own proxy, group, exits)
-        // is not a half-installed DNS layer: the DNS switch is off, and drawing
-        // it as `Partial` - which reads as on - made it impossible to switch off
-        // while any route kept the service up.
+        (true, false) => State::Partial(
+            crate::i18n::tr(
+                "правила стоят, служба не запущена",
+                "rules installed, service not running",
+            )
+            .into(),
+        ),
         (false, true) if !wanted => State::Off,
-        (false, true) => State::Partial("служба работает, правил нет".into()),
+        (false, true) => State::Partial(
+            crate::i18n::tr(
+                "служба работает, правил нет",
+                "service running, no rules",
+            )
+            .into(),
+        ),
         (false, false) => {
             if !admin && cfg!(target_os = "windows") {
-                State::Blocked("нужны права администратора".into())
+                State::Blocked(
+                    crate::i18n::tr(
+                        "нужны права администратора",
+                        "administrator rights required",
+                    )
+                    .into(),
+                )
             } else {
                 State::Off
             }
@@ -1159,7 +1297,13 @@ fn read_local_proxy(settings: &Settings) -> State {
         // leaving both set silently hijacks a proxy the user configured on
         // purpose. Theirs means ours stays off - whatever the setting says.
         let _ = foreign;
-        return State::Blocked("в системе задан свой прокси".into());
+        return State::Blocked(
+            crate::i18n::tr(
+                "в системе задан свой прокси",
+                "system proxy is set",
+            )
+            .into(),
+        );
     }
     local_proxy_state(settings.local_proxy, endpoint::proxy_env_is_ours())
 }
@@ -1173,15 +1317,20 @@ fn read_local_proxy(settings: &Settings) -> State {
 fn local_proxy_state(wanted: bool, ours: bool) -> State {
     match (wanted, ours) {
         (true, true) => State::On,
-        // Asked for, not written yet: the relay writes it once its listener
-        // answers, and `repair` does the same while the window is open. An
-        // on-ish state, so `Partial` and never `OffNote` - the switch has to
-        // stay switchable (G41).
-        (true, false) => State::Partial("переменная ещё не выставлена".into()),
-        // Off, and the variable is still there: a removal that did not land.
-        // The relay takes it off within a minute now; saying so beats a switch
-        // that contradicts the service's own log.
-        (false, true) => State::OffNote("переменная ещё не снята".into()),
+        (true, false) => State::Partial(
+            crate::i18n::tr(
+                "переменная ещё не выставлена",
+                "variable not set yet",
+            )
+            .into(),
+        ),
+        (false, true) => State::OffNote(
+            crate::i18n::tr(
+                "переменная ещё не снята",
+                "variable not removed yet",
+            )
+            .into(),
+        ),
         (false, false) => State::Off,
     }
 }
@@ -1203,12 +1352,14 @@ fn own_proxy_display(settings: &Settings) -> String {
 
 /// The kinds, in the order the window lists them. VS Code is the Antigravity
 /// extension's backend in `~/.gemini/bin` (`install_label`).
-const INSTALL_KINDS: [&str; 4] = [
-    "Antigravity 2.0",
-    "Antigravity IDE",
-    "Antigravity CLI",
-    "Antigravity для VS Code",
-];
+fn install_kinds() -> [&'static str; 4] {
+    [
+        "Antigravity 2.0",
+        "Antigravity IDE",
+        "Antigravity CLI",
+        crate::vscode_install_label(),
+    ]
+}
 
 fn collect_installs(
     settings: &Settings,
@@ -1229,7 +1380,7 @@ fn collect_installs(
     }
 
     let mut rows: Vec<InstallRow> = Vec::new();
-    for label in INSTALL_KINDS {
+    for label in install_kinds() {
         let hit = chosen
             .iter()
             .find(|(p, _)| crate::install_label(p) == label)
@@ -1290,7 +1441,10 @@ fn apply(ctx: &mut Ctx, cap: Cap, on: bool) {
     if cap.needs_admin() && !is_admin() {
         ctx.log(
             Level::Err,
-            "Нужны права администратора. Нажмите «Перезапустить от имени администратора».",
+            crate::i18n::tr(
+                "Нужны права администратора. Нажмите «Перезапустить от имени администратора».",
+                "Administrator rights required. Click \"Restart as administrator\".",
+            ),
         );
         return;
     }
@@ -1326,7 +1480,10 @@ fn apply(ctx: &mut Ctx, cap: Cap, on: bool) {
             if !ctx.settings.save() {
                 ctx.log(
                     Level::Warn,
-                    "Настройки не сохранились (файл занят?) — автопатч может вернуть патч. Выключите и «Автопатч».",
+                    crate::i18n::tr(
+                        "Настройки не сохранились (файл занят?) — автопатч может вернуть патч. Выключите и «Автопатч».",
+                        "Settings could not be saved (file in use?) — auto-patch may re-apply the patch. Turn off \"Auto-patch\" too.",
+                    ),
                 );
             }
             disable_client_patch(ctx);
@@ -1361,7 +1518,11 @@ fn apply(ctx: &mut Ctx, cap: Cap, on: bool) {
             if on {
                 let text = ctx.settings.own_proxy.clone();
                 let result = if text.trim().is_empty() {
-                    Err("Укажите адрес своего прокси в настройках.".into())
+                    Err(crate::i18n::tr(
+                        "Укажите адрес своего прокси в настройках.",
+                        "Enter your proxy address in Settings.",
+                    )
+                    .into())
                 } else {
                     set_own_proxy(ctx, &text, true)
                 };
@@ -1372,10 +1533,22 @@ fn apply(ctx: &mut Ctx, cap: Cap, on: bool) {
                 match upstream::try_clear() {
                     Ok(()) => {
                         ctx.settings.own_proxy_enabled = false;
-                        ctx.log(Level::Ok, "Свой прокси отключён.");
+                        ctx.log(
+                            Level::Ok,
+                            crate::i18n::tr(
+                                "Свой прокси отключён.",
+                                "Own proxy disabled.",
+                            ),
+                        );
                         release_route_carrier(ctx);
                     }
-                    Err(error) => ctx.log(Level::Err, format!("Свой прокси не отключён: {error}")),
+                    Err(error) => ctx.log(
+                        Level::Err,
+                        match crate::i18n::current() {
+                            crate::i18n::Lang::Ru => format!("Свой прокси не отключён: {error}"),
+                            crate::i18n::Lang::En => format!("Failed to disable own proxy: {error}"),
+                        },
+                    ),
                 }
             }
         }
@@ -1386,31 +1559,50 @@ fn apply(ctx: &mut Ctx, cap: Cap, on: bool) {
             ctx.log(
                 Level::Ok,
                 if on {
-                    "Ротация включена — запрос идёт ко всем включённым серверам, ответ сверяется с эталонным."
-                        .to_string()
+                    crate::i18n::tr(
+                        "Ротация включена — запрос идёт ко всем включённым серверам, ответ сверяется с эталонным.",
+                        "Rotation enabled — queries go to all enabled servers and are verified.",
+                    )
+                    .to_string()
                 } else {
                     match first_enabled_provider(&ctx.settings) {
-                        Some(name) => format!(
-                            "Ротация выключена — используется только {}. Запасных серверов не будет.",
-                            name
-                        ),
-                        None => "Ротация выключена, но все серверы отключены.".to_string(),
+                        Some(name) => match crate::i18n::current() {
+                            crate::i18n::Lang::Ru => format!("Ротация выключена — используется только {name}. Запасных серверов не будет."),
+                            crate::i18n::Lang::En => format!("Rotation disabled — using only {name}, no fallback servers."),
+                        },
+                        None => crate::i18n::tr(
+                            "Ротация выключена, но все серверы отключены.",
+                            "Rotation disabled, but all servers are off.",
+                        )
+                        .to_string(),
                     }
                 },
             );
         }
         (Cap::GroupProxy, on) => {
             if on && !ctx.settings.group_proxy_configured() {
-                ctx.log(Level::Warn, "Добавьте код для прокси из группы.");
+                ctx.log(
+                    Level::Warn,
+                    crate::i18n::tr(
+                        "Добавьте код для прокси из группы.",
+                        "Add a code for the group proxy.",
+                    ),
+                );
                 return;
             }
             ctx.settings.group_proxy = on;
             ctx.log(
                 Level::Ok,
                 if on {
-                    "Прокси из группы включён."
+                    crate::i18n::tr(
+                        "Прокси из группы включён.",
+                        "Group proxy enabled.",
+                    )
                 } else {
-                    "Прокси из группы выключен."
+                    crate::i18n::tr(
+                        "Прокси из группы выключен.",
+                        "Group proxy disabled.",
+                    )
                 },
             );
             if on {
@@ -1450,25 +1642,27 @@ fn enable_all(ctx: &mut Ctx) {
             // for a patch that is off too, with the bypass already running.
             ctx.log(
                 Level::Warn,
-                "Обход ошибки 400 не включён: нужны права администратора. Нажмите «Перезапустить от имени администратора».",
+                crate::i18n::tr(
+                    "Обход ошибки 400 не включён: нужны права администратора. Нажмите «Перезапустить от имени администратора».",
+                    "Error 400 bypass not enabled: administrator rights required. Click \"Restart as administrator\".",
+                ),
             );
             return;
         }
         apply(ctx, Cap::Dns, true);
     }
-    // A proxy the user set up themselves stays theirs (G33): `enable_local_proxy`
-    // says so and leaves ours off, which also keeps the loopback door shut.
     if !endpoint::proxy_env_is_ours() {
         apply(ctx, Cap::LocalProxy, true);
     }
-    // Whether or not the patch found anything to patch: auto-patch is what
-    // patches the Antigravity installed after this click (D27).
     if watchdog_allowed(admin) && !background::is_watchdog_enabled() {
         apply(ctx, Cap::Watchdog, true);
     }
     ctx.log(
         Level::Ok,
-        "Готово. Откройте Antigravity и напишите что-нибудь в чат — здесь появится подтверждение, что модель ответила.",
+        crate::i18n::tr(
+            "Готово. Откройте Antigravity и напишите что-нибудь в чат — здесь появится подтверждение, что модель ответила.",
+            "Done. Open Antigravity and send a message in chat — confirmation will appear here once the model replies.",
+        ),
     );
 }
 
@@ -1486,23 +1680,34 @@ fn repair(ctx: &mut Ctx) {
     if cfg!(target_os = "windows") && !is_admin() {
         ctx.log(
             Level::Err,
-            "Нужны права администратора. Нажмите «Перезапустить от имени администратора».",
+            crate::i18n::tr(
+                "Нужны права администратора. Нажмите «Перезапустить от имени администратора».",
+                "Administrator rights required. Click \"Restart as administrator\".",
+            ),
         );
         return;
     }
-    // DNS is put back only when it was wanted, or when nothing else is: a user
-    // running just their own proxy must not get DNS rules from a repair.
     let with_dns = ctx.settings.dns || !routes_want_relay(&ctx.settings);
     if with_dns {
         ctx.settings.dns = true;
     }
-    // `ensure_running` reinstalls only a copy that differs from this build;
-    // a relay that is merely stopped or outdated needs the full `enable`.
     if let Err(e) = background::enable() {
-        ctx.log(Level::Err, format!("Служба обхода не запустилась: {}", e));
+        ctx.log(
+            Level::Err,
+            match crate::i18n::current() {
+                crate::i18n::Lang::Ru => format!("Служба обхода не запустилась: {e}"),
+                crate::i18n::Lang::En => format!("Bypass service failed to start: {e}"),
+            },
+        );
         return;
     }
-    ctx.log(Level::Ok, "Служба обхода переустановлена и запущена.");
+    ctx.log(
+        Level::Ok,
+        crate::i18n::tr(
+            "Служба обхода переустановлена и запущена.",
+            "Bypass service reinstalled and started.",
+        ),
+    );
     if with_dns {
         enable_dns(ctx);
     } else {
@@ -1573,18 +1778,16 @@ fn patch_found(ctx: &mut Ctx, found: Vec<(&'static str, PathBuf)>) -> bool {
         return false;
     }
 
-    ctx.busy(Some("Автопатч"));
+    ctx.busy(Some(crate::i18n::tr("Автопатч", "Auto-patch")));
     let mut wrote = false;
     for (label, inst) in found {
-        // Never a password prompt nobody asked for: the automatic pass leaves a
-        // root-owned install to the button, which asks.
         if crate::elevate::needs_root(&inst) {
             ctx.log(
                 Level::Warn,
-                format!(
-                    "Автопатч: {} — установка принадлежит root. Нажмите «Включить всё» и введите пароль.",
-                    label
-                ),
+                match crate::i18n::current() {
+                    crate::i18n::Lang::Ru => format!("Автопатч: {label} — установка принадлежит root. Нажмите «Включить всё» и введите пароль."),
+                    crate::i18n::Lang::En => format!("Auto-patch: {label} — owned by root. Click \"Enable all\" and enter your password."),
+                },
             );
             continue;
         }
@@ -1605,27 +1808,28 @@ fn patch_found(ctx: &mut Ctx, found: Vec<(&'static str, PathBuf)>) -> bool {
             wrote = true;
             ctx.log(
                 Level::Ok,
-                format!("Автопатч: {} — патч наложен ({})", label, where_),
+                match crate::i18n::current() {
+                    crate::i18n::Lang::Ru => format!("Автопатч: {label} — патч наложен ({where_})"),
+                    crate::i18n::Lang::En => format!("Auto-patch: {label} — patched ({where_})"),
+                },
             );
         }
         if let Some(e) = failed {
             ctx.log(
                 Level::Warn,
-                format!(
-                    "Автопатч: {} — не удалось записать ({}). Закройте Antigravity и нажмите «Включить всё».",
-                    label, e
-                ),
+                match crate::i18n::current() {
+                    crate::i18n::Lang::Ru => format!("Автопатч: {label} — не удалось записать ({e}). Закройте Antigravity и нажмите «Включить всё»."),
+                    crate::i18n::Lang::En => format!("Auto-patch: {label} — failed to write ({e}). Close Antigravity and click \"Enable all\"."),
+                },
             );
         } else if unknown > 0 && patched == 0 {
-            // The watchdog's rule (I19): a build this patcher does not know is
-            // left exactly as it is, so Antigravity shows its own error.
+            let targets = patch_binary::describe_targets(&inst);
             ctx.log(
                 Level::Warn,
-                format!(
-                    "Автопатч: {} — эта сборка Antigravity анлокеру ещё не знакома, файлы не тронуты. Нужна новая версия анлокера. [{}]",
-                    label,
-                    patch_binary::describe_targets(&inst)
-                ),
+                match crate::i18n::current() {
+                    crate::i18n::Lang::Ru => format!("Автопатч: {label} — эта сборка Antigravity анлокеру ещё не знакома, файлы не тронуты. Нужна новая версия анлокера. [{targets}]"),
+                    crate::i18n::Lang::En => format!("Auto-patch: {label} — unknown Antigravity build, files untouched. Update the unlocker. [{targets}]"),
+                },
             );
         }
     }
@@ -1640,7 +1844,13 @@ fn patch_found(ctx: &mut Ctx, found: Vec<(&'static str, PathBuf)>) -> bool {
 }
 
 fn enable_client_patch(ctx: &mut Ctx) -> bool {
-    ctx.log(Level::Step, "Патч клиента Antigravity");
+    ctx.log(
+        Level::Step,
+        crate::i18n::tr(
+            "Патч клиента Antigravity",
+            "Patching Antigravity client",
+        ),
+    );
     patch_binary::kill_affected_processes();
 
     let installs = crate::find_all_installs();
@@ -1655,7 +1865,10 @@ fn enable_client_patch(ctx: &mut Ctx) -> bool {
     if targets.is_empty() {
         ctx.log(
             Level::Err,
-            "Установки Antigravity не найдены. Укажите путь вручную (карандаш).",
+            crate::i18n::tr(
+                "Установки Antigravity не найдены. Укажите путь вручную (карандаш).",
+                "No Antigravity installations found. Specify the path manually.",
+            ),
         );
         return false;
     }
@@ -1672,7 +1885,10 @@ fn enable_client_patch(ctx: &mut Ctx) -> bool {
             let where_ = crate::utils::mask_path(&inst.display().to_string());
             ctx.log(
                 Level::Step,
-                format!("{where_} принадлежит root — запрашиваю пароль для записи патча"),
+                match crate::i18n::current() {
+                    crate::i18n::Lang::Ru => format!("{where_} принадлежит root — запрашиваю пароль для записи патча"),
+                    crate::i18n::Lang::En => format!("{where_} is owned by root — requesting password to write patch"),
+                },
             );
             match crate::elevate::patch_as_root(inst) {
                 Ok(done) => {
@@ -1725,20 +1941,36 @@ fn enable_client_patch(ctx: &mut Ctx) -> bool {
     }
 
     if ok == 0 {
-        ctx.log(Level::Err, "Ни одна установка не пропатчена.");
+        ctx.log(
+            Level::Err,
+            crate::i18n::tr(
+                "Ни одна установка не пропатчена.",
+                "No installations were patched.",
+            ),
+        );
         return false;
     }
 
-    // I39: the legacy CA comes out last, and `remove_legacy_ca` itself refuses
-    // while the relay is still an older build.
     crate::remove_legacy_ca_quiet();
 
-    ctx.log(Level::Ok, format!("Пропатчено установок: {}", ok));
+    ctx.log(
+        Level::Ok,
+        match crate::i18n::current() {
+            crate::i18n::Lang::Ru => format!("Пропатчено установок: {ok}"),
+            crate::i18n::Lang::En => format!("Patched installations: {ok}"),
+        },
+    );
     true
 }
 
 fn disable_client_patch(ctx: &mut Ctx) {
-    ctx.log(Level::Step, "Снятие патча клиента");
+    ctx.log(
+        Level::Step,
+        crate::i18n::tr(
+            "Снятие патча клиента",
+            "Removing client patch",
+        ),
+    );
 
     // I20: a live watchdog treats an unpatch as an update and puts the patch
     // straight back. Both of them stop first — the standalone task and the one
@@ -1756,7 +1988,13 @@ fn disable_client_patch(ctx: &mut Ctx) {
     let want_relay = ctx.settings.dns;
     background::disable_watchdog();
     if let Err(e) = background::disable() {
-        ctx.log(Level::Warn, format!("Служба DNS не остановлена: {}", e));
+        ctx.log(
+            Level::Warn,
+            match crate::i18n::current() {
+                crate::i18n::Lang::Ru => format!("Служба DNS не остановлена: {e}"),
+                crate::i18n::Lang::En => format!("DNS service not stopped: {e}"),
+            },
+        );
     }
 
     patch_binary::kill_affected_processes();
@@ -1785,7 +2023,10 @@ fn disable_client_patch(ctx: &mut Ctx) {
         let done = if patched_here && crate::elevate::needs_root(inst) {
             ctx.log(
                 Level::Info,
-                format!("{} — установка принадлежит root, запрашиваю пароль", where_),
+                match crate::i18n::current() {
+                    crate::i18n::Lang::Ru => format!("{where_} — установка принадлежит root, запрашиваю пароль"),
+                    crate::i18n::Lang::En => format!("{where_} — owned by root, requesting password"),
+                },
             );
             match crate::elevate::unpatch_as_root(inst) {
                 Ok(d) => d,
@@ -1805,20 +2046,32 @@ fn disable_client_patch(ctx: &mut Ctx) {
         }
         let reverted = done.files;
         if let Err(e) = endpoint::remove_ide(inst) {
-            ctx.log(Level::Warn, format!("Оверрайд эндпоинта не снят: {}", e));
+            ctx.log(
+                Level::Warn,
+                match crate::i18n::current() {
+                    crate::i18n::Lang::Ru => format!("Оверрайд эндпоинта не снят: {e}"),
+                    crate::i18n::Lang::En => format!("Endpoint override not removed: {e}"),
+                },
+            );
         }
         ctx.log(
             Level::Ok,
-            format!("{} — возвращено файлов: {}", where_, reverted),
+            match crate::i18n::current() {
+                crate::i18n::Lang::Ru => format!("{where_} — возвращено файлов: {reverted}"),
+                crate::i18n::Lang::En => format!("{where_} — files restored: {reverted}"),
+            },
         );
     }
     if let Err(e) = endpoint::remove_cli() {
-        ctx.log(Level::Warn, format!("Переменная CLI не снята: {}", e));
+        ctx.log(
+            Level::Warn,
+            match crate::i18n::current() {
+                crate::i18n::Lang::Ru => format!("Переменная CLI не снята: {e}"),
+                crate::i18n::Lang::En => format!("CLI variable not removed: {e}"),
+            },
+        );
     }
 
-    // The proxy variable is only read by a patched binary, so an unpatched
-    // machine must not keep it: it would sit in the user environment forever,
-    // naming a port nothing listens on.
     disable_local_proxy(ctx);
     ctx.proxy_var_carried = Some(false);
 
@@ -1826,7 +2079,10 @@ fn disable_client_patch(ctx: &mut Ctx) {
         if let Err(e) = background::ensure_running() {
             ctx.log(
                 Level::Warn,
-                format!("Служба DNS не поднялась обратно: {}", e),
+                match crate::i18n::current() {
+                    crate::i18n::Lang::Ru => format!("Служба DNS не поднялась обратно: {e}"),
+                    crate::i18n::Lang::En => format!("DNS service failed to restart: {e}"),
+                },
             );
         }
     }
@@ -1837,61 +2093,100 @@ fn disable_client_patch(ctx: &mut Ctx) {
 fn set_watchdog(ctx: &mut Ctx, on: bool) {
     if !on {
         background::disable_watchdog();
-        ctx.log(Level::Ok, "Автовосстановление патча отключено.");
+        ctx.log(
+            Level::Ok,
+            crate::i18n::tr(
+                "Автовосстановление патча отключено.",
+                "Auto-patch disabled.",
+            ),
+        );
         return;
     }
-    // The task launches the copy in %ProgramData%, so it has to be there - but
-    // only the file: starting the relay here switched the 400 bypass on for a
-    // user who asked for auto-patch alone.
     if let Err(e) = background::ensure_installed() {
         ctx.log(
             Level::Warn,
-            format!("Не удалось установить копию для автопатча: {}", e),
+            match crate::i18n::current() {
+                crate::i18n::Lang::Ru => format!("Не удалось установить копию для автопатча: {e}"),
+                crate::i18n::Lang::En => format!("Failed to install auto-patch copy: {e}"),
+            },
         );
     }
     match background::enable_watchdog() {
-        Ok(()) => ctx.log(Level::Ok, "Автовосстановление патча включено."),
-        Err(e) => ctx.log(Level::Err, format!("Не удалось включить: {}", e)),
+        Ok(()) => ctx.log(
+            Level::Ok,
+            crate::i18n::tr(
+                "Автовосстановление патча включено.",
+                "Auto-patch enabled.",
+            ),
+        ),
+        Err(e) => ctx.log(
+            Level::Err,
+            match crate::i18n::current() {
+                crate::i18n::Lang::Ru => format!("Не удалось включить: {e}"),
+                crate::i18n::Lang::En => format!("Failed to enable: {e}"),
+            },
+        ),
     }
 }
 
 // --- DNS -------------------------------------------------------------------
 
 fn enable_dns(ctx: &mut Ctx) {
-    ctx.log(Level::Step, "Обход через DNS");
+    ctx.log(
+        Level::Step,
+        crate::i18n::tr("Обход через DNS", "DNS bypass"),
+    );
 
-    // I5: the rules name the relay as their first nameserver, so it has to be
-    // answering before they are written.
     if let Err(e) = background::ensure_running() {
-        ctx.log(Level::Err, format!("Служба DNS не запустилась: {}", e));
+        ctx.log(
+            Level::Err,
+            match crate::i18n::current() {
+                crate::i18n::Lang::Ru => format!("Служба DNS не запустилась: {e}"),
+                crate::i18n::Lang::En => format!("DNS service failed to start: {e}"),
+            },
+        );
         return;
     }
-    ctx.log(Level::Ok, "Локальная служба DNS запущена.");
+    ctx.log(
+        Level::Ok,
+        crate::i18n::tr(
+            "Локальная служба DNS запущена.",
+            "Local DNS service started.",
+        ),
+    );
 
     match dns::setup_dns_nrpt() {
         Ok(outcome) => {
             dns::invalidate_cache();
-            // The rules are in; what the client cached before them is not ours
-            // to keep (G75). The relay does the same at its own start.
             dns::flush_client_cache();
             if outcome.stood_down_for_vpn {
-                // Not a failure, and not "on" either: with the client measured
-                // inside a tunnel the rules would override the resolver the user
-                // turned on, and the substituted address is reached through the
-                // tunnel anyway (D13, G26, G29).
                 ctx.log(
                     Level::Warn,
-                    "Обнаружен активный VPN, через который идёт Antigravity — \
-                     правила DNS не создавались. Выключите VPN и включите переключатель заново.",
+                    crate::i18n::tr(
+                        "Обнаружен активный VPN, через который идёт Antigravity — правила DNS не создавались. Выключите VPN и включите переключатель заново.",
+                        "Active VPN carrying Antigravity detected — DNS rules were not created. Turn off VPN and re-enable the switch.",
+                    ),
                 );
             } else {
-                ctx.log(Level::Ok, "Правила DNS установлены.");
+                ctx.log(
+                    Level::Ok,
+                    crate::i18n::tr(
+                        "Правила DNS установлены.",
+                        "DNS rules installed.",
+                    ),
+                );
             }
             if let Some(note) = dns::outcome_note(&outcome) {
                 ctx.log(Level::Info, strip_ansi(&note));
             }
         }
-        Err(e) => ctx.log(Level::Err, format!("Правила DNS не установлены: {}", e)),
+        Err(e) => ctx.log(
+            Level::Err,
+            match crate::i18n::current() {
+                crate::i18n::Lang::Ru => format!("Правила DNS не установлены: {e}"),
+                crate::i18n::Lang::En => format!("DNS rules not installed: {e}"),
+            },
+        ),
     }
 
     // Both of these were taken down *by* `disable_dns` rather than by the user,
@@ -1906,7 +2201,13 @@ fn enable_dns(ctx: &mut Ctx) {
 }
 
 fn disable_dns(ctx: &mut Ctx) {
-    ctx.log(Level::Step, "Отключение обхода через DNS");
+    ctx.log(
+        Level::Step,
+        crate::i18n::tr(
+            "Отключение обхода через DNS",
+            "Disabling DNS bypass",
+        ),
+    );
 
     // The relay is also the carrier of every route (local proxy, own proxy,
     // group, exits): it stays while any of them is wanted, and only the rules
@@ -1925,11 +2226,20 @@ fn disable_dns(ctx: &mut Ctx) {
     // I45: both steps run regardless of what the first one did.
     dns::remove_dns_nrpt();
     dns::invalidate_cache();
-    ctx.log(Level::Ok, "Правила DNS сняты.");
+    ctx.log(
+        Level::Ok,
+        crate::i18n::tr(
+            "Правила DNS сняты.",
+            "DNS rules removed.",
+        ),
+    );
     if keep_relay {
         ctx.log(
             Level::Info,
-            "Служба осталась запущенной: она нужна включённым прокси и выходам.",
+            crate::i18n::tr(
+                "Служба осталась запущенной: она нужна включённым прокси и выходам.",
+                "Service kept running: required by enabled proxies and routes.",
+            ),
         );
     } else {
         stop_relay(ctx);
@@ -1992,7 +2302,10 @@ fn restart_stale_holders(ctx: &mut Ctx) {
     if !shells.is_empty() {
         ctx.log(
             Level::Step,
-            "Перезапуск Antigravity: он запомнил адрес выключенного прокси",
+            crate::i18n::tr(
+                "Перезапуск Antigravity: он запомнил адрес выключенного прокси",
+                "Restarting Antigravity: it remembered the disabled proxy address",
+            ),
         );
         patch_binary::kill_affected_processes();
         for path in &shells {
@@ -2000,7 +2313,10 @@ fn restart_stale_holders(ctx: &mut Ctx) {
         }
         ctx.log(
             Level::Ok,
-            "Antigravity перезапущен и обращается к Google напрямую.",
+            crate::i18n::tr(
+                "Antigravity перезапущен и обращается к Google напрямую.",
+                "Antigravity restarted and connects to Google directly.",
+            ),
         );
     }
     // Only when the extension's backend is actually running: every editor
@@ -2009,12 +2325,17 @@ fn restart_stale_holders(ctx: &mut Ctx) {
         .iter()
         .any(|h| h.name.eq_ignore_ascii_case("agy.exe"));
     if agy_runs && !others.is_empty() {
+        let joined = others.join(", ");
         ctx.log(
             Level::Info,
-            format!(
-                "Расширение Antigravity помнит адрес выключенного прокси — перезапустите {}.",
-                others.join(", ")
-            ),
+            match crate::i18n::current() {
+                crate::i18n::Lang::Ru => format!(
+                    "Расширение Antigravity помнит адрес выключенного прокси — перезапустите {joined}."
+                ),
+                crate::i18n::Lang::En => format!(
+                    "Antigravity extension remembers the disabled proxy address — restart {joined}."
+                ),
+            },
         );
     }
 }
@@ -2048,10 +2369,19 @@ fn stop_relay(ctx: &mut Ctx) {
         background::disable_watchdog();
     }
     match background::disable() {
-        Ok(()) => ctx.log(Level::Ok, "Локальная служба DNS остановлена."),
+        Ok(()) => ctx.log(
+            Level::Ok,
+            crate::i18n::tr(
+                "Локальная служба DNS остановлена.",
+                "Local DNS service stopped.",
+            ),
+        ),
         Err(e) => ctx.log(
             Level::Warn,
-            format!("Служба остановлена не полностью: {}", e),
+            match crate::i18n::current() {
+                crate::i18n::Lang::Ru => format!("Служба остановлена не полностью: {e}"),
+                crate::i18n::Lang::En => format!("Service only partially stopped: {e}"),
+            },
         ),
     }
     if restore_watchdog {
@@ -2077,12 +2407,21 @@ fn ensure_route_carrier(ctx: &mut Ctx) {
     if cfg!(target_os = "windows") && !is_admin() {
         ctx.log(
             Level::Warn,
-            "Служба обхода не запущена: нужны права администратора. Нажмите «Перезапустить от имени администратора».",
+            crate::i18n::tr(
+                "Служба обхода не запущена: нужны права администратора. Нажмите «Перезапустить от имени администратора».",
+                "Bypass service not started: administrator rights required. Click \"Restart as administrator\".",
+            ),
         );
         return;
     }
     if let Err(e) = background::ensure_running() {
-        ctx.log(Level::Err, format!("Служба обхода не запустилась: {}", e));
+        ctx.log(
+            Level::Err,
+            match crate::i18n::current() {
+                crate::i18n::Lang::Ru => format!("Служба обхода не запустилась: {e}"),
+                crate::i18n::Lang::En => format!("Bypass service failed to start: {e}"),
+            },
+        );
         return;
     }
     // Wanted, whatever `enable_local_proxy` manages below: the relay writes the
@@ -2149,7 +2488,10 @@ fn reapply_dns_rules(ctx: &mut Ctx) -> bool {
     if !is_admin() && cfg!(target_os = "windows") {
         ctx.log(
             Level::Warn,
-            "Список DNS сохранён, но правила не переписаны — нужны права администратора.",
+            crate::i18n::tr(
+                "Список DNS сохранён, но правила не переписаны — нужны права администратора.",
+                "DNS list saved, but rules not rewritten — administrator rights required.",
+            ),
         );
         return false;
     }
@@ -2157,9 +2499,21 @@ fn reapply_dns_rules(ctx: &mut Ctx) -> bool {
         Ok(_) => {
             dns::invalidate_cache();
             dns::flush_client_cache();
-            ctx.log(Level::Ok, "Правила DNS переписаны под новый список.");
+            ctx.log(
+                Level::Ok,
+                crate::i18n::tr(
+                    "Правила DNS переписаны под новый список.",
+                    "DNS rules updated for the new list.",
+                ),
+            );
         }
-        Err(e) => ctx.log(Level::Warn, format!("Правила DNS не переписаны: {}", e)),
+        Err(e) => ctx.log(
+            Level::Warn,
+            match crate::i18n::current() {
+                crate::i18n::Lang::Ru => format!("Правила DNS не переписаны: {e}"),
+                crate::i18n::Lang::En => format!("DNS rules not updated: {e}"),
+            },
+        ),
     }
     true
 }
@@ -2167,90 +2521,121 @@ fn reapply_dns_rules(ctx: &mut Ctx) -> bool {
 // --- local proxy -----------------------------------------------------------
 
 fn enable_local_proxy(ctx: &mut Ctx) {
-    ctx.log(Level::Step, "Локальный прокси");
+    ctx.log(
+        Level::Step,
+        crate::i18n::tr("Локальный прокси", "Local proxy"),
+    );
     let url = proxy::proxy_url();
 
-    // 1. The user-wide pair that builds up to 2.11.0_4 wrote. It goes first:
-    //    leaving it puts the whole machine through loopback (D19).
     match endpoint::remove_legacy_proxy_env(&url) {
-        Ok(true) => ctx.log(Level::Ok, "Прежняя общесистемная HTTPS_PROXY снята."),
+        Ok(true) => ctx.log(
+            Level::Ok,
+            crate::i18n::tr(
+                "Прежняя общесистемная HTTPS_PROXY снята.",
+                "Previous system-wide HTTPS_PROXY removed.",
+            ),
+        ),
         Ok(false) => {}
         Err(e) => {
-            ctx.log(Level::Err, format!("Прежняя HTTPS_PROXY не снята: {}", e));
+            ctx.log(
+                Level::Err,
+                match crate::i18n::current() {
+                    crate::i18n::Lang::Ru => format!("Прежняя HTTPS_PROXY не снята: {e}"),
+                    crate::i18n::Lang::En => format!("Previous HTTPS_PROXY not removed: {e}"),
+                },
+            );
             return;
         }
     }
 
-    // 2. Measured (G33): ours outranks theirs inside the patched server. A user
-    //    who configured their own proxy must keep it, so ours comes off — this
-    //    is not a "skip".
     if endpoint::foreign_proxy(&url).is_some() {
         match endpoint::remove_proxy(&url, "") {
             Ok(()) => {
                 ctx.log(
                     Level::Warn,
-                    "В системе задан свой прокси — наш не включаем, чтобы не перехватывать чужой.",
+                    crate::i18n::tr(
+                        "В системе задан свой прокси — наш не включаем, чтобы не перехватывать чужой.",
+                        "A custom system proxy is set — keeping ours off to avoid overriding yours.",
+                    ),
                 );
                 ctx.settings.local_proxy = false;
             }
-            // Swallowed by a `let _ =` until `2.15.1_2`, and that is one way the
-            // two readers came apart: the setting went off while the variable
-            // stayed set, so the relay stopped writing it and the window went on
-            // drawing it as on (G74). A removal that did not happen must not be
-            // recorded as a switch that did.
             Err(e) => ctx.log(
                 Level::Err,
-                format!(
-                    "В системе задан свой прокси, но нашу переменную снять не удалось: {}",
-                    e
-                ),
+                match crate::i18n::current() {
+                    crate::i18n::Lang::Ru => format!("В системе задан свой прокси, но нашу переменную снять не удалось: {e}"),
+                    crate::i18n::Lang::En => format!("A system proxy is set, but failed to remove our variable: {e}"),
+                },
             ),
         }
         return;
     }
 
-    // 3. The variable has a private name that only a patched binary reads. If
-    //    the rename did not land, writing it is writing into nothing.
     if ctx.proxy_var_carried == Some(false) {
         ctx.log(
             Level::Err,
             if ctx.proxy_var_retryable {
-                "Файл был занят — закройте Antigravity полностью и включите переключатель заново."
+                crate::i18n::tr(
+                    "Файл был занят — закройте Antigravity полностью и включите переключатель заново.",
+                    "File was in use — close Antigravity completely and re-enable the switch.",
+                )
             } else {
-                "В этой сборке Antigravity нет места для переменной прокси — \
-                 вероятно, вышла новая версия и нужен более новый анлокер."
+                crate::i18n::tr(
+                    "В этой сборке Antigravity нет места для переменной прокси — вероятно, вышла новая версия и нужен более новый анлокер.",
+                    "This Antigravity build has no slot for the proxy variable — a newer unlocker may be needed.",
+                )
             },
         );
         return;
     }
 
-    // 4. I53/G31: never name a listener that is not there. A variable pointing
-    //    at a dead port takes the sign-in down with it.
-    //    Named by the port that answered, not the one read above: the relay can
-    //    move the proxy while this waits (P26), and a URL for the port it left
-    //    would be a dead one no watchdog takes back off.
     let Some(port) = proxy::wait_for_our_listener(Duration::from_secs(3)) else {
         ctx.log(
             Level::Err,
-            "Локальный прокси не отвечает — сначала включите «Обход через DNS».",
+            crate::i18n::tr(
+                "Локальный прокси не отвечает — сначала включите «Обход через DNS».",
+                "Local proxy is not responding — enable \"DNS bypass\" first.",
+            ),
         );
         return;
     };
     let url = proxy::url_at(port);
 
     match endpoint::apply_proxy(&url, "") {
-        Ok(_) => ctx.log(Level::Ok, "Локальный прокси включён."),
-        Err(e) => ctx.log(Level::Err, format!("Не удалось включить: {}", e)),
+        Ok(_) => ctx.log(
+            Level::Ok,
+            crate::i18n::tr(
+                "Локальный прокси включён.",
+                "Local proxy enabled.",
+            ),
+        ),
+        Err(e) => ctx.log(
+            Level::Err,
+            match crate::i18n::current() {
+                crate::i18n::Lang::Ru => format!("Не удалось включить: {e}"),
+                crate::i18n::Lang::En => format!("Failed to enable: {e}"),
+            },
+        ),
     }
 }
 
 fn disable_local_proxy(ctx: &mut Ctx) {
     let url = proxy::proxy_url();
-    // I45 again: `remove_proxy` collects its own failures and joins them, so a
-    // half-failed removal still takes off everything it can.
     match endpoint::remove_proxy(&url, "") {
-        Ok(()) => ctx.log(Level::Ok, "Локальный прокси отключён."),
-        Err(e) => ctx.log(Level::Warn, format!("Снято не полностью: {}", e)),
+        Ok(()) => ctx.log(
+            Level::Ok,
+            crate::i18n::tr(
+                "Локальный прокси отключён.",
+                "Local proxy disabled.",
+            ),
+        ),
+        Err(e) => ctx.log(
+            Level::Warn,
+            match crate::i18n::current() {
+                crate::i18n::Lang::Ru => format!("Снято не полностью: {e}"),
+                crate::i18n::Lang::En => format!("Partially removed: {e}"),
+            },
+        ),
     }
 }
 
@@ -2263,7 +2648,10 @@ fn set_custom_dns(ctx: &mut Ctx, text: &str) {
     let text = text.trim();
     if text.is_empty() {
         ctx.settings.custom_dns.clear();
-        ctx.log(Level::Ok, "Свой DNS убран.");
+        ctx.log(
+            Level::Ok,
+            crate::i18n::tr("Свой DNS убран.", "Custom DNS removed."),
+        );
         return;
     }
     let found = match crate::resolvers::parse_custom_dns(text) {
@@ -2272,10 +2660,10 @@ fn set_custom_dns(ctx: &mut Ctx, text: &str) {
         Err(e) => {
             ctx.log(
                 Level::Err,
-                format!(
-                    "{} Принимаются IPv4-адрес (77.88.8.8), DoH (https://dns.example.com/dns-query)                      и DoT (tls://dns.example.com), через пробел.",
-                    e
-                ),
+                match crate::i18n::current() {
+                    crate::i18n::Lang::Ru => format!("{e} Принимаются IPv4-адрес (77.88.8.8), DoH (https://dns.example.com/dns-query) и DoT (tls://dns.example.com), через пробел."),
+                    crate::i18n::Lang::En => format!("{e} Accepted: IPv4 (77.88.8.8), DoH (https://dns.example.com/dns-query), and DoT (tls://dns.example.com), space-separated."),
+                },
             );
             return;
         }
@@ -2283,12 +2671,13 @@ fn set_custom_dns(ctx: &mut Ctx, text: &str) {
     ctx.settings.custom_dns = found.iter().map(|s| s.text()).collect::<Vec<_>>().join(" ");
     ctx.settings
         .set_provider_enabled(crate::resolvers::CUSTOM_NAME, true);
+    let saved_dns = &ctx.settings.custom_dns;
     ctx.log(
         Level::Ok,
-        format!(
-            "Свой DNS сохранён ({}). Он участвует в пуле наравне с остальными: ответ сверяется с эталонным.",
-            ctx.settings.custom_dns
-        ),
+        match crate::i18n::current() {
+            crate::i18n::Lang::Ru => format!("Свой DNS сохранён ({saved_dns}). Он участвует в пуле наравне с остальными: ответ сверяется с эталонным."),
+            crate::i18n::Lang::En => format!("Custom DNS saved ({saved_dns}). It joins the pool alongside others and answers are verified."),
+        },
     );
 }
 
@@ -2307,13 +2696,20 @@ fn set_group_key(ctx: &mut Ctx, text: &str, enable: bool) -> Result<(), String> 
     settings.group_key = text.trim().to_string();
     settings.group_key_at = crate::gate::now_unix();
     if !settings.save() {
-        return Err("Не удалось сохранить код из группы.".into());
+        return Err(crate::i18n::tr(
+            "Не удалось сохранить код из группы.",
+            "Failed to save group code.",
+        )
+        .into());
     }
     ctx.settings = settings;
     if ctx.settings.group_proxy_wanted() {
         apply(ctx, Cap::GroupProxy, true);
     }
-    ctx.log(Level::Ok, "Ключ принят.");
+    ctx.log(
+        Level::Ok,
+        crate::i18n::tr("Ключ принят.", "Key accepted."),
+    );
     Ok(())
 }
 
@@ -2323,61 +2719,102 @@ fn set_own_proxy(ctx: &mut Ctx, text: &str, enable: bool) -> Result<(), String> 
     settings.own_proxy = text.to_string();
     settings.own_proxy_enabled = enable && !text.is_empty();
     if text.is_empty() {
-        upstream::try_clear().map_err(|error| format!("Не удалось убрать свой прокси: {error}"))?;
+        upstream::try_clear().map_err(|error| match crate::i18n::current() {
+            crate::i18n::Lang::Ru => format!("Не удалось убрать свой прокси: {error}"),
+            crate::i18n::Lang::En => format!("Failed to remove own proxy: {error}"),
+        })?;
         ctx.settings = settings;
         if !ctx.settings.save() {
-            return Err("Свой прокси отключён, но не удалось удалить его адрес из настроек.".into());
+            return Err(crate::i18n::tr(
+                "Свой прокси отключён, но не удалось удалить его адрес из настроек.",
+                "Own proxy disabled, but failed to clear its address from settings.",
+            )
+            .into());
         }
-        ctx.log(Level::Ok, "Свой прокси убран.");
+        ctx.log(
+            Level::Ok,
+            crate::i18n::tr(
+                "Свой прокси убран.",
+                "Own proxy removed.",
+            ),
+        );
         release_route_carrier(ctx);
         return Ok(());
     }
 
-    let up = upstream::parse(text).map_err(|error| format!("Адрес не разобран: {error}"))?;
+    let up = upstream::parse(text).map_err(|error| match crate::i18n::current() {
+        crate::i18n::Lang::Ru => format!("Адрес не разобран: {error}"),
+        crate::i18n::Lang::En => format!("Invalid address: {error}"),
+    })?;
     if !enable {
         if !settings.save() {
-            return Err("Не удалось сохранить адрес своего прокси.".into());
+            return Err(crate::i18n::tr(
+                "Не удалось сохранить адрес своего прокси.",
+                "Failed to save own proxy address.",
+            )
+            .into());
         }
         ctx.settings = settings;
-        ctx.log(Level::Ok, "Адрес своего прокси сохранён.");
+        ctx.log(
+            Level::Ok,
+            crate::i18n::tr(
+                "Адрес своего прокси сохранён.",
+                "Own proxy address saved.",
+            ),
+        );
         return Ok(());
     }
 
-    // Saved and switched on whatever the network probe says: the user typed it in,
-    // and the route table is what decides whether it carries anything - a proxy
-    // that does not open is stepped around on the connection that finds out, and
-    // one that draws a region 400 is benched by the watch (G81). Refusing to save
-    // it made the user keep a proxy they wanted out of the table altogether.
-    upstream::save(&up).map_err(|error| format!("Прокси не сохранён: {error}"))?;
+    upstream::save(&up).map_err(|error| match crate::i18n::current() {
+        crate::i18n::Lang::Ru => format!("Прокси не сохранён: {error}"),
+        crate::i18n::Lang::En => format!("Proxy not saved: {error}"),
+    })?;
     settings.own_proxy_at = crate::gate::now_unix();
     ctx.settings = settings;
     let saved = ctx.settings.save();
-    ctx.log(Level::Ok, format!("Свой прокси включён: {}", up.display()));
-    // Alone it needs the service and the variable; DNS is not part of it.
+    let disp = up.display();
+    ctx.log(
+        Level::Ok,
+        match crate::i18n::current() {
+            crate::i18n::Lang::Ru => format!("Свой прокси включён: {disp}"),
+            crate::i18n::Lang::En => format!("Own proxy enabled: {disp}"),
+        },
+    );
     ensure_route_carrier(ctx);
 
-    // Whether it carries a request to Google, and nothing else. Its exit country
-    // is never traced (D34): through the user's proxy the only traffic is to
-    // Google, and the region is judged by the refusal Google actually gives -
-    // Cloudflare's geolocation only guessed at it, and no unsigned Google call
-    // can tell (401/403 from any exit, measured).
-    ctx.log(Level::Info, "Проверяю прокси…");
+    ctx.log(
+        Level::Info,
+        crate::i18n::tr(
+            "Проверяю прокси…",
+            "Checking proxy…",
+        ),
+    );
     match upstream::probe(&up) {
-        Ok(()) => ctx.log(Level::Ok, "Прокси отвечает."),
+        Ok(()) => ctx.log(
+            Level::Ok,
+            crate::i18n::tr(
+                "Прокси отвечает.",
+                "Proxy is responding.",
+            ),
+        ),
         Err(e) => {
             ctx.log(
                 Level::Warn,
-                format!(
-                    "Прокси не отвечает: {} — сохранён всё равно; пока он не отвечает, запросы пойдут другими маршрутами.",
-                    e
-                ),
+                match crate::i18n::current() {
+                    crate::i18n::Lang::Ru => format!("Прокси не отвечает: {e} — сохранён всё равно; пока он не отвечает, запросы пойдут другими маршрутами."),
+                    crate::i18n::Lang::En => format!("Proxy not responding: {e} — saved anyway; other routes will be used until it responds."),
+                },
             );
         }
     }
     if saved {
         Ok(())
     } else {
-        Err("Свой прокси включён, но не удалось сохранить адрес в настройках.".into())
+        Err(crate::i18n::tr(
+            "Свой прокси включён, но не удалось сохранить адрес в настройках.",
+            "Own proxy enabled, but failed to save address in settings.",
+        )
+        .into())
     }
 }
 
@@ -2669,5 +3106,10 @@ mod tests {
             dns_state(true, true, true, Some(VpnSeen::CarryingClient), true, true),
             State::On
         );
+    }
+
+    #[test]
+    fn install_kinds_matches_vscode_label_in_current_language() {
+        assert!(install_kinds().contains(&crate::vscode_install_label()));
     }
 }

@@ -152,6 +152,10 @@ pub struct Settings {
     /// UI color theme preference (`system`, `light`, or `dark`).
     #[serde(default)]
     pub theme: ThemeMode,
+
+    /// UI language (`ru` or `en`).
+    #[serde(default)]
+    pub lang: crate::i18n::Lang,
 }
 
 impl Default for Settings {
@@ -180,6 +184,7 @@ impl Default for Settings {
             own_proxy_enabled: false,
             manual_paths: Vec::new(),
             theme: ThemeMode::System,
+            lang: crate::i18n::Lang::Ru,
         }
     }
 }
@@ -640,6 +645,20 @@ mod tests {
             let json = serde_json::to_string(&s).unwrap();
             let parsed = parse(&json).unwrap();
             assert_eq!(parsed.theme, mode);
+        }
+    }
+
+    #[test]
+    fn lang_defaults_to_ru_and_round_trips() {
+        assert_eq!(Settings::default().lang, crate::i18n::Lang::Ru);
+        for lang in crate::i18n::Lang::ALL {
+            let s = Settings {
+                lang,
+                ..Settings::default()
+            };
+            let json = serde_json::to_string(&s).unwrap();
+            let parsed = parse(&json).unwrap();
+            assert_eq!(parsed.lang, lang);
         }
     }
 }

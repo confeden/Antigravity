@@ -81,12 +81,26 @@ pub fn run(note: Option<String>) -> Result<(), String> {
         std::panic::set_hook(Box::new(|info| {
             crate::utils::message_box(
                 "Antigravity Unlocker",
-                &format!("Программа аварийно завершилась.\n\n{info}"),
+                &format!(
+                    "{}\n\n{info}",
+                    crate::i18n::tr(
+                        "Программа аварийно завершилась.",
+                        "The program crashed unexpectedly.",
+                    )
+                ),
             );
         }));
     }
 
-    let mut terminal = ratatui::try_init().map_err(|e| format!("терминал недоступен: {e}"))?;
+    let mut terminal = ratatui::try_init().map_err(|e| {
+        format!(
+            "{}: {e}",
+            crate::i18n::tr(
+                "терминал недоступен",
+                "terminal unavailable",
+            )
+        )
+    })?;
     // Bracketed paste makes a pasted key one event instead of 25 keystrokes.
     // Windows' console has no such mode; there a paste arrives as keys, which
     // the key field takes just as well.
@@ -199,10 +213,14 @@ impl App {
             if crate::utils::is_admin() {
                 log.push((
                     Level::Warn,
-                    format!(
-                        "Запущено через sudo: Antigravity ищется в домашней папке root, а не {user}. \
-                         Запустите без sudo — права root не нужны."
-                    ),
+                    match crate::i18n::current() {
+                        crate::i18n::Lang::Ru => format!(
+                            "Запущено через sudo: Antigravity ищется в домашней папке root, а не {user}. Запустите без sudo — права root не нужны."
+                        ),
+                        crate::i18n::Lang::En => format!(
+                            "Running under sudo: Antigravity is searched in root's home instead of {user}. Run without sudo — root is not needed."
+                        ),
+                    },
                 ));
             }
         }
@@ -246,13 +264,16 @@ impl App {
             if dirty || drawn_at.is_none_or(|t| t.elapsed() >= Duration::from_secs(1)) {
                 terminal
                     .draw(|f| self.draw(f))
-                    .map_err(|e| format!("терминал: {e}"))?;
+                    .map_err(|e| format!("{}: {e}", crate::i18n::tr("терминал", "terminal")))?;
                 drawn_at = Some(Instant::now());
                 dirty = false;
             }
-            if event::poll(Duration::from_millis(200)).map_err(|e| format!("терминал: {e}"))?
+            if event::poll(Duration::from_millis(200))
+                .map_err(|e| format!("{}: {e}", crate::i18n::tr("терминал", "terminal")))?
             {
-                match event::read().map_err(|e| format!("терминал: {e}"))? {
+                match event::read()
+                    .map_err(|e| format!("{}: {e}", crate::i18n::tr("терминал", "terminal")))?
+                {
                     // Windows reports releases too; only a press is a keystroke.
                     TermEvent::Key(k) if k.kind != KeyEventKind::Release => self.on_key(k),
                     TermEvent::Paste(text) => self.on_paste(&text),
@@ -421,7 +442,13 @@ impl App {
                     None => {
                         self.input = Some(Input::Path {
                             text,
-                            error: Some("По этому пути установка Antigravity не найдена.".into()),
+                            error: Some(
+                                crate::i18n::tr(
+                                    "По этому пути установка Antigravity не найдена.",
+                                    "Antigravity installation not found at this path.",
+                                )
+                                .into(),
+                            ),
                         })
                     }
                 }
@@ -508,6 +535,11 @@ impl App {
             KeyCode::Char('r') => self.act_if_offered(Action::Repair),
             KeyCode::Char('v') => self.act_if_offered(Action::Verify),
             KeyCode::Char('o') if crate::gui::report::ENABLED => self.save_report(),
+            KeyCode::Char('l') | KeyCode::Char('L') => {
+                let next = crate::i18n::current().next();
+                crate::i18n::set_current(next);
+                self.worker.send(Cmd::SetLang(next));
+            }
             KeyCode::Char('x') | KeyCode::Delete => {
                 if let Some(Row::Install(i)) = row {
                     self.forget_install(i);
@@ -524,7 +556,10 @@ impl App {
 
     fn busy_refusal(&mut self) -> bool {
         if let Some(what) = self.busy.clone() {
-            self.toast(format!("Подождите — идёт: {what}"));
+            self.toast(match crate::i18n::current() {
+                crate::i18n::Lang::Ru => format!("Подождите — идёт: {what}"),
+                crate::i18n::Lang::En => format!("Please wait — running: {what}"),
+            });
             return true;
         }
         false
@@ -543,7 +578,10 @@ impl App {
                     .map(|s| s.get(cap).clone())
                     .unwrap_or(State::Off);
                 if let State::Blocked(why) = &state {
-                    self.toast(format!("Не включается: {why}"));
+                    self.toast(match crate::i18n::current() {
+                        crate::i18n::Lang::Ru => format!("Не включается: {why}"),
+                        crate::i18n::Lang::En => format!("Cannot enable: {why}"),
+                    });
                     return;
                 }
                 if cap == Cap::OwnProxy
@@ -585,7 +623,10 @@ impl App {
                 }
                 if let Some(p) = self.status.as_ref().and_then(|s| s.providers.get(i)) {
                     if !p.available {
-                        self.toast("Свой DNS не задан — добавьте сервер в поле ниже.");
+                        self.toast(crate::i18n::tr(
+                            "Свой DNS не задан — добавьте сервер в поле ниже.",
+                            "Custom DNS not set — add a server in the field below.",
+                        ));
                         return;
                     }
                     self.worker
@@ -594,16 +635,28 @@ impl App {
             }
             Row::GroupProxyOpenRoom => {
                 crate::utils::open_url("https://t.me/nova_txt/69864");
-                self.toast("Открыто в браузере: https://t.me/nova_txt/69864");
+                self.toast(crate::i18n::tr(
+                    "Открыто в браузере: https://t.me/nova_txt/69864",
+                    "Opened in browser: https://t.me/nova_txt/69864",
+                ));
             }
             Row::GroupProxyCopy => {
                 let cmd = format!("/ag+{}", crate::hwid::pc_code());
                 let message = if crate::utils::set_clipboard_text(&cmd) {
-                    "Команда скопирована — вставьте её в Telegram."
+                    crate::i18n::tr(
+                        "Команда скопирована — вставьте её в Telegram.",
+                        "Command copied — paste it into Telegram.",
+                    )
                 } else if copy_to_terminal(&cmd).is_ok() {
-                    "Если вставка не сработает, выделите команду в списке."
+                    crate::i18n::tr(
+                        "Если вставка не сработает, выделите команду в списке.",
+                        "If paste doesn't work, select the command from the list.",
+                    )
                 } else {
-                    "Не удалось скопировать — выделите команду в списке."
+                    crate::i18n::tr(
+                        "Не удалось скопировать — выделите команду в списке.",
+                        "Failed to copy — select the command from the list.",
+                    )
                 };
                 self.toast(message);
             }
@@ -639,8 +692,14 @@ impl App {
         let offered = self.facts().and_then(|f| status::headline(&f).action);
         match offered {
             Some(a) if a == action => self.act(action),
-            Some(a) => self.toast(format!("Сейчас нужно другое: {}.", a.label())),
-            None => self.toast(format!("«{}» сейчас не нужно.", action.label())),
+            Some(a) => self.toast(match crate::i18n::current() {
+                crate::i18n::Lang::Ru => format!("Сейчас нужно другое: {}.", a.label()),
+                crate::i18n::Lang::En => format!("Something else is needed now: {}.", a.label()),
+            }),
+            None => self.toast(match crate::i18n::current() {
+                crate::i18n::Lang::Ru => format!("«{}» сейчас не нужно.", action.label()),
+                crate::i18n::Lang::En => format!("\"{}\" is not needed right now.", action.label()),
+            }),
         }
     }
 
@@ -657,16 +716,24 @@ impl App {
                     self.quit = true;
                     return;
                 }
-                self.toast("Права администратора не получены.");
+                self.toast(crate::i18n::tr(
+                    "Права администратора не получены.",
+                    "Administrator rights were not obtained.",
+                ));
             }
             // Opened, and also shown: a terminal with no desktop behind it has
             // no browser to open, and the link is then copied from here.
             Action::Verify => {
                 if let Some((_, url)) = self.facts().and_then(|f| f.verify) {
                     crate::utils::open_url_as_user(&url);
-                    self.toast(format!(
-                        "Если браузер не открылся, откройте ссылку вручную: {url}"
-                    ));
+                    self.toast(match crate::i18n::current() {
+                        crate::i18n::Lang::Ru => {
+                            format!("Если браузер не открылся, откройте ссылку вручную: {url}")
+                        }
+                        crate::i18n::Lang::En => {
+                            format!("If the browser did not open, open the link manually: {url}")
+                        }
+                    });
                 }
             }
         }
@@ -686,7 +753,10 @@ impl App {
                 let p = p.clone();
                 self.worker.send(Cmd::ForgetPath(p));
             }
-            _ => self.toast("Убрать можно только путь, указанный вручную."),
+            _ => self.toast(crate::i18n::tr(
+                "Убрать можно только путь, указанный вручную.",
+                "Only a manually specified path can be removed.",
+            )),
         }
     }
 
@@ -743,18 +813,33 @@ impl App {
         let copied = copy_out(&text);
         let msg = match (saved, copied) {
             (Some(path), Copied::Clipboard) => {
-                format!("Отчёт сохранён: {} (и скопирован)", path.display())
+                let p = path.display();
+                match crate::i18n::current() {
+                    crate::i18n::Lang::Ru => format!("Отчёт сохранён: {p} (и скопирован)"),
+                    crate::i18n::Lang::En => format!("Report saved: {p} (and copied)"),
+                }
             }
-            (Some(path), Copied::Terminal) => format!(
-                "Отчёт сохранён: {} (и передан терминалу для буфера обмена)",
-                path.display()
-            ),
-            (None, Copied::Clipboard) => {
-                "Файл сохранить не удалось — отчёт скопирован в буфер обмена.".to_string()
+            (Some(path), Copied::Terminal) => {
+                let p = path.display();
+                match crate::i18n::current() {
+                    crate::i18n::Lang::Ru => format!(
+                        "Отчёт сохранён: {p} (и передан терминалу для буфера обмена)"
+                    ),
+                    crate::i18n::Lang::En => format!(
+                        "Report saved: {p} (and sent to terminal clipboard)"
+                    ),
+                }
             }
-            (None, Copied::Terminal) => {
-                "Файл сохранить не удалось — отчёт передан терминалу для буфера обмена.".to_string()
-            }
+            (None, Copied::Clipboard) => crate::i18n::tr(
+                "Файл сохранить не удалось — отчёт скопирован в буфер обмена.",
+                "Could not save file — report copied to clipboard.",
+            )
+            .to_string(),
+            (None, Copied::Terminal) => crate::i18n::tr(
+                "Файл сохранить не удалось — отчёт передан терминалу для буфера обмена.",
+                "Could not save file — report sent to terminal clipboard.",
+            )
+            .to_string(),
         };
         self.toast(msg);
     }
@@ -802,7 +887,7 @@ impl App {
         match row {
             Row::Action(a) => format!("Enter — {}.", a.label()),
             Row::Cap(cap) => status::switch_text(cap).1.to_string(),
-            Row::Bypass => status::BYPASS_TEXT.1.to_string(),
+            Row::Bypass => status::bypass_text().1.to_string(),
             Row::Install(i) => {
                 let manual = self
                     .status
@@ -810,28 +895,67 @@ impl App {
                     .and_then(|s| s.installs.get(i))
                     .is_some_and(|r| r.manual);
                 let full = self.install_path(i).unwrap_or_default();
-                let mut s = "Enter — указать путь вручную".to_string();
+                let mut s = crate::i18n::tr(
+                    "Enter — указать путь вручную",
+                    "Enter — specify path manually",
+                )
+                .to_string();
                 if manual {
-                    s.push_str(", x — убрать указанный путь");
+                    s.push_str(crate::i18n::tr(
+                        ", x — убрать указанный путь",
+                        ", x — remove manual path",
+                    ));
                 }
                 if !full.is_empty() {
                     s.push_str(&format!(". {full}"));
                 }
                 s
             }
-            Row::Advanced => "Детали обхода: DNS-серверы, прокси, выходы.".into(),
-            Row::Provider(_) => "Пробел — включить или выключить сервер, +/- — выше или ниже в списке.".into(),
-            Row::GroupProxyText => "Команда для Telegram и состояние ключа.".into(),
-            Row::GroupProxyOpenRoom => "Открыть Telegram-комнату для получения ключа.".into(),
-            Row::GroupProxyCopy => "Скопировать команду для получения ключа.".into(),
-            Row::GroupProxyPaste => "Вставить полученный ключ (из буфера обмена или в поле ввода).".into(),
-            Row::CustomDnsText => "Enter — задать свой DNS: IPv4, https://… (DoH) или tls://… (DoT) через пробел.".into(),
-            Row::OwnProxyText => {
-                "Enter — изменить адрес: логин:пароль@адрес:порт (или адрес:порт без пароля).".into()
-            }
-            Row::Report => {
-                "Всё, что нужно, чтобы понять, почему Antigravity отвечает или нет — одним текстом для группы.".into()
-            }
+            Row::Advanced => crate::i18n::tr(
+                "Детали обхода: DNS-серверы, прокси, выходы.",
+                "Bypass details: DNS servers, proxies, exits.",
+            )
+            .into(),
+            Row::Provider(_) => crate::i18n::tr(
+                "Пробел — включить или выключить сервер, +/- — выше или ниже в списке.",
+                "Space — toggle server, +/- — move up or down.",
+            )
+            .into(),
+            Row::GroupProxyText => crate::i18n::tr(
+                "Команда для Telegram и состояние ключа.",
+                "Telegram command and key status.",
+            )
+            .into(),
+            Row::GroupProxyOpenRoom => crate::i18n::tr(
+                "Открыть Telegram-комнату для получения ключа.",
+                "Open Telegram room to get a key.",
+            )
+            .into(),
+            Row::GroupProxyCopy => crate::i18n::tr(
+                "Скопировать команду для получения ключа.",
+                "Copy command to get a key.",
+            )
+            .into(),
+            Row::GroupProxyPaste => crate::i18n::tr(
+                "Вставить полученный ключ (из буфера обмена или в поле ввода).",
+                "Paste received key (from clipboard or input box).",
+            )
+            .into(),
+            Row::CustomDnsText => crate::i18n::tr(
+                "Enter — задать свой DNS: IPv4, https://… (DoH) или tls://… (DoT) через пробел.",
+                "Enter — set custom DNS: IPv4, https://… (DoH) or tls://… (DoT) space-separated.",
+            )
+            .into(),
+            Row::OwnProxyText => crate::i18n::tr(
+                "Enter — изменить адрес: логин:пароль@адрес:порт (или адрес:порт без пароля).",
+                "Enter — edit address: user:pass@host:port (or host:port without password).",
+            )
+            .into(),
+            Row::Report => crate::i18n::tr(
+                "Всё, что нужно, чтобы понять, почему Antigravity отвечает или нет — одним текстом для группы.",
+                "Everything needed to diagnose why Antigravity is or isn't replying — in one text for the group.",
+            )
+            .into(),
         }
     }
 
@@ -861,7 +985,7 @@ impl App {
             Row::Bypass => {
                 let on = self.status.as_ref().is_some_and(|s| s.bypass_on());
                 let state = if on { State::On } else { State::Off };
-                switch_line("", status::BYPASS_TEXT.0, &state, busy, width)
+                switch_line("", status::bypass_text().0, &state, busy, width)
             }
             Row::Install(i) => {
                 let Some(r) = self.status.as_ref().and_then(|s| s.installs.get(i)) else {
@@ -871,7 +995,11 @@ impl App {
                     (None, _) => (
                         "○",
                         Color::DarkGray,
-                        "не найдено — Enter: указать путь".to_string(),
+                        crate::i18n::tr(
+                            "не найдено — Enter: указать путь",
+                            "not found — Enter: specify path",
+                        )
+                        .to_string(),
                     ),
                     (Some(p), patched) => (
                         "●",
@@ -884,9 +1012,9 @@ impl App {
                     ),
                 };
                 let tail = match (&r.path, r.patched) {
-                    (Some(_), Some(true)) => " · пропатчен",
-                    (Some(_), Some(false)) => " · не пропатчен",
-                    (Some(_), None) => " · проверяю…",
+                    (Some(_), Some(true)) => crate::i18n::tr(" · пропатчен", " · patched"),
+                    (Some(_), Some(false)) => crate::i18n::tr(" · не пропатчен", " · unpatched"),
+                    (Some(_), None) => crate::i18n::tr(" · проверяю…", " · checking…"),
                     (None, _) => "",
                 };
                 ListItem::new(Line::from(vec![
@@ -899,8 +1027,12 @@ impl App {
             }
             Row::Advanced => ListItem::new(Line::styled(
                 format!(
-                    "{} Настройки для опытных",
-                    if self.advanced { "▾" } else { "▸" }
+                    "{} {}",
+                    if self.advanced { "▾" } else { "▸" },
+                    crate::i18n::tr(
+                        "Настройки для опытных",
+                        "Advanced settings",
+                    )
                 ),
                 Style::new().fg(Color::Gray),
             )),
@@ -915,14 +1047,17 @@ impl App {
             Row::GroupProxyText => {
                 let pc = crate::hwid::pc_code();
                 let key_text = if crate::settings::group_key().is_empty() {
-                    "ключа нет"
+                    crate::i18n::tr("ключа нет", "no key")
                 } else if crate::group::key_rejected() {
-                    "код перестал работать - получите новый в группе"
+                    crate::i18n::tr(
+                        "код перестал работать - получите новый в группе",
+                        "code stopped working - get a new one in the group",
+                    )
                 } else {
-                    "ключ есть"
+                    crate::i18n::tr("ключ есть", "key present")
                 };
                 ListItem::new(Line::from(vec![
-                    Span::raw("      Команда: "),
+                    Span::raw(crate::i18n::tr("      Команда: ", "      Command: ")),
                     Span::styled(
                         format!("/ag+{pc} - {key_text}"),
                         Style::new().fg(Color::Gray),
@@ -930,44 +1065,53 @@ impl App {
                 ]))
             }
             Row::GroupProxyOpenRoom => ListItem::new(Line::from(vec![Span::styled(
-                "      > Открыть комнату группы",
+                crate::i18n::tr(
+                    "      > Открыть комнату группы",
+                    "      > Open group room",
+                ),
                 Style::new().fg(Color::Cyan),
             )])),
             Row::GroupProxyCopy => ListItem::new(Line::from(vec![Span::styled(
-                "      > Скопировать команду",
+                crate::i18n::tr(
+                    "      > Скопировать команду",
+                    "      > Copy command",
+                ),
                 Style::new().fg(Color::Cyan),
             )])),
             Row::GroupProxyPaste => ListItem::new(Line::from(vec![Span::styled(
-                "      > Вставить ключ из буфера",
+                crate::i18n::tr(
+                    "      > Вставить ключ из буфера",
+                    "      > Paste key from clipboard",
+                ),
                 Style::new().fg(Color::Cyan),
             )])),
             Row::CustomDnsText => {
                 let text = self.custom_dns_text();
                 let shown = if text.is_empty() {
-                    "не задан".to_string()
+                    crate::i18n::tr("не задан", "not set").to_string()
                 } else {
                     text
                 };
                 ListItem::new(Line::from(vec![
-                    Span::raw("      Свой DNS: "),
+                    Span::raw(crate::i18n::tr("      Свой DNS: ", "      Custom DNS: ")),
                     Span::styled(shown, Style::new().fg(Color::Gray)),
                 ]))
             }
             Row::OwnProxyText => {
                 let text = self.own_proxy_text();
                 let shown = if text.is_empty() {
-                    "не задан".to_string()
+                    crate::i18n::tr("не задан", "not set").to_string()
                 } else {
                     text
                 };
                 ListItem::new(Line::from(vec![
-                    Span::raw("      Адрес прокси: "),
+                    Span::raw(crate::i18n::tr("      Адрес прокси: ", "      Proxy address: ")),
                     Span::styled(shown, Style::new().fg(Color::Gray)),
                 ]))
             }
             Row::Report => ListItem::new(Line::from(vec![
                 Span::styled("⎘ ", Style::new().fg(Color::Cyan)),
-                Span::raw("Сохранить отчёт"),
+                Span::raw(crate::i18n::tr("Сохранить отчёт", "Save report")),
             ])),
         }
     }
@@ -980,10 +1124,16 @@ impl App {
         let area = f.area();
         if area.width < MIN_W || area.height < MIN_H {
             f.render_widget(
-                Paragraph::new(format!(
-                    "Окно терминала слишком маленькое: нужно хотя бы {MIN_W}×{MIN_H} (сейчас {}×{}).",
-                    area.width, area.height
-                ))
+                Paragraph::new(match crate::i18n::current() {
+                    crate::i18n::Lang::Ru => format!(
+                        "Окно терминала слишком маленькое: нужно хотя бы {MIN_W}×{MIN_H} (сейчас {}×{}).",
+                        area.width, area.height
+                    ),
+                    crate::i18n::Lang::En => format!(
+                        "Terminal window is too small: need at least {MIN_W}×{MIN_H} (currently {}×{}).",
+                        area.width, area.height
+                    ),
+                })
                 .wrap(Wrap { trim: true }),
                 area,
             );
@@ -1002,11 +1152,18 @@ impl App {
         )];
         if let Some(rel) = &self.update {
             spans.push(Span::styled(
-                format!(
-                    " ⬆ новая версия {}: {} ",
-                    rel.display_version(),
-                    update::RELEASES_LATEST_URL
-                ),
+                match crate::i18n::current() {
+                    crate::i18n::Lang::Ru => format!(
+                        " ⬆ новая версия {}: {} ",
+                        rel.display_version(),
+                        update::RELEASES_LATEST_URL
+                    ),
+                    crate::i18n::Lang::En => format!(
+                        " ⬆ new version {}: {} ",
+                        rel.display_version(),
+                        update::RELEASES_LATEST_URL
+                    ),
+                },
                 Style::new().fg(Color::Black).bg(Color::Yellow),
             ));
         }
@@ -1032,7 +1189,7 @@ impl App {
         let mut lines = vec![
             Line::raw(""),
             Line::styled(
-                "Лицензионный ключ",
+                crate::i18n::tr("Лицензионный ключ", "License key"),
                 Style::new().add_modifier(Modifier::BOLD),
             ),
             Line::raw(""),
@@ -1050,23 +1207,32 @@ impl App {
                 .filter(|c| c.is_ascii_alphanumeric())
                 .count();
             let why = if normalized != 24 {
-                "В ключе 24 буквы и цифры (дефис не считается)."
+                crate::i18n::tr(
+                    "В ключе 24 буквы и цифры (дефис не считается).",
+                    "Key must contain 24 letters and digits (hyphens excluded).",
+                )
             } else {
-                "Ключ не подходит к этой версии анлокера."
+                crate::i18n::tr(
+                    "Ключ не подходит к этой версии анлокера.",
+                    "Key does not match this unlocker version.",
+                )
             };
             lines.push(Line::styled(why, Style::new().fg(Color::Red)));
             lines.push(Line::raw(""));
         }
         lines.push(Line::styled(
-            format!(
-                "Ключ можно взять в группе: {}",
-                crate::gui::TELEGRAM_KEYS_URL
-            ),
+            match crate::i18n::current() {
+                crate::i18n::Lang::Ru => format!("Ключ можно взять в группе: {}", crate::gui::TELEGRAM_KEYS_URL),
+                crate::i18n::Lang::En => format!("Get a key in the group: {}", crate::gui::TELEGRAM_KEYS_URL),
+            },
             Style::new().fg(Color::Gray),
         ));
         lines.push(Line::raw(""));
         lines.push(Line::styled(
-            "Enter — продолжить · Ctrl+U — стереть · Esc — выход",
+            crate::i18n::tr(
+                "Enter — продолжить · Ctrl+U — стереть · Esc — выход",
+                "Enter — continue · Ctrl+U — clear · Esc — quit",
+            ),
             Style::new().fg(Color::DarkGray),
         ));
         f.render_widget(
@@ -1087,7 +1253,7 @@ impl App {
         }
         .min(area.height / 3);
         let vpn_h = if facts.as_ref().is_some_and(|f| f.relay_uses_vpn) {
-            wrapped_height(status::VPN_TRAFFIC_NOTICE, area.width)
+            wrapped_height(status::vpn_traffic_notice(), area.width)
         } else {
             0
         };
@@ -1108,7 +1274,7 @@ impl App {
         self.draw_card(f, card, headline.as_ref());
         if vpn_h != 0 {
             f.render_widget(
-                Paragraph::new(status::VPN_TRAFFIC_NOTICE)
+                Paragraph::new(status::vpn_traffic_notice())
                     .style(Style::new().fg(Color::Yellow))
                     .wrap(Wrap { trim: true }),
                 vpn,
@@ -1144,7 +1310,11 @@ impl App {
     fn draw_card(&self, f: &mut Frame, area: Rect, headline: Option<&status::Headline>) {
         let Some(h) = headline else {
             f.render_widget(
-                Paragraph::new("Проверяю систему…").block(Block::new().borders(Borders::ALL)),
+                Paragraph::new(crate::i18n::tr(
+                    "Проверяю систему…",
+                    "Checking system…",
+                ))
+                .block(Block::new().borders(Borders::ALL)),
                 area,
             );
             return;
@@ -1179,9 +1349,10 @@ impl App {
     }
 
     fn draw_journal(&self, f: &mut Frame, area: Rect) {
+        let title = crate::i18n::tr(" Журнал ", " Log ");
         let block = Block::new()
             .borders(Borders::TOP)
-            .title(Span::styled(" Журнал ", Style::new().fg(Color::Gray)))
+            .title(Span::styled(title, Style::new().fg(Color::Gray)))
             .border_style(Style::new().fg(Color::DarkGray));
         let inner = block.inner(area);
         f.render_widget(block, area);
@@ -1224,17 +1395,21 @@ impl App {
             self.toast = None;
         }
         let offered = match self.facts().and_then(|f| status::headline(&f).action) {
-            Some(Action::EnableAll) => " · a — включить всё",
-            Some(Action::Repair) => " · r — починить",
-            Some(Action::Verify) => " · v — пройти верификацию",
+            Some(Action::EnableAll) => crate::i18n::tr(" · a — включить всё", " · a — enable all"),
+            Some(Action::Repair) => crate::i18n::tr(" · r — починить", " · r — repair"),
+            Some(Action::Verify) => crate::i18n::tr(" · v — пройти верификацию", " · v — verify"),
             _ => "",
         };
         let report = if crate::gui::report::ENABLED {
-            " · o — отчёт"
+            crate::i18n::tr(" · o — отчёт", " · o — report")
         } else {
             ""
         };
-        let keys = format!("↑↓ выбор · Пробел/Enter — вкл/выкл{offered}{report} · q — выход");
+        let lang_hint = format!(" · l — {}", crate::i18n::current().short_label());
+        let keys = match crate::i18n::current() {
+            crate::i18n::Lang::Ru => format!("↑↓ выбор · Пробел/Enter — вкл/выкл{offered}{report}{lang_hint} · q — выход"),
+            crate::i18n::Lang::En => format!("↑↓ select · Space/Enter — toggle{offered}{report}{lang_hint} · q — quit"),
+        };
         f.render_widget(
             Paragraph::new(keys).style(Style::new().fg(Color::DarkGray)),
             area,
@@ -1244,28 +1419,38 @@ impl App {
     fn draw_input(&self, f: &mut Frame, area: Rect) {
         let (title, hint, text, error) = match &self.input {
             Some(Input::Path { text, error }) => (
-                " Путь к Antigravity ",
-                "Папка установки Antigravity, IDE или CLI. Можно указать вложенную — корень будет найден сам.",
+                crate::i18n::tr(" Путь к Antigravity ", " Path to Antigravity "),
+                crate::i18n::tr(
+                    "Папка установки Antigravity, IDE или CLI. Можно указать вложенную — корень будет найден сам.",
+                    "Installation folder for Antigravity, IDE, or CLI. A nested folder works too.",
+                ),
                 text,
                 error.as_deref(),
             ),
             Some(Input::CustomDns { text }) => (
-                " Свой DNS ",
-                "IPv4-адреса DNS-серверов через пробел. Сервер участвует в пуле наравне с остальными, ответ сверяется с эталонным. Пустая строка — убрать.",
+                crate::i18n::tr(" Свой DNS ", " Custom DNS "),
+                crate::i18n::tr(
+                    "IPv4-адреса DNS-серверов через пробел. Сервер участвует в пуле наравне с остальными, ответ сверяется с эталонным. Пустая строка — убрать.",
+                    "Space-separated DNS server addresses. Empty line removes it.",
+                ),
                 text,
                 None,
             ),
             Some(Input::OwnProxy { text }) => (
-                " Свой HTTP-прокси ",
-                "Формат: логин:пароль@адрес:порт — или просто адрес:порт, если пароля нет. \
-                 Например ivan:secret@203.0.113.9:3128. Только HTTP-прокси. \
-                 Пустая строка — убрать прокси.",
+                crate::i18n::tr(" Свой HTTP-прокси ", " Own HTTP proxy "),
+                crate::i18n::tr(
+                    "Формат: логин:пароль@адрес:порт — или просто адрес:порт, если пароля нет. Например ivan:secret@203.0.113.9:3128. Только HTTP-прокси. Пустая строка — убрать прокси.",
+                    "Format: user:pass@host:port or host:port. HTTP proxies only. Empty line removes it.",
+                ),
                 text,
                 None,
             ),
             Some(Input::GroupKey { text }) => (
-                " Ключ группового прокси ",
-                "Буфер обмена недоступен или пуст. Вставьте ключ сюда (Ctrl+Shift+V или правая кнопка мыши в терминале) или наберите его.",
+                crate::i18n::tr(" Ключ группового прокси ", " Group proxy key "),
+                crate::i18n::tr(
+                    "Буфер обмена недоступен или пуст. Вставьте ключ сюда (Ctrl+Shift+V или правая кнопка мыши в терминале) или наберите его.",
+                    "Clipboard unavailable or empty. Paste or type the key here.",
+                ),
                 text,
                 None,
             ),
@@ -1300,7 +1485,10 @@ impl App {
             lines.push(Line::styled(e.to_string(), Style::new().fg(Color::Red)));
         }
         lines.push(Line::styled(
-            "Enter — применить · Esc — отмена",
+            crate::i18n::tr(
+                "Enter — применить · Esc — отмена",
+                "Enter — apply · Esc — cancel",
+            ),
             Style::new().fg(Color::DarkGray),
         ));
         f.render_widget(Clear, popup);
@@ -1325,10 +1513,10 @@ fn switch_line(
     width: u16,
 ) -> ListItem<'static> {
     let (badge, color) = match state {
-        State::On => ("[вкл ]", Color::Green),
-        State::Partial(_) => ("[вкл~]", Color::Yellow),
-        State::Off | State::OffNote(_) => ("[выкл]", Color::DarkGray),
-        State::Blocked(_) => ("[ -- ]", Color::Yellow),
+        State::On => (crate::i18n::tr("[вкл ]", "[ on ]"), Color::Green),
+        State::Partial(_) => (crate::i18n::tr("[вкл~]", "[part]"), Color::Yellow),
+        State::Off | State::OffNote(_) => (crate::i18n::tr("[выкл]", "[off ]"), Color::DarkGray),
+        State::Blocked(_) => (crate::i18n::tr("[ -- ]", "[ -- ]"), Color::Yellow),
     };
     let color = if busy { Color::DarkGray } else { color };
     let mut spans = vec![
@@ -1337,7 +1525,7 @@ fn switch_line(
         Span::raw(format!(" {title}")),
     ];
     if let Some(note) = state.note() {
-        let used = (indent.chars().count() + 7 + title.chars().count() + 3) as u16;
+        let used = (indent.chars().count() + badge.chars().count() + 1 + title.chars().count() + 3) as u16;
         let room = width.saturating_sub(used + 2) as usize;
         if room > 8 {
             let note: String = if note.chars().count() > room {

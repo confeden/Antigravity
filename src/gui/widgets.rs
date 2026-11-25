@@ -237,11 +237,22 @@ pub fn ghost(ui: &mut egui::Ui, text: &str) -> egui::Response {
 
 /// Small grey explanatory text — the line under a switch that says what it does.
 pub fn hint(ui: &mut egui::Ui, text: &str) {
-    ui.label(
-        egui::RichText::new(text)
-            .color(theme::palette(ui).muted)
-            .size(12.5),
-    );
+    wrapped_label(ui, text, 12.5, theme::palette(ui).muted);
+}
+
+/// Renders text wrapped to the available width.
+pub fn wrapped_label(
+    ui: &mut egui::Ui,
+    text: &str,
+    size: f32,
+    color: egui::Color32,
+) -> egui::Response {
+    ui.label(egui::RichText::new(text).color(color).size(size))
+}
+
+/// Attaches a hover tooltip to `resp`.
+pub fn hover_text(resp: egui::Response, _ui: &egui::Ui, text: &str) -> egui::Response {
+    resp.on_hover_text(text)
 }
 
 /// The round «i» itself. `lit` while its text is showing.
@@ -264,7 +275,7 @@ pub fn info_button(ui: &mut egui::Ui, lit: bool) -> egui::Response {
         );
     }
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
-        .on_hover_text("Что это")
+        .on_hover_text(crate::i18n::tr("Что это", "What is this"))
 }
 
 /// A coloured status dot, for install rows and provider rows.

@@ -15,6 +15,9 @@ pub fn view(app: &mut App, ui: &mut egui::Ui) {
     // the margin back itself instead of running to the window edge.
     ui.set_max_width(ui.available_width() - 14.0);
     ui.add_space(6.0);
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+        super::main_view::lang_toggle(app, ui);
+    });
     app.update_banner(ui);
 
     ui.vertical_centered(|ui| {
@@ -46,7 +49,16 @@ pub fn view(app: &mut App, ui: &mut egui::Ui) {
     let can_continue = normalized_len == 24 && !in_cooldown;
 
     widgets::card(ui, |ui| {
-        ui.label(egui::RichText::new("Лицензионный ключ").size(15.0).strong());
+        ui.label(
+            egui::RichText::new(
+                crate::i18n::tr(
+                    "Лицензионный ключ",
+                    "License key",
+                ),
+            )
+            .size(15.0)
+            .strong(),
+        );
         ui.add_space(8.0);
 
         let field = egui::TextEdit::singleline(&mut app.key_input)
@@ -55,9 +67,14 @@ pub fn view(app: &mut App, ui: &mut egui::Ui) {
             .margin(egui::Margin::symmetric(10, 9))
             .desired_width(f32::INFINITY)
             .font(egui::TextStyle::Monospace);
-        let resp = ui
-            .add(field)
-            .on_hover_text("Правый клик — вставить ключ из буфера обмена (поле очищается).");
+        let resp = widgets::hover_text(
+            ui.add(field),
+            ui,
+            crate::i18n::tr(
+                "Правый клик — вставить ключ из буфера обмена (поле очищается).",
+                "Right-click to paste key from clipboard (replaces field).",
+            ),
+        );
         if app.key_needs_focus {
             resp.request_focus();
             app.key_needs_focus = false;
@@ -86,9 +103,22 @@ pub fn view(app: &mut App, ui: &mut egui::Ui) {
         ui.add_space(10.0);
         let mut pressed = false;
         ui.horizontal(|ui| {
-            pressed = widgets::primary(ui, "Продолжить", can_continue).clicked();
+            pressed = widgets::primary(
+                ui,
+                crate::i18n::tr("Продолжить", "Continue"),
+                can_continue,
+            )
+            .clicked();
             ui.add_space(8.0);
-            if widgets::ghost(ui, "Взять ключ из группы").clicked() {
+            if widgets::ghost(
+                ui,
+                crate::i18n::tr(
+                    "Взять ключ из группы",
+                    "Get key from group",
+                ),
+            )
+            .clicked()
+            {
                 crate::utils::open_url(TELEGRAM_KEYS_URL);
             }
         });
@@ -134,10 +164,14 @@ pub fn view(app: &mut App, ui: &mut egui::Ui) {
 
         if app.key_rejected {
             ui.add_space(8.0);
-            ui.label(
-                egui::RichText::new("Ключ не подходит к этой версии анлокера.")
-                    .color(theme::palette(ui).bad)
-                    .size(13.0),
+            widgets::wrapped_label(
+                ui,
+                crate::i18n::tr(
+                    "Ключ не подходит к этой версии анлокера.",
+                    "Key does not match this unlocker version.",
+                ),
+                13.0,
+                theme::palette(ui).bad,
             );
         }
     });
@@ -154,17 +188,22 @@ pub fn view(app: &mut App, ui: &mut egui::Ui) {
 
     if in_cooldown_post {
         ui.add_space(8.0);
-        ui.label(
-            egui::RichText::new("Подождите…")
-                .color(theme::palette(ui).muted)
-                .size(12.5),
+        widgets::wrapped_label(
+            ui,
+            crate::i18n::tr("Подождите…", "Please wait…"),
+            12.5,
+            theme::palette(ui).muted,
         );
     } else if !app.key_input.trim().is_empty() && normalized_len != 24 {
         ui.add_space(8.0);
-        ui.label(
-            egui::RichText::new("Введите ключ подходящей длины")
-                .color(theme::palette(ui).muted)
-                .size(12.5),
+        widgets::wrapped_label(
+            ui,
+            crate::i18n::tr(
+                "Введите ключ подходящей длины",
+                "Enter a key of the required length",
+            ),
+            12.5,
+            theme::palette(ui).muted,
         );
     }
 }

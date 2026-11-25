@@ -99,6 +99,7 @@ fn install_font(ctx: &egui::Context) {
             .or_default()
             .insert(0, name.to_string());
     }
+
     fonts.font_data.insert(
         "Lucide".into(),
         std::sync::Arc::new(egui::FontData::from_static(include_bytes!(
