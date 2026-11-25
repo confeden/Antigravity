@@ -60,7 +60,7 @@ pub(super) struct ViewState {
     page: Page,
     setup: Option<Setup>,
     focus_setup: bool,
-    saving_proxy: Option<Cap>,
+    pub(super) saving_proxy: Option<Cap>,
     proxy_saved: Option<(Cap, Result<(), String>)>,
     log_copied: Option<(Instant, bool)>,
     confirm_deactivation: bool,

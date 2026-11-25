@@ -362,36 +362,48 @@ enum FetchOutcome {
     Done,
 }
 
+enum HttpEvent<'a> {
+    Start(Option<u64>),
+    Chunk(&'a [u8]),
+}
+
+fn push_chunk(
+    received: &mut usize,
+    max_bytes: usize,
+    slice: &[u8],
+    on_event: &mut dyn FnMut(HttpEvent<'_>) -> Result<(), String>,
+) -> Result<(), String> {
+    let next = received
+        .checked_add(slice.len())
+        .ok_or_else(|| "response size overflow".to_string())?;
+    if next > max_bytes {
+        return Err(format!("response exceeded limit ({} bytes)", max_bytes));
+    }
+    *received = next;
+    on_event(HttpEvent::Chunk(slice))
+}
+
 fn stream_body(
     stream: &mut dyn Read,
     initial: &[u8],
     is_chunked: bool,
     content_len: Option<u64>,
     max_bytes: usize,
-    on_chunk: &mut dyn FnMut(&[u8]) -> Result<(), String>,
+    on_event: &mut dyn FnMut(HttpEvent<'_>) -> Result<(), String>,
 ) -> Result<(), String> {
     let mut received: usize = 0;
-    let mut emit = |slice: &[u8]| -> Result<(), String> {
-        let next = received
-            .checked_add(slice.len())
-            .ok_or_else(|| "response size overflow".to_string())?;
-        if next > max_bytes {
-            return Err(format!("response exceeded limit ({} bytes)", max_bytes));
-        }
-        received = next;
-        on_chunk(slice)
-    };
-
     let mut buf = [0u8; 16 * 1024];
     if is_chunked {
         let mut dec = ChunkDecoder::default();
         if !initial.is_empty() {
-            dec.push(initial, &mut emit)?;
+            dec.push(initial, &mut |s| push_chunk(&mut received, max_bytes, s, on_event))?;
         }
         while !dec.done {
             match stream.read(&mut buf) {
                 Ok(0) => break,
-                Ok(n) => dec.push(&buf[..n], &mut emit)?,
+                Ok(n) => {
+                    dec.push(&buf[..n], &mut |s| push_chunk(&mut received, max_bytes, s, on_event))?;
+                }
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
                 Err(e) => return Err(format!("error reading chunked response: {}", e)),
@@ -404,7 +416,7 @@ fn stream_body(
     }
 
     if !initial.is_empty() {
-        emit(initial)?;
+        push_chunk(&mut received, max_bytes, initial, on_event)?;
     }
     loop {
         if content_len.is_some_and(|l| (received as u64) >= l) {
@@ -412,7 +424,7 @@ fn stream_body(
         }
         match stream.read(&mut buf) {
             Ok(0) => break,
-            Ok(n) => emit(&buf[..n])?,
+            Ok(n) => push_chunk(&mut received, max_bytes, &buf[..n], on_event)?,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
                 if content_len.is_some_and(|l| (received as u64) < l) {
@@ -439,8 +451,7 @@ fn http_get_once(
     accept: &str,
     io_timeout: Duration,
     max_bytes: usize,
-    on_start: &mut dyn FnMut(Option<u64>),
-    on_chunk: &mut dyn FnMut(&[u8]) -> Result<(), String>,
+    on_event: &mut dyn FnMut(HttpEvent<'_>) -> Result<(), String>,
 ) -> Result<FetchOutcome, String> {
     let (host, port, path) = parse_https_url(url)?;
     let mut sock = connect_tcp(&host, port, io_timeout)?;
@@ -489,14 +500,14 @@ fn http_get_once(
     if content_len.is_some_and(|l| l > max_bytes as u64) {
         return Err(format!("response exceeded limit ({} bytes)", max_bytes));
     }
-    on_start(content_len);
+    on_event(HttpEvent::Start(content_len))?;
     stream_body(
         &mut stream,
         &initial_body,
         is_chunked,
         content_len,
         max_bytes,
-        on_chunk,
+        on_event,
     )?;
     Ok(FetchOutcome::Done)
 }
@@ -506,12 +517,11 @@ fn http_get_stream(
     accept: &str,
     io_timeout: Duration,
     max_bytes: usize,
-    on_start: &mut dyn FnMut(Option<u64>),
-    on_chunk: &mut dyn FnMut(&[u8]) -> Result<(), String>,
+    on_event: &mut dyn FnMut(HttpEvent<'_>) -> Result<(), String>,
 ) -> Result<(), String> {
     let mut current = url.to_string();
     for _ in 0..=MAX_REDIRECTS {
-        match http_get_once(&current, accept, io_timeout, max_bytes, on_start, on_chunk)? {
+        match http_get_once(&current, accept, io_timeout, max_bytes, on_event)? {
             FetchOutcome::Redirect(next) => current = next,
             FetchOutcome::Done => return Ok(()),
         }
@@ -521,17 +531,12 @@ fn http_get_stream(
 
 fn fetch_bytes(url: &str, accept: &str, timeout: Duration, max_bytes: usize) -> Result<Vec<u8>, String> {
     let mut body = Vec::new();
-    http_get_stream(
-        url,
-        accept,
-        timeout,
-        max_bytes,
-        &mut |_| {},
-        &mut |slice| {
+    http_get_stream(url, accept, timeout, max_bytes, &mut |ev| {
+        if let HttpEvent::Chunk(slice) = ev {
             body.extend_from_slice(slice);
-            Ok(())
-        },
-    )?;
+        }
+        Ok(())
+    })?;
     Ok(body)
 }
 
@@ -791,20 +796,23 @@ fn download_to_file(
         "application/octet-stream",
         DOWNLOAD_IO_TIMEOUT,
         MAX_DOWNLOAD_BYTES,
-        &mut |total| {
-            total_hint = total;
-            on_progress(0, total);
-        },
-        &mut |slice| {
-            file.write_all(slice)
-                .map_err(|e| format!("ошибка записи обновления: {e}"))?;
-            hasher.update(slice);
-            downloaded += slice.len() as u64;
-            if last_report.elapsed() >= Duration::from_millis(120) {
-                last_report = Instant::now();
-                on_progress(downloaded, total_hint);
+        &mut |ev| match ev {
+            HttpEvent::Start(total) => {
+                total_hint = total;
+                on_progress(0, total);
+                Ok(())
             }
-            Ok(())
+            HttpEvent::Chunk(slice) => {
+                file.write_all(slice)
+                    .map_err(|e| format!("ошибка записи обновления: {e}"))?;
+                hasher.update(slice);
+                downloaded += slice.len() as u64;
+                if last_report.elapsed() >= Duration::from_millis(120) {
+                    last_report = Instant::now();
+                    on_progress(downloaded, total_hint);
+                }
+                Ok(())
+            }
         },
     )?;
     file.flush()
