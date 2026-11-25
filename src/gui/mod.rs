@@ -11,6 +11,7 @@ pub(crate) mod renderer;
 pub(crate) mod report;
 pub(crate) mod status;
 mod theme;
+mod tray;
 mod widgets;
 
 use eframe::egui;
@@ -19,7 +20,7 @@ use std::sync::mpsc::{channel, Receiver};
 use crate::gate;
 use crate::ops::{self, Cmd, Event, Level, Status, Worker};
 use crate::settings::Settings;
-use crate::update::{self, ReleaseInfo};
+use crate::update::{self, ReleaseInfo, UpdateEvent};
 
 pub const TELEGRAM_GROUP_URL: &str = "https://t.me/nova_txt";
 /// The room the free keys are pinned in (spec item 9), not the group root.
@@ -39,6 +40,31 @@ enum Screen {
     Deactivated,
 }
 
+pub(super) enum UpdateCheckState {
+    Idle,
+    Checking,
+    UpToDate(String),
+    Failed(String),
+}
+
+enum UpdateBanner {
+    Available(ReleaseInfo),
+    Downloading {
+        version: String,
+        downloaded: u64,
+        total: Option<u64>,
+    },
+    PendingRestart {
+        version: String,
+        exe: std::path::PathBuf,
+    },
+    Failed {
+        release: ReleaseInfo,
+        reason: String,
+        needs_elevation: bool,
+    },
+}
+
 pub struct App {
     screen: Screen,
     key_input: String,
@@ -55,8 +81,14 @@ pub struct App {
 
     /// Raised once a newer release is on GitHub and never lowered — the banner
     /// has to survive the move from the licence screen to the main one.
-    update: Option<ReleaseInfo>,
-    update_rx: Receiver<ReleaseInfo>,
+    update: Option<UpdateBanner>,
+    pub(super) update_check: UpdateCheckState,
+    pub(super) update_handle: update::UpdateHandle,
+    update_rx: Receiver<UpdateEvent>,
+    tray: Option<tray::TrayHandle>,
+    tray_rx: Option<Receiver<tray::TrayEvent>>,
+    force_quit: bool,
+    last_tray_tip: String,
 
     worker: Worker,
     events: Receiver<Event>,
@@ -108,6 +140,12 @@ pub struct App {
     theme: crate::settings::ThemeMode,
 }
 
+impl UpdateBanner {
+    pub(super) fn is_busy(&self) -> bool {
+        matches!(self, Self::Downloading { .. } | Self::PendingRestart { .. })
+    }
+}
+
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         theme::apply(&cc.egui_ctx);
@@ -117,7 +155,8 @@ impl App {
 
         let (up_tx, update_rx) = channel();
         let up_ctx = cc.egui_ctx.clone();
-        update::spawn_watch(up_tx, Box::new(move || up_ctx.request_repaint()));
+        let update_handle =
+            update::spawn_watch(up_tx, Box::new(move || up_ctx.request_repaint()));
 
         // The worker wakes the UI itself: egui sleeps until something asks it to
         // repaint, so an event that only lands in a channel is an event the user
@@ -154,7 +193,13 @@ impl App {
             key_attempts: Vec::new(),
             key_cooldown: std::time::Duration::from_millis(100),
             update: None,
+            update_check: UpdateCheckState::Idle,
+            update_handle,
             update_rx,
+            tray: None,
+            tray_rx: None,
+            force_quit: false,
+            last_tray_tip: String::new(),
             worker,
             events,
             status: None,
@@ -186,23 +231,207 @@ impl App {
         self.busy.is_some()
     }
 
-    /// The "новая версия" button, drawn on both screens (spec item 10: it must
-    /// not disappear after the key is accepted).
-    fn update_banner(&self, ui: &mut egui::Ui) {
-        let Some(rel) = &self.update else { return };
-        let label = format!("⬆  Доступна новая версия — {}", rel.display_version());
+    /// The update banner, drawn on both screens (spec item 10: survives screen change).
+    fn update_banner(&mut self, ui: &mut egui::Ui) {
+        let Some(state) = &self.update else { return };
         let colors = theme::palette(ui);
-        let btn = egui::Button::new(egui::RichText::new(label).color(colors.on_accent))
-            .fill(colors.accent)
-            .corner_radius(egui::CornerRadius::same(theme::RADIUS_SMALL))
-            .min_size(egui::vec2(ui.available_width(), 32.0));
-        if ui.add(btn).clicked() {
-            // Always /latest, never the tag URL from the API response: the point
-            // is to land the user on whatever is newest when they click, not on
-            // the release this process happened to see hours ago.
-            crate::utils::open_url(update::RELEASES_LATEST_URL);
+        let mut elevate_for_update = false;
+        let release_url = |rel: &ReleaseInfo| {
+            if rel.html_url.trim().is_empty() {
+                update::releases_latest_url()
+            } else {
+                rel.html_url.clone()
+            }
+        };
+        match state {
+            UpdateBanner::Available(rel) => {
+                let label = format!("⬆  Доступна новая версия {} — скачать и обновить", rel.display_version());
+                let gh_w = 82.0;
+                let main_w = (ui.available_width() - gh_w - ui.spacing().item_spacing.x).max(160.0);
+                ui.horizontal(|ui| {
+                    let btn = egui::Button::new(egui::RichText::new(label).color(colors.on_accent))
+                        .fill(colors.accent)
+                        .corner_radius(egui::CornerRadius::same(theme::RADIUS_SMALL))
+                        .min_size(egui::vec2(main_w, 32.0));
+                    let resp = ui.add(btn);
+                    if let Some(body) = rel.body.as_deref().map(str::trim).filter(|b| !b.is_empty()) {
+                        if resp.clone().on_hover_text(body).clicked() {
+                            self.update_handle.install_now(rel.clone());
+                        }
+                    } else if resp.clicked() {
+                        self.update_handle.install_now(rel.clone());
+                    }
+                    let gh = egui::Button::new("GitHub").min_size(egui::vec2(gh_w, 32.0));
+                    if ui.add(gh).clicked() {
+                        crate::utils::open_url(&release_url(rel));
+                    }
+                });
+            }
+            UpdateBanner::Downloading {
+                version,
+                downloaded,
+                total,
+            } => {
+                let mb = *downloaded as f64 / (1024.0 * 1024.0);
+                let text = match total {
+                    Some(t) if *t > 0 => {
+                        let pct = ((*downloaded as f64 / *t as f64) * 100.0).min(100.0);
+                        format!("⬇  Обновление {version} — {pct:.0}% ({mb:.1} МБ)")
+                    }
+                    _ => format!("⬇  Скачиваю обновление {version}… ({mb:.1} МБ)"),
+                };
+                ui.label(egui::RichText::new(text).color(colors.accent_text).size(13.0));
+                if let Some(t) = total.filter(|&t| t > 0) {
+                    let frac = (*downloaded as f32 / t as f32).clamp(0.0, 1.0);
+                    ui.add(egui::ProgressBar::new(frac).desired_height(6.0));
+                } else {
+                    ui.add(egui::ProgressBar::new(0.0).desired_height(6.0).animate(true));
+                }
+            }
+            UpdateBanner::PendingRestart { version, .. } => {
+                let text = format!(
+                    "✓  Обновление {version} скачано — перезапуск после завершения операции…"
+                );
+                ui.label(egui::RichText::new(text).color(colors.ok).size(13.0));
+            }
+            UpdateBanner::Failed {
+                release,
+                reason,
+                needs_elevation,
+            } => {
+                let label = if *needs_elevation {
+                    format!(
+                        "🛡  Обновление {} требует прав администратора — перезапустить",
+                        release.display_version()
+                    )
+                } else {
+                    format!(
+                        "⬆  Обновление {} не поставилось само — открыть GitHub",
+                        release.display_version()
+                    )
+                };
+                let gh_w = if *needs_elevation { 82.0 } else { 0.0 };
+                let main_w = if *needs_elevation {
+                    (ui.available_width() - gh_w - ui.spacing().item_spacing.x).max(160.0)
+                } else {
+                    ui.available_width()
+                };
+                ui.horizontal(|ui| {
+                    let btn = egui::Button::new(egui::RichText::new(label).color(colors.on_accent))
+                        .fill(colors.warn)
+                        .corner_radius(egui::CornerRadius::same(theme::RADIUS_SMALL))
+                        .min_size(egui::vec2(main_w, 32.0));
+                    if ui.add(btn).on_hover_text(reason).clicked() {
+                        if *needs_elevation {
+                            elevate_for_update = true;
+                        } else {
+                            crate::utils::open_url(&release_url(release));
+                        }
+                    }
+                    if *needs_elevation {
+                        let gh = egui::Button::new("GitHub").min_size(egui::vec2(gh_w, 32.0));
+                        if ui.add(gh).clicked() {
+                            crate::utils::open_url(&release_url(release));
+                        }
+                    }
+                });
+            }
+        }
+        if elevate_for_update {
+            self.request_update_elevation();
         }
         ui.add_space(10.0);
+    }
+
+    fn minimize_to_tray_enabled(&self) -> bool {
+        self.status.as_ref().is_some_and(|s| s.minimize_to_tray)
+    }
+
+    fn sync_tray(&mut self, ctx: &egui::Context) {
+        let want = cfg!(target_os = "windows")
+            && matches!(self.screen, Screen::Main)
+            && self.minimize_to_tray_enabled()
+            && !self.force_quit;
+        if want && self.tray.is_none() {
+            let wake_ctx = ctx.clone();
+            if let Some((handle, rx)) = tray::spawn(Box::new(move || wake_ctx.request_repaint())) {
+                self.tray = Some(handle);
+                self.tray_rx = Some(rx);
+                self.last_tray_tip.clear();
+            }
+        } else if !want && self.tray.is_some() {
+            self.tray = None;
+            self.tray_rx = None;
+            self.last_tray_tip.clear();
+        }
+        if let Some(handle) = &self.tray {
+            let label = self.status.as_ref().map(|s| {
+                let facts = status::Facts::read(s, &self.gate, self.gate_at.elapsed());
+                status::headline(&facts).title
+            });
+            let tip = tray::format_tooltip(label.as_deref());
+            if tip != self.last_tray_tip {
+                handle.set_tooltip(&tip);
+                self.last_tray_tip = tip;
+            }
+        }
+    }
+
+    fn handle_tray_and_close(&mut self, ctx: &egui::Context) {
+        let mut events = Vec::new();
+        if let Some(rx) = &self.tray_rx {
+            while let Ok(ev) = rx.try_recv() {
+                events.push(ev);
+            }
+        }
+        for ev in events {
+            match ev {
+                tray::TrayEvent::Show => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
+                tray::TrayEvent::Quit => {
+                    self.force_quit = true;
+                    self.tray = None;
+                    self.tray_rx = None;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+        }
+        if ctx.input(|i| i.viewport().close_requested())
+            && self.tray.is_some()
+            && tray::close_behavior(
+                matches!(self.screen, Screen::Main),
+                self.minimize_to_tray_enabled(),
+                self.force_quit,
+            ) == tray::CloseBehavior::HideToTray
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        }
+    }
+
+    fn relaunch_elevated_and_exit(&mut self, params: &str) {
+        #[cfg(target_os = "windows")]
+        {
+            self.tray = None;
+            self.tray_rx = None;
+            let relaunched = if params.is_empty() {
+                crate::utils::relaunch_elevated()
+            } else {
+                crate::utils::relaunch_elevated_with(params)
+            };
+            if relaunched {
+                std::process::exit(0);
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        let _ = params;
+    }
+
+    fn request_update_elevation(&mut self) {
+        self.relaunch_elevated_and_exit(update::INSTALL_UPDATE_FLAG);
     }
 
     /// Re-launches this exe elevated and closes the current window.
@@ -211,18 +440,59 @@ impl App {
     /// process on Windows and eframe owns the message loop — so the only honest
     /// button is one that starts again. If the user dismisses the UAC prompt
     /// nothing happens and the window stays as it was.
-    fn request_elevation(&self) {
-        #[cfg(target_os = "windows")]
-        {
-            if crate::utils::relaunch_elevated() {
-                std::process::exit(0);
-            }
-        }
+    fn request_elevation(&mut self) {
+        self.relaunch_elevated_and_exit("");
     }
 
     fn drain_events(&mut self) {
-        while let Ok(rel) = self.update_rx.try_recv() {
-            self.update = Some(rel);
+        while let Ok(ev) = self.update_rx.try_recv() {
+            match ev {
+                UpdateEvent::Checking => {
+                    self.update_check = UpdateCheckState::Checking;
+                }
+                UpdateEvent::UpToDate { version, latest } => {
+                    self.update_check =
+                        UpdateCheckState::UpToDate(update::up_to_date_label(&version, &latest));
+                    if matches!(self.update, Some(UpdateBanner::Available(_))) {
+                        self.update = None;
+                    }
+                }
+                UpdateEvent::CheckFailed(reason) => {
+                    self.update_check = UpdateCheckState::Failed(reason);
+                }
+                UpdateEvent::Available(rel) => {
+                    self.update_check = UpdateCheckState::Idle;
+                    self.update = Some(UpdateBanner::Available(rel));
+                }
+                UpdateEvent::Downloading {
+                    version,
+                    downloaded,
+                    total,
+                } => {
+                    self.update_check = UpdateCheckState::Idle;
+                    self.update = Some(UpdateBanner::Downloading {
+                        version,
+                        downloaded,
+                        total,
+                    });
+                }
+                UpdateEvent::ReadyToRestart { version, exe } => {
+                    self.update_check = UpdateCheckState::Idle;
+                    self.update = Some(UpdateBanner::PendingRestart { version, exe });
+                }
+                UpdateEvent::Failed {
+                    release,
+                    reason,
+                    needs_elevation,
+                } => {
+                    self.update_check = UpdateCheckState::Idle;
+                    self.update = Some(UpdateBanner::Failed {
+                        release,
+                        reason,
+                        needs_elevation,
+                    });
+                }
+            }
         }
         while let Ok(signal) = self.gate_rx.try_recv() {
             match signal {
@@ -267,6 +537,45 @@ impl App {
                 }
             }
         }
+        self.maybe_finish_update();
+    }
+
+    fn maybe_finish_update(&mut self) {
+        if self.is_busy() || self.main_view.saving_proxy.is_some() {
+            return;
+        }
+        let Some((version, exe)) = (match &self.update {
+            Some(UpdateBanner::PendingRestart { version, exe }) => {
+                Some((version.clone(), exe.clone()))
+            }
+            _ => None,
+        }) else {
+            return;
+        };
+        match update::relaunch_updated(&exe, update::current_version()) {
+            Ok(()) => {
+                self.tray = None;
+                self.tray_rx = None;
+                std::process::exit(0);
+            }
+            Err(reason) => {
+                let release = ReleaseInfo {
+                    tag_name: format!("v{version}"),
+                    html_url: update::releases_latest_url(),
+                    name: None,
+                    body: None,
+                    published_at: None,
+                    prerelease: false,
+                    draft: false,
+                    assets: Vec::new(),
+                };
+                self.update = Some(UpdateBanner::Failed {
+                    release,
+                    reason,
+                    needs_elevation: false,
+                });
+            }
+        }
     }
 }
 
@@ -286,6 +595,8 @@ impl eframe::App for App {
             renderer::confirm();
         }
         self.drain_events();
+        self.sync_tray(ui.ctx());
+        self.handle_tray_and_close(ui.ctx());
 
         match self.screen {
             Screen::Main => {
@@ -415,7 +726,7 @@ fn title() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::without_source_location;
+    use super::{tray, without_source_location};
 
     #[test]
     fn a_winit_error_loses_the_build_machine_path_and_keeps_what_happened() {
@@ -426,5 +737,25 @@ mod tests {
             "Failed to open connection to X server"
         );
         assert_eq!(without_source_location("no display"), "no display");
+    }
+
+    #[test]
+    fn close_behavior_respects_screen_setting_and_force_quit() {
+        assert_eq!(
+            tray::close_behavior(true, true, false),
+            tray::CloseBehavior::HideToTray
+        );
+        assert_eq!(
+            tray::close_behavior(false, true, false),
+            tray::CloseBehavior::Exit
+        );
+        assert_eq!(
+            tray::close_behavior(true, false, false),
+            tray::CloseBehavior::Exit
+        );
+        assert_eq!(
+            tray::close_behavior(true, true, true),
+            tray::CloseBehavior::Exit
+        );
     }
 }

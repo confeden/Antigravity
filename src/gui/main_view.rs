@@ -60,7 +60,7 @@ pub(super) struct ViewState {
     page: Page,
     setup: Option<Setup>,
     focus_setup: bool,
-    saving_proxy: Option<Cap>,
+    pub(super) saving_proxy: Option<Cap>,
     proxy_saved: Option<(Cap, Result<(), String>)>,
     log_copied: Option<(Instant, bool)>,
     confirm_deactivation: bool,
@@ -954,10 +954,84 @@ fn settings(app: &mut App, ui: &mut egui::Ui) {
     custom_dns_field(app, ui);
     ui.add_space(4.0);
     ui.separator();
+    auto_update_row(app, ui);
+    #[cfg(target_os = "windows")]
+    {
+        ui.add_space(4.0);
+        ui.separator();
+        tray_row(app, ui);
+    }
+    ui.add_space(4.0);
+    ui.separator();
     ui.add_space(4.0);
     egui::CollapsingHeader::new("Дополнительные параметры сети")
         .default_open(dev_open())
         .show(ui, |ui| advanced_network(app, ui));
+}
+
+fn auto_update_row(app: &mut App, ui: &mut egui::Ui) {
+    let mut on = app.status.as_ref().map_or(true, |s| s.auto_update);
+    let enabled = app.status.is_some();
+    if widgets::switch_row(ui, &mut on, enabled, "Автообновление при запуске", |ui| {
+        control_label(
+            ui,
+            widgets::REFRESH,
+            "Автообновление при запуске",
+            "При старте тихо проверяет GitHub Releases, скачивает новую версию и перезапускает программу.",
+        );
+    }) {
+        app.worker.send(Cmd::SetAutoUpdate(on));
+    }
+    ui.add_space(6.0);
+    ui.horizontal_wrapped(|ui| {
+        let busy_update = matches!(app.update_check, super::UpdateCheckState::Checking)
+            || app.update.as_ref().is_some_and(|b| b.is_busy());
+        if widgets::command(ui, widgets::REFRESH, "Проверить обновления", false, !busy_update)
+            .clicked()
+        {
+            app.update_check = super::UpdateCheckState::Checking;
+            app.update_handle.check_now();
+        }
+        let colors = theme::palette(ui);
+        ui.label(
+            egui::RichText::new(format!("Текущая: v{}", crate::update::current_version()))
+                .size(12.0)
+                .color(colors.muted),
+        );
+        match &app.update_check {
+            super::UpdateCheckState::Idle => {}
+            super::UpdateCheckState::Checking => {
+                ui.add(egui::Spinner::new().size(13.0));
+                ui.label(egui::RichText::new("Проверяю GitHub Releases…").size(12.0).color(colors.muted));
+            }
+            super::UpdateCheckState::UpToDate(label) => {
+                ui.label(egui::RichText::new(label).size(12.0).color(colors.ok));
+            }
+            super::UpdateCheckState::Failed(err) => {
+                ui.label(
+                    egui::RichText::new(format!("Ошибка проверки: {err}"))
+                        .size(12.0)
+                        .color(colors.bad),
+                );
+            }
+        }
+    });
+}
+
+#[cfg(target_os = "windows")]
+fn tray_row(app: &mut App, ui: &mut egui::Ui) {
+    let mut on = app.minimize_to_tray_enabled();
+    let enabled = app.status.is_some();
+    if widgets::switch_row(ui, &mut on, enabled, "Сворачивать в трей при закрытии", |ui| {
+        control_label(
+            ui,
+            widgets::OVERVIEW,
+            "Сворачивать в трей при закрытии",
+            "При нажатии крестика окно скрывается в область уведомлений и продолжает следить за Antigravity.",
+        );
+    }) {
+        app.worker.send(Cmd::SetMinimizeToTray(on));
+    }
 }
 
 fn proxy_configured(app: &App, cap: Cap) -> bool {

@@ -34,7 +34,7 @@ use crate::auth;
 use crate::gate;
 use crate::gui::status::{self, Action, Facts, Tone};
 use crate::ops::{self, Cap, Cmd, Event, Level, State, Status, Worker};
-use crate::update::{self, ReleaseInfo};
+use crate::update::{self, ReleaseInfo, UpdateEvent};
 
 /// How many log lines are kept, as in the window.
 const LOG_LIMIT: usize = 400;
@@ -104,7 +104,11 @@ pub fn run(note: Option<String>) -> Result<(), String> {
         ratatui::crossterm::event::DisableBracketedPaste
     );
     ratatui::restore();
-    result
+    match result {
+        Ok(Some(exe)) => crate::update::relaunch_updated(&exe, crate::update::current_version()),
+        Ok(None) => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -126,8 +130,10 @@ enum Input {
 }
 
 /// One selectable line of the main list.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum Row {
+    /// Available or failed self-update action.
+    UpdateAction,
     /// The status card's one action, when it has one.
     Action(Action),
     Cap(Cap),
@@ -143,7 +149,35 @@ enum Row {
     GroupProxyOpenRoom,
     GroupProxyCopy,
     GroupProxyPaste,
+    AutoUpdate,
+    CheckUpdate,
     Report,
+}
+
+enum UpdateCheckStatus {
+    Idle,
+    Checking,
+    UpToDate(String),
+    Failed(String),
+}
+
+#[derive(Clone)]
+enum UpdateState {
+    Available(ReleaseInfo),
+    Downloading {
+        version: String,
+        downloaded: u64,
+        total: Option<u64>,
+    },
+    PendingRestart {
+        version: String,
+        exe: std::path::PathBuf,
+    },
+    Failed {
+        release: ReleaseInfo,
+        reason: String,
+        needs_elevation: bool,
+    },
 }
 
 struct App {
@@ -152,8 +186,11 @@ struct App {
     key_error: bool,
     key_next_attempt: Option<Instant>,
 
-    update: Option<ReleaseInfo>,
-    update_rx: Receiver<ReleaseInfo>,
+    update: Option<UpdateState>,
+    update_check: UpdateCheckStatus,
+    update_handle: update::UpdateHandle,
+    update_rx: Receiver<UpdateEvent>,
+    restart_exe: Option<std::path::PathBuf>,
 
     worker: Worker,
     events: Receiver<Event>,
@@ -180,7 +217,7 @@ struct App {
 impl App {
     fn new(note: Option<String>) -> Self {
         let (up_tx, update_rx) = channel();
-        update::spawn_watch(up_tx, Box::new(|| {}));
+        let update_handle = update::spawn_watch(up_tx, Box::new(|| {}));
         // The loop below polls every 200 ms, so nothing needs waking.
         let (ev_tx, events) = channel();
         let worker = ops::spawn(ev_tx, Box::new(|| {}));
@@ -218,7 +255,10 @@ impl App {
             key_error: false,
             key_next_attempt: None,
             update: None,
+            update_check: UpdateCheckStatus::Idle,
+            update_handle,
             update_rx,
+            restart_exe: None,
             worker,
             events,
             status: None,
@@ -236,11 +276,17 @@ impl App {
         }
     }
 
-    fn run(mut self, terminal: &mut DefaultTerminal) -> Result<(), String> {
+    fn run(mut self, terminal: &mut DefaultTerminal) -> Result<Option<std::path::PathBuf>, String> {
         let mut drawn_at: Option<Instant> = None;
         let mut dirty = true;
         while !self.quit {
             dirty |= self.drain();
+            if let Some(UpdateState::PendingRestart { exe, .. }) = &self.update {
+                if self.busy.is_none() && self.input.is_none() {
+                    self.restart_exe = Some(exe.clone());
+                    break;
+                }
+            }
             // Ages on the card count up by themselves, so a quiet screen is
             // still redrawn once a second.
             if dirty || drawn_at.is_none_or(|t| t.elapsed() >= Duration::from_secs(1)) {
@@ -261,15 +307,67 @@ impl App {
                 dirty = true;
             }
         }
-        Ok(())
+        Ok(self.restart_exe)
     }
 
     /// Takes in everything the worker and the watchers sent. True when anything
     /// arrived.
     fn drain(&mut self) -> bool {
         let mut any = false;
-        while let Ok(rel) = self.update_rx.try_recv() {
-            self.update = Some(rel);
+        while let Ok(ev) = self.update_rx.try_recv() {
+            match ev {
+                UpdateEvent::Checking => {
+                    self.update_check = UpdateCheckStatus::Checking;
+                }
+                UpdateEvent::UpToDate { version, latest } => {
+                    let msg = update::up_to_date_label(&version, &latest);
+                    self.update_check = UpdateCheckStatus::UpToDate(msg.clone());
+                    if matches!(self.update, Some(UpdateState::Available(_))) {
+                        self.update = None;
+                    }
+                    self.toast(msg);
+                }
+                UpdateEvent::CheckFailed(reason) => {
+                    self.update_check = UpdateCheckStatus::Failed(reason.clone());
+                    self.toast(format!("Ошибка проверки обновлений: {reason}"));
+                }
+                UpdateEvent::Available(rel) => {
+                    self.update_check = UpdateCheckStatus::Idle;
+                    self.update = Some(UpdateState::Available(rel));
+                }
+                UpdateEvent::Downloading {
+                    version,
+                    downloaded,
+                    total,
+                } => {
+                    self.update_check = UpdateCheckStatus::Idle;
+                    self.update = Some(UpdateState::Downloading {
+                        version,
+                        downloaded,
+                        total,
+                    });
+                }
+                UpdateEvent::ReadyToRestart { version, exe } => {
+                    self.update_check = UpdateCheckStatus::Idle;
+                    self.update = Some(UpdateState::PendingRestart { version, exe });
+                }
+                UpdateEvent::Failed {
+                    release,
+                    reason,
+                    needs_elevation,
+                } => {
+                    self.update_check = UpdateCheckStatus::Idle;
+                    if self.log.len() >= LOG_LIMIT {
+                        self.log.remove(0);
+                    }
+                    self.log.push((Level::Warn, format!("Автообновление: {reason}")));
+                    self.update = Some(UpdateState::Failed {
+                        release,
+                        reason,
+                        needs_elevation,
+                    });
+                }
+            }
             any = true;
         }
         while let Ok(signal) = self.gate_rx.try_recv() {
@@ -532,6 +630,33 @@ impl App {
 
     fn activate(&mut self, row: Row) {
         match row {
+            Row::UpdateAction => match self.update.clone() {
+                Some(UpdateState::Available(rel)) => self.update_handle.install_now(rel),
+                Some(UpdateState::Failed {
+                    needs_elevation: true,
+                    ..
+                }) => {
+                    #[cfg(windows)]
+                    if crate::utils::relaunch_elevated_with(&format!(
+                        "--tui {}",
+                        update::INSTALL_UPDATE_FLAG
+                    )) {
+                        self.quit = true;
+                        return;
+                    }
+                    self.toast("Права администратора не получены.");
+                }
+                Some(UpdateState::Failed { release, .. }) => {
+                    let url = if release.html_url.trim().is_empty() {
+                        update::releases_latest_url()
+                    } else {
+                        release.html_url
+                    };
+                    crate::utils::open_url_as_user(&url);
+                    self.toast(format!("Если браузер не открылся, откройте вручную: {url}"));
+                }
+                _ => {}
+            },
             Row::Action(a) => self.act(a),
             Row::Cap(cap) => {
                 if self.busy_refusal() {
@@ -630,6 +755,26 @@ impl App {
                 self.input = Some(Input::CustomDns {
                     text: self.custom_dns_text(),
                 })
+            }
+            Row::AutoUpdate => {
+                if self.busy_refusal() {
+                    return;
+                }
+                let on = self.status.as_ref().map_or(true, |s| s.auto_update);
+                self.worker.send(Cmd::SetAutoUpdate(!on));
+            }
+            Row::CheckUpdate => {
+                let busy = matches!(self.update_check, UpdateCheckStatus::Checking)
+                    || matches!(
+                        self.update,
+                        Some(UpdateState::Downloading { .. } | UpdateState::PendingRestart { .. })
+                    );
+                if busy {
+                    self.toast("Проверка или загрузка обновления уже идёт.");
+                } else {
+                    self.update_check = UpdateCheckStatus::Checking;
+                    self.update_handle.check_now();
+                }
             }
             Row::Report => self.save_report(),
         }
@@ -764,42 +909,84 @@ impl App {
     // -----------------------------------------------------------------------
 
     fn rows(&self) -> Vec<Row> {
-        let mut rows = Vec::new();
-        if let Some(a) = self.facts().and_then(|f| status::headline(&f).action) {
+        build_rows(
+            self.status.as_ref(),
+            &self.gate,
+            self.gate_at.elapsed(),
+            self.advanced,
+            self.update.as_ref(),
+        )
+    }
+}
+
+fn build_rows(
+    status: Option<&Status>,
+    gate: &gate::View,
+    gate_age: Duration,
+    advanced: bool,
+    update: Option<&UpdateState>,
+) -> Vec<Row> {
+    let mut rows = Vec::new();
+    if matches!(
+        update,
+        Some(UpdateState::Available(_) | UpdateState::Failed { .. })
+    ) {
+        rows.push(Row::UpdateAction);
+    }
+    if let Some(s) = status {
+        let facts = Facts::read(s, gate, gate_age);
+        if let Some(a) = status::headline(&facts).action {
             rows.push(Row::Action(a));
         }
-        rows.push(Row::Cap(Cap::ClientPatch));
-        rows.push(Row::Bypass);
-        rows.push(Row::Cap(Cap::Watchdog));
-        let installs = self.status.as_ref().map_or(0, |s| s.installs.len());
-        rows.extend((0..installs).map(Row::Install));
-        rows.push(Row::Advanced);
-        if self.advanced {
-            rows.push(Row::Cap(Cap::Dns));
-            let providers = self.status.as_ref().map_or(0, |s| s.providers.len());
-            rows.extend((0..providers).map(Row::Provider));
-            if providers > 0 {
-                rows.push(Row::Cap(Cap::DnsRotation));
-            }
-            rows.push(Row::CustomDnsText);
-            rows.push(Row::Cap(Cap::LocalProxy));
-            rows.push(Row::Cap(Cap::GroupProxy));
-            rows.push(Row::GroupProxyText);
-            rows.push(Row::GroupProxyOpenRoom);
-            rows.push(Row::GroupProxyCopy);
-            rows.push(Row::GroupProxyPaste);
-            rows.push(Row::Cap(Cap::OwnProxy));
-            rows.push(Row::OwnProxyText);
-        }
-        if crate::gui::report::ENABLED {
-            rows.push(Row::Report);
-        }
-        rows
     }
+    rows.push(Row::Cap(Cap::ClientPatch));
+    rows.push(Row::Bypass);
+    rows.push(Row::Cap(Cap::Watchdog));
+    let installs = status.map_or(0, |s| s.installs.len());
+    rows.extend((0..installs).map(Row::Install));
+    rows.push(Row::Advanced);
+    if advanced {
+        rows.push(Row::Cap(Cap::Dns));
+        let providers = status.map_or(0, |s| s.providers.len());
+        rows.extend((0..providers).map(Row::Provider));
+        if providers > 0 {
+            rows.push(Row::Cap(Cap::DnsRotation));
+        }
+        rows.push(Row::CustomDnsText);
+        rows.push(Row::Cap(Cap::LocalProxy));
+        rows.push(Row::Cap(Cap::GroupProxy));
+        rows.push(Row::GroupProxyText);
+        rows.push(Row::GroupProxyOpenRoom);
+        rows.push(Row::GroupProxyCopy);
+        rows.push(Row::GroupProxyPaste);
+        rows.push(Row::Cap(Cap::OwnProxy));
+        rows.push(Row::OwnProxyText);
+        rows.push(Row::AutoUpdate);
+        rows.push(Row::CheckUpdate);
+    }
+    if crate::gui::report::ENABLED {
+        rows.push(Row::Report);
+    }
+    rows
+}
+
+impl App {
 
     /// What the selected row does, for the line under the list.
     fn row_hint(&self, row: Row) -> String {
         match row {
+            Row::UpdateAction => match &self.update {
+                Some(UpdateState::Failed {
+                    needs_elevation: true,
+                    reason,
+                    ..
+                }) => format!("Enter — перезапустить от имени администратора ({reason})."),
+                Some(UpdateState::Available(_)) => "Enter — скачать и установить обновление.".into(),
+                Some(UpdateState::Failed { reason, .. }) => {
+                    format!("Enter — открыть GitHub ({reason}).")
+                }
+                _ => String::new(),
+            },
             Row::Action(a) => format!("Enter — {}.", a.label()),
             Row::Cap(cap) => status::switch_text(cap).1.to_string(),
             Row::Bypass => status::BYPASS_TEXT.1.to_string(),
@@ -819,7 +1006,7 @@ impl App {
                 }
                 s
             }
-            Row::Advanced => "Детали обхода: DNS-серверы, прокси, выходы.".into(),
+            Row::Advanced => "Детали обхода: DNS-серверы, прокси, выходы, обновления.".into(),
             Row::Provider(_) => "Пробел — включить или выключить сервер, +/- — выше или ниже в списке.".into(),
             Row::GroupProxyText => "Команда для Telegram и состояние ключа.".into(),
             Row::GroupProxyOpenRoom => "Открыть Telegram-комнату для получения ключа.".into(),
@@ -829,6 +1016,11 @@ impl App {
             Row::OwnProxyText => {
                 "Enter — изменить адрес: логин:пароль@адрес:порт (или адрес:порт без пароля).".into()
             }
+            Row::AutoUpdate => "Автоматически скачивать новые релизы с GitHub при запуске программы.".into(),
+            Row::CheckUpdate => format!(
+                "Enter — проверить наличие обновлений сейчас (текущая: v{}).",
+                update::current_version()
+            ),
             Row::Report => {
                 "Всё, что нужно, чтобы понять, почему Antigravity отвечает или нет — одним текстом для группы.".into()
             }
@@ -838,6 +1030,40 @@ impl App {
     fn row_item(&self, row: Row, width: u16) -> ListItem<'static> {
         let busy = self.busy.is_some();
         match row {
+            Row::UpdateAction => {
+                let (badge, text, color) = match &self.update {
+                    Some(UpdateState::Failed {
+                        release,
+                        needs_elevation: true,
+                        ..
+                    }) => (
+                        "🛡 ",
+                        format!(
+                            "Обновление {} требует прав администратора — перезапустить",
+                            release.display_version()
+                        ),
+                        Color::Yellow,
+                    ),
+                    Some(UpdateState::Failed { release, .. }) => (
+                        "⬆ ",
+                        format!(
+                            "Обновление {} не поставилось — открыть GitHub",
+                            release.display_version()
+                        ),
+                        Color::Yellow,
+                    ),
+                    Some(UpdateState::Available(rel)) => (
+                        "⬆ ",
+                        format!("Скачать и установить обновление {}", rel.display_version()),
+                        Color::Cyan,
+                    ),
+                    _ => ("", String::new(), Color::Gray),
+                };
+                ListItem::new(Line::from(vec![
+                    Span::styled(badge, Style::new().fg(color)),
+                    Span::styled(text, Style::new().fg(color).add_modifier(Modifier::BOLD)),
+                ]))
+            }
             Row::Action(a) => ListItem::new(Line::from(vec![
                 Span::styled("▶ ", Style::new().fg(Color::Cyan)),
                 Span::styled(
@@ -965,6 +1191,26 @@ impl App {
                     Span::styled(shown, Style::new().fg(Color::Gray)),
                 ]))
             }
+            Row::AutoUpdate => {
+                let state = if self.status.as_ref().map_or(true, |s| s.auto_update) {
+                    State::On
+                } else {
+                    State::Off
+                };
+                switch_line("  ", "Автообновление при запуске", &state, busy, width)
+            }
+            Row::CheckUpdate => {
+                let note = match &self.update_check {
+                    UpdateCheckStatus::Idle => format!("v{}", update::current_version()),
+                    UpdateCheckStatus::Checking => "проверяю…".to_string(),
+                    UpdateCheckStatus::UpToDate(msg) => msg.clone(),
+                    UpdateCheckStatus::Failed(e) => format!("ошибка: {e}"),
+                };
+                ListItem::new(Line::from(vec![
+                    Span::styled("  > Проверить обновления  ", Style::new().fg(Color::Cyan)),
+                    Span::styled(note, Style::new().fg(Color::Gray)),
+                ]))
+            }
             Row::Report => ListItem::new(Line::from(vec![
                 Span::styled("⎘ ", Style::new().fg(Color::Cyan)),
                 Span::raw("Сохранить отчёт"),
@@ -1000,15 +1246,54 @@ impl App {
             format!(" Antigravity Unlocker 2 v{} ", update::current_version()),
             Style::new().add_modifier(Modifier::BOLD),
         )];
-        if let Some(rel) = &self.update {
-            spans.push(Span::styled(
-                format!(
-                    " ⬆ новая версия {}: {} ",
-                    rel.display_version(),
-                    update::RELEASES_LATEST_URL
-                ),
-                Style::new().fg(Color::Black).bg(Color::Yellow),
-            ));
+        match &self.update {
+            Some(UpdateState::Available(rel)) => {
+                spans.push(Span::styled(
+                    format!(" ⬆ новая версия {} ", rel.display_version()),
+                    Style::new().fg(Color::Black).bg(Color::Yellow),
+                ));
+            }
+            Some(UpdateState::Failed {
+                release,
+                needs_elevation: true,
+                ..
+            }) => {
+                spans.push(Span::styled(
+                    format!(" 🛡 {} требует прав администратора ", release.display_version()),
+                    Style::new().fg(Color::Black).bg(Color::Yellow),
+                ));
+            }
+            Some(UpdateState::Failed { release, .. }) => {
+                spans.push(Span::styled(
+                    format!(
+                        " ⬆ новая версия {}: {} ",
+                        release.display_version(),
+                        update::releases_latest_url()
+                    ),
+                    Style::new().fg(Color::Black).bg(Color::Yellow),
+                ));
+            }
+            Some(UpdateState::Downloading {
+                version,
+                downloaded,
+                total,
+            }) => {
+                let pct = total
+                    .filter(|&t| t > 0)
+                    .map(|t| format!(" {}%", ((*downloaded as f64 / t as f64) * 100.0).min(100.0) as u64))
+                    .unwrap_or_default();
+                spans.push(Span::styled(
+                    format!(" ⬇ скачиваю {version}{pct}… "),
+                    Style::new().fg(Color::Black).bg(Color::Cyan),
+                ));
+            }
+            Some(UpdateState::PendingRestart { version, .. }) => {
+                spans.push(Span::styled(
+                    format!(" ✓ обновление {version} готово, перезапуск… "),
+                    Style::new().fg(Color::Black).bg(Color::Green),
+                ));
+            }
+            None => {}
         }
         Line::from(spans)
     }
@@ -1550,5 +1835,35 @@ mod tests {
         assert_eq!(wrapped_height("ab\ncd", 10), 2);
         // Cyrillic is one column per letter, not one per byte.
         assert_eq!(wrapped_height("ключключкл", 10), 1);
+    }
+
+    #[test]
+    fn advanced_rows_expose_auto_update_and_manual_check() {
+        let collapsed = build_rows(None, &gate::View::default(), Duration::ZERO, false, None);
+        assert!(!collapsed.contains(&Row::AutoUpdate));
+        assert!(!collapsed.contains(&Row::CheckUpdate));
+
+        let expanded = build_rows(None, &gate::View::default(), Duration::ZERO, true, None);
+        assert!(expanded.contains(&Row::AutoUpdate));
+        assert!(expanded.contains(&Row::CheckUpdate));
+
+        let pending = UpdateState::Available(ReleaseInfo {
+            tag_name: "v99.0.0".into(),
+            html_url: String::new(),
+            name: None,
+            body: None,
+            published_at: None,
+            prerelease: false,
+            draft: false,
+            assets: Vec::new(),
+        });
+        let with_update = build_rows(
+            None,
+            &gate::View::default(),
+            Duration::ZERO,
+            false,
+            Some(&pending),
+        );
+        assert!(with_update.contains(&Row::UpdateAction));
     }
 }

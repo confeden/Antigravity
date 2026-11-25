@@ -152,6 +152,12 @@ pub struct Settings {
     /// UI color theme preference (`system`, `light`, or `dark`).
     #[serde(default)]
     pub theme: ThemeMode,
+
+    /// Automatically download and apply newer GitHub releases at startup.
+    pub auto_update: bool,
+
+    /// Hide the main window to the system tray instead of exiting when closed.
+    pub minimize_to_tray: bool,
 }
 
 impl Default for Settings {
@@ -180,6 +186,8 @@ impl Default for Settings {
             own_proxy_enabled: false,
             manual_paths: Vec::new(),
             theme: ThemeMode::System,
+            auto_update: true,
+            minimize_to_tray: true,
         }
     }
 }
@@ -641,5 +649,23 @@ mod tests {
             let parsed = parse(&json).unwrap();
             assert_eq!(parsed.theme, mode);
         }
+    }
+
+    #[test]
+    fn auto_update_defaults_to_true_and_round_trips() {
+        assert!(Settings::default().auto_update);
+        let parsed = parse(r#"{"auto_update": false}"#).unwrap();
+        assert!(!parsed.auto_update);
+        let omitted = parse(r#"{"dns": true}"#).unwrap();
+        assert!(omitted.auto_update);
+    }
+
+    #[test]
+    fn minimize_to_tray_defaults_to_true_and_round_trips() {
+        assert!(Settings::default().minimize_to_tray);
+        let parsed = parse(r#"{"minimize_to_tray": false}"#).unwrap();
+        assert!(!parsed.minimize_to_tray);
+        let omitted = parse(r#"{"dns": true}"#).unwrap();
+        assert!(omitted.minimize_to_tray);
     }
 }

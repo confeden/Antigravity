@@ -223,6 +223,8 @@ pub struct Status {
     /// at all. Reported, never acted on: the stand-down decision is still the
     /// client's (D13, P34).
     pub relay_egress: Option<crate::egress::ClientEgress>,
+    pub auto_update: bool,
+    pub minimize_to_tray: bool,
 }
 
 impl Status {
@@ -297,6 +299,10 @@ pub enum Cmd {
     RememberLicense(String),
     /// Persist the user's UI theme preference.
     SetTheme(crate::settings::ThemeMode),
+    /// Toggle silent self-update on startup.
+    SetAutoUpdate(bool),
+    /// Toggle minimizing the main window to system tray on close.
+    SetMinimizeToTray(bool),
     /// Ask the system again where the client's traffic leaves.
     ///
     /// Its own command because it is the one measurement that goes stale on its
@@ -490,6 +496,20 @@ fn run_worker(
                 if ctx.settings.theme != mode {
                     ctx.settings.theme = mode;
                     ctx.settings.save();
+                }
+            }
+            Cmd::SetAutoUpdate(on) => {
+                if ctx.settings.auto_update != on {
+                    ctx.settings.auto_update = on;
+                    ctx.settings.save();
+                    push_status(&mut ctx, Scan::Settings);
+                }
+            }
+            Cmd::SetMinimizeToTray(on) => {
+                if ctx.settings.minimize_to_tray != on {
+                    ctx.settings.minimize_to_tray = on;
+                    ctx.settings.save();
+                    push_status(&mut ctx, Scan::Settings);
                 }
             }
             Cmd::Unlocked => {
@@ -738,9 +758,33 @@ fn run_worker(
 /// inside a tunnel it strips the rules outright (G29). In a console that was
 /// invisible and harmless; in a window it reads as the tool spontaneously
 /// disabling itself, so the flip is watched for and explained.
+fn sync_service_after_update(ctx: &mut Ctx) {
+    if crate::update::updated_from_arg().is_none() && !background::relay_is_outdated() {
+        return;
+    }
+    if cfg!(target_os = "windows") && !is_admin() {
+        return;
+    }
+    if background::is_enabled() {
+        match background::ensure_running() {
+            Ok(()) => ctx.log(Level::Ok, "Фоновая служба обновлена до текущей версии."),
+            Err(e) => ctx.log(Level::Warn, format!("Не удалось обновить службу после апдейта: {e}")),
+        }
+    } else if background::is_watchdog_enabled() {
+        #[cfg(windows)]
+        let res = background::ensure_installed().and_then(|()| background::enable_watchdog());
+        #[cfg(not(windows))]
+        let res = background::enable_watchdog();
+        if let Err(e) = res {
+            ctx.log(Level::Warn, format!("Не удалось обновить автопатч после апдейта: {e}"));
+        }
+    }
+}
+
 fn startup_housekeeping(ctx: &mut Ctx) {
     #[cfg(windows)]
     let _ = crate::launch_guard::uninstall();
+    sync_service_after_update(ctx);
     if !cfg!(target_os = "windows") || !is_admin() {
         return;
     }
@@ -896,6 +940,7 @@ impl Status {
             on_off(s.group_proxy_wanted())
         };
         self.custom_dns_text = s.custom_dns.clone();
+        self.auto_update = s.auto_update;
         self.dns_rotation = if s.rotate_providers {
             State::On
         } else {
@@ -1002,6 +1047,8 @@ fn read_status(ctx: &mut Ctx, deep: bool) -> Status {
         relay_egress: ctx.relay_egress,
         providers: Vec::new(),
         installs,
+        auto_update: ctx.settings.auto_update,
+        minimize_to_tray: ctx.settings.minimize_to_tray,
     }
     .with_settings_switches(&ctx.settings)
 }
@@ -2635,6 +2682,8 @@ mod tests {
             rules: false,
             providers: Vec::new(),
             relay_egress: None,
+            auto_update: true,
+            minimize_to_tray: true,
         }
     }
 
