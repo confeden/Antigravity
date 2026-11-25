@@ -11,6 +11,7 @@ pub(crate) mod renderer;
 pub(crate) mod report;
 pub(crate) mod status;
 mod theme;
+mod tray;
 mod widgets;
 
 use eframe::egui;
@@ -84,6 +85,10 @@ pub struct App {
     pub(super) update_check: UpdateCheckState,
     pub(super) update_handle: update::UpdateHandle,
     update_rx: Receiver<UpdateEvent>,
+    tray: Option<tray::TrayHandle>,
+    tray_rx: Option<Receiver<tray::TrayEvent>>,
+    force_quit: bool,
+    last_tray_tip: String,
 
     worker: Worker,
     events: Receiver<Event>,
@@ -191,6 +196,10 @@ impl App {
             update_check: UpdateCheckState::Idle,
             update_handle,
             update_rx,
+            tray: None,
+            tray_rx: None,
+            force_quit: false,
+            last_tray_tip: String::new(),
             worker,
             events,
             status: None,
@@ -223,9 +232,10 @@ impl App {
     }
 
     /// The update banner, drawn on both screens (spec item 10: survives screen change).
-    fn update_banner(&self, ui: &mut egui::Ui) {
+    fn update_banner(&mut self, ui: &mut egui::Ui) {
         let Some(state) = &self.update else { return };
         let colors = theme::palette(ui);
+        let mut elevate_for_update = false;
         let release_url = |rel: &ReleaseInfo| {
             if rel.html_url.trim().is_empty() {
                 update::releases_latest_url()
@@ -313,7 +323,7 @@ impl App {
                         .min_size(egui::vec2(main_w, 32.0));
                     if ui.add(btn).on_hover_text(reason).clicked() {
                         if *needs_elevation {
-                            self.request_update_elevation();
+                            elevate_for_update = true;
                         } else {
                             crate::utils::open_url(&release_url(release));
                         }
@@ -327,16 +337,101 @@ impl App {
                 });
             }
         }
+        if elevate_for_update {
+            self.request_update_elevation();
+        }
         ui.add_space(10.0);
     }
 
-    fn request_update_elevation(&self) {
+    fn minimize_to_tray_enabled(&self) -> bool {
+        self.status.as_ref().is_some_and(|s| s.minimize_to_tray)
+    }
+
+    fn sync_tray(&mut self, ctx: &egui::Context) {
+        let want = cfg!(target_os = "windows")
+            && matches!(self.screen, Screen::Main)
+            && self.minimize_to_tray_enabled()
+            && !self.force_quit;
+        if want && self.tray.is_none() {
+            let wake_ctx = ctx.clone();
+            if let Some((handle, rx)) = tray::spawn(Box::new(move || wake_ctx.request_repaint())) {
+                self.tray = Some(handle);
+                self.tray_rx = Some(rx);
+                self.last_tray_tip.clear();
+            }
+        } else if !want && self.tray.is_some() {
+            self.tray = None;
+            self.tray_rx = None;
+            self.last_tray_tip.clear();
+        }
+        if let Some(handle) = &self.tray {
+            let label = self.status.as_ref().map(|s| {
+                let facts = status::Facts::read(s, &self.gate, self.gate_at.elapsed());
+                status::headline(&facts).title
+            });
+            let tip = tray::format_tooltip(label.as_deref());
+            if tip != self.last_tray_tip {
+                handle.set_tooltip(&tip);
+                self.last_tray_tip = tip;
+            }
+        }
+    }
+
+    fn handle_tray_and_close(&mut self, ctx: &egui::Context) {
+        let mut events = Vec::new();
+        if let Some(rx) = &self.tray_rx {
+            while let Ok(ev) = rx.try_recv() {
+                events.push(ev);
+            }
+        }
+        for ev in events {
+            match ev {
+                tray::TrayEvent::Show => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
+                tray::TrayEvent::Quit => {
+                    self.force_quit = true;
+                    self.tray = None;
+                    self.tray_rx = None;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+        }
+        if ctx.input(|i| i.viewport().close_requested())
+            && self.tray.is_some()
+            && tray::close_behavior(
+                matches!(self.screen, Screen::Main),
+                self.minimize_to_tray_enabled(),
+                self.force_quit,
+            ) == tray::CloseBehavior::HideToTray
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        }
+    }
+
+    fn relaunch_elevated_and_exit(&mut self, params: &str) {
         #[cfg(target_os = "windows")]
         {
-            if crate::utils::relaunch_elevated_with(update::INSTALL_UPDATE_FLAG) {
+            self.tray = None;
+            self.tray_rx = None;
+            let relaunched = if params.is_empty() {
+                crate::utils::relaunch_elevated()
+            } else {
+                crate::utils::relaunch_elevated_with(params)
+            };
+            if relaunched {
                 std::process::exit(0);
             }
         }
+        #[cfg(not(target_os = "windows"))]
+        let _ = params;
+    }
+
+    fn request_update_elevation(&mut self) {
+        self.relaunch_elevated_and_exit(update::INSTALL_UPDATE_FLAG);
     }
 
     /// Re-launches this exe elevated and closes the current window.
@@ -345,13 +440,8 @@ impl App {
     /// process on Windows and eframe owns the message loop — so the only honest
     /// button is one that starts again. If the user dismisses the UAC prompt
     /// nothing happens and the window stays as it was.
-    fn request_elevation(&self) {
-        #[cfg(target_os = "windows")]
-        {
-            if crate::utils::relaunch_elevated() {
-                std::process::exit(0);
-            }
-        }
+    fn request_elevation(&mut self) {
+        self.relaunch_elevated_and_exit("");
     }
 
     fn drain_events(&mut self) {
@@ -454,11 +544,20 @@ impl App {
         if self.is_busy() || self.main_view.saving_proxy.is_some() {
             return;
         }
-        let Some(UpdateBanner::PendingRestart { version, exe }) = &self.update else {
+        let Some((version, exe)) = (match &self.update {
+            Some(UpdateBanner::PendingRestart { version, exe }) => {
+                Some((version.clone(), exe.clone()))
+            }
+            _ => None,
+        }) else {
             return;
         };
-        match update::relaunch_updated(exe, update::current_version()) {
-            Ok(()) => std::process::exit(0),
+        match update::relaunch_updated(&exe, update::current_version()) {
+            Ok(()) => {
+                self.tray = None;
+                self.tray_rx = None;
+                std::process::exit(0);
+            }
             Err(reason) => {
                 let release = ReleaseInfo {
                     tag_name: format!("v{version}"),
@@ -496,6 +595,8 @@ impl eframe::App for App {
             renderer::confirm();
         }
         self.drain_events();
+        self.sync_tray(ui.ctx());
+        self.handle_tray_and_close(ui.ctx());
 
         match self.screen {
             Screen::Main => {
@@ -625,7 +726,7 @@ fn title() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::without_source_location;
+    use super::{tray, without_source_location};
 
     #[test]
     fn a_winit_error_loses_the_build_machine_path_and_keeps_what_happened() {
@@ -636,5 +737,25 @@ mod tests {
             "Failed to open connection to X server"
         );
         assert_eq!(without_source_location("no display"), "no display");
+    }
+
+    #[test]
+    fn close_behavior_respects_screen_setting_and_force_quit() {
+        assert_eq!(
+            tray::close_behavior(true, true, false),
+            tray::CloseBehavior::HideToTray
+        );
+        assert_eq!(
+            tray::close_behavior(false, true, false),
+            tray::CloseBehavior::Exit
+        );
+        assert_eq!(
+            tray::close_behavior(true, false, false),
+            tray::CloseBehavior::Exit
+        );
+        assert_eq!(
+            tray::close_behavior(true, true, true),
+            tray::CloseBehavior::Exit
+        );
     }
 }

@@ -224,6 +224,7 @@ pub struct Status {
     /// client's (D13, P34).
     pub relay_egress: Option<crate::egress::ClientEgress>,
     pub auto_update: bool,
+    pub minimize_to_tray: bool,
 }
 
 impl Status {
@@ -300,6 +301,8 @@ pub enum Cmd {
     SetTheme(crate::settings::ThemeMode),
     /// Toggle silent self-update on startup.
     SetAutoUpdate(bool),
+    /// Toggle minimizing the main window to system tray on close.
+    SetMinimizeToTray(bool),
     /// Ask the system again where the client's traffic leaves.
     ///
     /// Its own command because it is the one measurement that goes stale on its
@@ -498,6 +501,13 @@ fn run_worker(
             Cmd::SetAutoUpdate(on) => {
                 if ctx.settings.auto_update != on {
                     ctx.settings.auto_update = on;
+                    ctx.settings.save();
+                    push_status(&mut ctx, Scan::Settings);
+                }
+            }
+            Cmd::SetMinimizeToTray(on) => {
+                if ctx.settings.minimize_to_tray != on {
+                    ctx.settings.minimize_to_tray = on;
                     ctx.settings.save();
                     push_status(&mut ctx, Scan::Settings);
                 }
@@ -1038,6 +1048,7 @@ fn read_status(ctx: &mut Ctx, deep: bool) -> Status {
         providers: Vec::new(),
         installs,
         auto_update: ctx.settings.auto_update,
+        minimize_to_tray: ctx.settings.minimize_to_tray,
     }
     .with_settings_switches(&ctx.settings)
 }
@@ -2672,6 +2683,7 @@ mod tests {
             providers: Vec::new(),
             relay_egress: None,
             auto_update: true,
+            minimize_to_tray: true,
         }
     }
 

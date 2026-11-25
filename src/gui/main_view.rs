@@ -955,6 +955,12 @@ fn settings(app: &mut App, ui: &mut egui::Ui) {
     ui.add_space(4.0);
     ui.separator();
     auto_update_row(app, ui);
+    #[cfg(target_os = "windows")]
+    {
+        ui.add_space(4.0);
+        ui.separator();
+        tray_row(app, ui);
+    }
     ui.add_space(4.0);
     ui.separator();
     ui.add_space(4.0);
@@ -1010,6 +1016,22 @@ fn auto_update_row(app: &mut App, ui: &mut egui::Ui) {
             }
         }
     });
+}
+
+#[cfg(target_os = "windows")]
+fn tray_row(app: &mut App, ui: &mut egui::Ui) {
+    let mut on = app.minimize_to_tray_enabled();
+    let enabled = app.status.is_some();
+    if widgets::switch_row(ui, &mut on, enabled, "Сворачивать в трей при закрытии", |ui| {
+        control_label(
+            ui,
+            widgets::OVERVIEW,
+            "Сворачивать в трей при закрытии",
+            "При нажатии крестика окно скрывается в область уведомлений и продолжает следить за Antigravity.",
+        );
+    }) {
+        app.worker.send(Cmd::SetMinimizeToTray(on));
+    }
 }
 
 fn proxy_configured(app: &App, cap: Cap) -> bool {
