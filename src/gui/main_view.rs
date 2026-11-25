@@ -954,10 +954,28 @@ fn settings(app: &mut App, ui: &mut egui::Ui) {
     custom_dns_field(app, ui);
     ui.add_space(4.0);
     ui.separator();
+    auto_update_row(app, ui);
+    ui.add_space(4.0);
+    ui.separator();
     ui.add_space(4.0);
     egui::CollapsingHeader::new("Дополнительные параметры сети")
         .default_open(dev_open())
         .show(ui, |ui| advanced_network(app, ui));
+}
+
+fn auto_update_row(app: &mut App, ui: &mut egui::Ui) {
+    let mut on = app.status.as_ref().map_or(true, |s| s.auto_update);
+    let enabled = app.status.is_some();
+    if widgets::switch_row(ui, &mut on, enabled, "Автообновление при запуске", |ui| {
+        control_label(
+            ui,
+            widgets::REFRESH,
+            "Автообновление при запуске",
+            "При старте тихо проверяет GitHub Releases, скачивает новую версию и перезапускает программу.",
+        );
+    }) {
+        app.worker.send(Cmd::SetAutoUpdate(on));
+    }
 }
 
 fn proxy_configured(app: &App, cap: Cap) -> bool {

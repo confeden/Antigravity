@@ -673,6 +673,7 @@ fn main() {
     }
 
     canary::handle_cli_flags();
+    update::cleanup_old_binaries();
 
     // A window of an older release left open would keep re-applying its own
     // state under this one.

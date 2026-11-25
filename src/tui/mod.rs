@@ -34,7 +34,7 @@ use crate::auth;
 use crate::gate;
 use crate::gui::status::{self, Action, Facts, Tone};
 use crate::ops::{self, Cap, Cmd, Event, Level, State, Status, Worker};
-use crate::update::{self, ReleaseInfo};
+use crate::update::{self, ReleaseInfo, UpdateEvent};
 
 /// How many log lines are kept, as in the window.
 const LOG_LIMIT: usize = 400;
@@ -104,7 +104,11 @@ pub fn run(note: Option<String>) -> Result<(), String> {
         ratatui::crossterm::event::DisableBracketedPaste
     );
     ratatui::restore();
-    result
+    match result {
+        Ok(Some(exe)) => crate::update::relaunch_updated(&exe, crate::update::current_version()),
+        Ok(None) => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -146,14 +150,29 @@ enum Row {
     Report,
 }
 
+enum UpdateState {
+    Available(ReleaseInfo),
+    Downloading {
+        version: String,
+        downloaded: u64,
+        total: Option<u64>,
+    },
+    PendingRestart {
+        version: String,
+        exe: std::path::PathBuf,
+    },
+    Failed(ReleaseInfo),
+}
+
 struct App {
     screen: Screen,
     key: String,
     key_error: bool,
     key_next_attempt: Option<Instant>,
 
-    update: Option<ReleaseInfo>,
-    update_rx: Receiver<ReleaseInfo>,
+    update: Option<UpdateState>,
+    update_rx: Receiver<UpdateEvent>,
+    restart_exe: Option<std::path::PathBuf>,
 
     worker: Worker,
     events: Receiver<Event>,
@@ -219,6 +238,7 @@ impl App {
             key_next_attempt: None,
             update: None,
             update_rx,
+            restart_exe: None,
             worker,
             events,
             status: None,
@@ -236,11 +256,17 @@ impl App {
         }
     }
 
-    fn run(mut self, terminal: &mut DefaultTerminal) -> Result<(), String> {
+    fn run(mut self, terminal: &mut DefaultTerminal) -> Result<Option<std::path::PathBuf>, String> {
         let mut drawn_at: Option<Instant> = None;
         let mut dirty = true;
         while !self.quit {
             dirty |= self.drain();
+            if let Some(UpdateState::PendingRestart { exe, .. }) = &self.update {
+                if self.busy.is_none() && self.input.is_none() {
+                    self.restart_exe = Some(exe.clone());
+                    break;
+                }
+            }
             // Ages on the card count up by themselves, so a quiet screen is
             // still redrawn once a second.
             if dirty || drawn_at.is_none_or(|t| t.elapsed() >= Duration::from_secs(1)) {
@@ -261,15 +287,40 @@ impl App {
                 dirty = true;
             }
         }
-        Ok(())
+        Ok(self.restart_exe)
     }
 
     /// Takes in everything the worker and the watchers sent. True when anything
     /// arrived.
     fn drain(&mut self) -> bool {
         let mut any = false;
-        while let Ok(rel) = self.update_rx.try_recv() {
-            self.update = Some(rel);
+        while let Ok(ev) = self.update_rx.try_recv() {
+            match ev {
+                UpdateEvent::Available(rel) => {
+                    self.update = Some(UpdateState::Available(rel));
+                }
+                UpdateEvent::Downloading {
+                    version,
+                    downloaded,
+                    total,
+                } => {
+                    self.update = Some(UpdateState::Downloading {
+                        version,
+                        downloaded,
+                        total,
+                    });
+                }
+                UpdateEvent::ReadyToRestart { version, exe } => {
+                    self.update = Some(UpdateState::PendingRestart { version, exe });
+                }
+                UpdateEvent::Failed { release, reason } => {
+                    if self.log.len() >= LOG_LIMIT {
+                        self.log.remove(0);
+                    }
+                    self.log.push((Level::Warn, format!("Автообновление: {reason}")));
+                    self.update = Some(UpdateState::Failed(release));
+                }
+            }
             any = true;
         }
         while let Ok(signal) = self.gate_rx.try_recv() {
@@ -1000,15 +1051,38 @@ impl App {
             format!(" Antigravity Unlocker 2 v{} ", update::current_version()),
             Style::new().add_modifier(Modifier::BOLD),
         )];
-        if let Some(rel) = &self.update {
-            spans.push(Span::styled(
-                format!(
-                    " ⬆ новая версия {}: {} ",
-                    rel.display_version(),
-                    update::RELEASES_LATEST_URL
-                ),
-                Style::new().fg(Color::Black).bg(Color::Yellow),
-            ));
+        match &self.update {
+            Some(UpdateState::Available(rel)) | Some(UpdateState::Failed(rel)) => {
+                spans.push(Span::styled(
+                    format!(
+                        " ⬆ новая версия {}: {} ",
+                        rel.display_version(),
+                        update::releases_latest_url()
+                    ),
+                    Style::new().fg(Color::Black).bg(Color::Yellow),
+                ));
+            }
+            Some(UpdateState::Downloading {
+                version,
+                downloaded,
+                total,
+            }) => {
+                let pct = total
+                    .filter(|&t| t > 0)
+                    .map(|t| format!(" {}%", ((*downloaded as f64 / t as f64) * 100.0).min(100.0) as u64))
+                    .unwrap_or_default();
+                spans.push(Span::styled(
+                    format!(" ⬇ скачиваю {version}{pct}… "),
+                    Style::new().fg(Color::Black).bg(Color::Cyan),
+                ));
+            }
+            Some(UpdateState::PendingRestart { version, .. }) => {
+                spans.push(Span::styled(
+                    format!(" ✓ обновление {version} готово, перезапуск… "),
+                    Style::new().fg(Color::Black).bg(Color::Green),
+                ));
+            }
+            None => {}
         }
         Line::from(spans)
     }

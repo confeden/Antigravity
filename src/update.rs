@@ -1,37 +1,48 @@
-//! New-version check against the project's GitHub Releases.
+//! Self-update against GitHub Releases (silent check, download, verify, replace).
 //!
-//! Synchronous on purpose, like the rest of the crate: one HTTP/1.1 GET over a
-//! rustls stream, the same pattern `doh.rs` and `proxy.rs` already use. The GUI
-//! runs it on its own thread and never on the paint loop.
+//! Synchronous on purpose, like the rest of the crate: HTTPS over `rustls` with
+//! HTTP redirect handling and streaming writes to disk, run off the UI thread.
 
-use std::fs;
+use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
-pub const RELEASES_LATEST_URL: &str = "https://github.com/confeden/Antigravity/releases/latest";
+pub const DEFAULT_REPO: &str = "soroka-ilya/Antigravity";
+pub const UPDATED_FROM_FLAG: &str = "--updated-from";
+
+pub fn update_repo() -> &'static str {
+    option_env!("AG_UPDATE_REPO").unwrap_or(DEFAULT_REPO)
+}
+
+pub fn releases_latest_url() -> String {
+    format!("https://github.com/{}/releases/latest", update_repo())
+}
+
+fn api_path() -> String {
+    format!("/repos/{}/releases/latest", update_repo())
+}
+
 const API_HOST: &str = "api.github.com";
-const API_PATH: &str = "/repos/confeden/Antigravity/releases/latest";
 const CHECK_INTERVAL: Duration = Duration::from_secs(8 * 60 * 60);
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const IO_TIMEOUT: Duration = Duration::from_secs(10);
-const MAX_BODY: usize = 256 * 1024;
+const API_IO_TIMEOUT: Duration = Duration::from_secs(10);
+const DOWNLOAD_IO_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_HEADER_BYTES: usize = 32 * 1024;
+const MAX_API_BODY: usize = 512 * 1024;
+const MAX_DOWNLOAD_BYTES: usize = 128 * 1024 * 1024;
+const MAX_REDIRECTS: usize = 5;
 
 /// The version this binary shipped as, in the form the release tags use.
-///
-/// `CARGO_PKG_VERSION` only ever holds the three-digit part (`2.12.2`) because
-/// `build_rust.py` deliberately keeps the fourth digit out of Cargo.toml — a
-/// changed Cargo version re-salts every licence key (I2). So the full shipped
-/// name (`2.12.2_3`) comes from build.rs instead. Without it a `_3` build would
-/// compare itself against tag `v2.12.2_3` as if it were `2.12.2`, and claim an
-/// update that does not exist.
 pub fn current_version() -> &'static str {
     option_env!("AG_FULL_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"))
 }
@@ -67,7 +78,7 @@ pub struct ReleaseInfo {
 impl ReleaseInfo {
     /// Returns true if this release is strictly newer than the currently running binary.
     pub fn is_newer_than_current(&self) -> bool {
-        is_newer_version(&self.tag_name, current_version())
+        !self.draft && !self.prerelease && is_newer_version(&self.tag_name, current_version())
     }
 
     /// Strips leading 'v' / 'V' and whitespace from tag name for display.
@@ -78,20 +89,25 @@ impl ReleaseInfo {
     }
 }
 
-/// Cached check payload stored on disk.
-#[derive(Debug, Serialize, Deserialize)]
-struct CachedCheck {
-    checked_at_unix: u64,
-    release: ReleaseInfo,
-}
-
-/// Returns the path to the update check cache file in the system temp directory.
-fn cache_path() -> PathBuf {
-    std::env::temp_dir().join("ag_unlocker_update_cache.json")
+#[derive(Debug, Clone)]
+pub enum UpdateEvent {
+    Available(ReleaseInfo),
+    Downloading {
+        version: String,
+        downloaded: u64,
+        total: Option<u64>,
+    },
+    ReadyToRestart {
+        version: String,
+        exe: PathBuf,
+    },
+    Failed {
+        release: ReleaseInfo,
+        reason: String,
+    },
 }
 
 /// Compares two version strings (e.g. "v2.11.0_4" vs "2.11.0_1", "2.11.0" vs "2.10.0").
-/// Returns true if `remote` is strictly newer than `current`.
 pub fn is_newer_version(remote: &str, current: &str) -> bool {
     let parse_segments = |v: &str| -> Vec<u64> {
         let clean = v.trim().trim_start_matches(|c| c == 'v' || c == 'V');
@@ -104,7 +120,6 @@ pub fn is_newer_version(remote: &str, current: &str) -> bool {
 
     let r_parts = parse_segments(remote);
     let c_parts = parse_segments(current);
-
     let max_len = r_parts.len().max(c_parts.len());
     for i in 0..max_len {
         let r = r_parts.get(i).copied().unwrap_or(0);
@@ -118,8 +133,6 @@ pub fn is_newer_version(remote: &str, current: &str) -> bool {
     false
 }
 
-/// Client configuration for TLS. Reuses the project's standard pattern with WebPKI roots
-/// and HTTP/1.1 ALPN protocol.
 fn tls_config() -> Arc<ClientConfig> {
     static CFG: OnceLock<Arc<ClientConfig>> = OnceLock::new();
     CFG.get_or_init(|| {
@@ -135,8 +148,7 @@ fn tls_config() -> Arc<ClientConfig> {
     .clone()
 }
 
-/// Connects a TCP stream to `host:port` with a connection timeout.
-fn connect_tcp(host: &str, port: u16) -> Result<TcpStream, String> {
+fn connect_tcp(host: &str, port: u16, io_timeout: Duration) -> Result<TcpStream, String> {
     let addrs: Vec<_> = (host, port)
         .to_socket_addrs()
         .map_err(|e| format!("DNS resolution failed for {}: {}", host, e))?
@@ -146,8 +158,8 @@ fn connect_tcp(host: &str, port: u16) -> Result<TcpStream, String> {
     for addr in addrs {
         match TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {
             Ok(sock) => {
-                sock.set_read_timeout(Some(IO_TIMEOUT)).ok();
-                sock.set_write_timeout(Some(IO_TIMEOUT)).ok();
+                sock.set_read_timeout(Some(io_timeout)).ok();
+                sock.set_write_timeout(Some(io_timeout)).ok();
                 return Ok(sock);
             }
             Err(e) => last_err = Some(e),
@@ -161,204 +173,870 @@ fn connect_tcp(host: &str, port: u16) -> Result<TcpStream, String> {
     ))
 }
 
-/// Decodes HTTP chunked transfer encoding if present in response.
+fn parse_https_url(url: &str) -> Result<(String, u16, String), String> {
+    let url = url.trim();
+    if !url.get(..8).is_some_and(|s| s.eq_ignore_ascii_case("https://")) {
+        return Err("supported only over HTTPS".to_string());
+    }
+    let rest = &url[8..];
+    let (authority, raw_path) = match rest.find(['/', '?']) {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
+    };
+    if authority.is_empty() || authority.contains('@') {
+        return Err("invalid URL authority".to_string());
+    }
+    let path_part = raw_path.split('#').next().unwrap_or("/");
+    let path = if path_part.starts_with('/') {
+        path_part.to_string()
+    } else {
+        format!("/{path_part}")
+    };
+    let (host, port) = if authority.starts_with('[') {
+        let close = authority.find(']').ok_or_else(|| "invalid IPv6 host".to_string())?;
+        let host = &authority[1..close];
+        let tail = &authority[close + 1..];
+        let port = if let Some(p) = tail.strip_prefix(':') {
+            p.parse::<u16>().map_err(|_| "invalid URL port".to_string())?
+        } else if tail.is_empty() {
+            443
+        } else {
+            return Err("invalid URL authority".to_string());
+        };
+        (host, port)
+    } else if let Some((h, p)) = authority.rsplit_once(':') {
+        let port = p.parse::<u16>().map_err(|_| "invalid URL port".to_string())?;
+        (h, port)
+    } else {
+        (authority, 443)
+    };
+    if host.is_empty() || port == 0 {
+        return Err("invalid URL host or port".to_string());
+    }
+    Ok((host.to_string(), port, path.to_string()))
+}
+
+fn resolve_redirect(current_url: &str, location: &str) -> Result<String, String> {
+    let loc = location.trim();
+    if loc.get(..8).is_some_and(|s| s.eq_ignore_ascii_case("https://")) {
+        return Ok(loc.to_string());
+    }
+    if loc.get(..7).is_some_and(|s| s.eq_ignore_ascii_case("http://")) {
+        return Err("refusing insecure http:// redirect".to_string());
+    }
+    if loc.starts_with("//") {
+        return Ok(format!("https:{loc}"));
+    }
+    if loc.starts_with('/') {
+        let (host, port, _) = parse_https_url(current_url)?;
+        let origin = if port == 443 {
+            format!("https://{host}")
+        } else {
+            format!("https://{host}:{port}")
+        };
+        return Ok(format!("{origin}{loc}"));
+    }
+    Err("unsupported relative redirect".to_string())
+}
+
+#[derive(Default)]
+struct ChunkDecoder {
+    buf: Vec<u8>,
+    remaining: Option<usize>,
+    expect_crlf: bool,
+    done: bool,
+}
+
+impl ChunkDecoder {
+    fn push(
+        &mut self,
+        data: &[u8],
+        out: &mut dyn FnMut(&[u8]) -> Result<(), String>,
+    ) -> Result<(), String> {
+        self.buf.extend_from_slice(data);
+        while !self.done {
+            if self.expect_crlf {
+                if self.buf.len() < 2 {
+                    break;
+                }
+                if &self.buf[..2] != b"\r\n" {
+                    return Err("invalid chunk terminator".to_string());
+                }
+                self.buf.drain(..2);
+                self.expect_crlf = false;
+                continue;
+            }
+            if let Some(rem) = self.remaining {
+                if self.buf.is_empty() {
+                    break;
+                }
+                let take = rem.min(self.buf.len());
+                out(&self.buf[..take])?;
+                self.buf.drain(..take);
+                if take == rem {
+                    self.remaining = None;
+                    self.expect_crlf = true;
+                } else {
+                    self.remaining = Some(rem - take);
+                }
+                continue;
+            }
+            let Some(pos) = self.buf.windows(2).position(|w| w == b"\r\n") else {
+                if self.buf.len() > 256 {
+                    return Err("chunk header too long".to_string());
+                }
+                break;
+            };
+            let line = std::str::from_utf8(&self.buf[..pos])
+                .map_err(|e| format!("invalid chunk size encoding: {}", e))?
+                .trim();
+            let hex = line.split(';').next().unwrap_or("").trim();
+            let chunk_size = usize::from_str_radix(hex, 16)
+                .map_err(|e| format!("invalid chunk size hex '{}': {}", line, e))?;
+            self.buf.drain(..pos + 2);
+            if chunk_size == 0 {
+                self.done = true;
+                break;
+            }
+            self.remaining = Some(chunk_size);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
 fn decode_chunked(raw: &[u8]) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
-    let mut cursor = 0;
-    while cursor < raw.len() {
-        let rem = &raw[cursor..];
-        let Some(pos) = rem.windows(2).position(|w| w == b"\r\n") else {
-            break;
-        };
-        let line = std::str::from_utf8(&rem[..pos])
-            .map_err(|e| format!("invalid chunk size encoding: {}", e))?
-            .trim();
-        let chunk_size = usize::from_str_radix(line.split(';').next().unwrap_or("").trim(), 16)
-            .map_err(|e| format!("invalid chunk size hex '{}': {}", line, e))?;
-        if chunk_size == 0 {
-            break;
-        }
-        let chunk_start = cursor + pos + 2;
-        // Checked: the size comes off the wire, and `chunk_start + chunk_size`
-        // on a hostile or corrupt value overflows. `panic = "abort"` makes an
-        // overflow panic a dead window rather than a caught error.
-        let Some(chunk_end) = chunk_start.checked_add(chunk_size) else {
-            return Err("chunk size out of range".to_string());
-        };
-        if chunk_end > raw.len() {
-            return Err("truncated chunk data in HTTP response".to_string());
-        }
-        out.extend_from_slice(&raw[chunk_start..chunk_end]);
-        cursor = chunk_end + 2; // skip trailing \r\n
+    let mut dec = ChunkDecoder::default();
+    dec.push(raw, &mut |slice| {
+        out.extend_from_slice(slice);
+        Ok(())
+    })?;
+    if !dec.done {
+        return Err("truncated chunk data in HTTP response".to_string());
     }
     Ok(out)
 }
 
-/// Synchronously fetches the latest release from the GitHub API over HTTPS.
-pub fn fetch_latest_release() -> Result<ReleaseInfo, String> {
-    let mut sock = connect_tcp(API_HOST, 443)?;
+fn read_http_headers(stream: &mut dyn Read) -> Result<(String, Vec<u8>), String> {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let delim = loop {
+        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break pos;
+        }
+        if buf.len() > MAX_HEADER_BYTES {
+            return Err("HTTP response headers too large".to_string());
+        }
+        match stream.read(&mut chunk) {
+            Ok(0) => return Err("empty or truncated HTTP headers".to_string()),
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(format!("error reading HTTP headers: {}", e)),
+        }
+    };
+    let headers = String::from_utf8_lossy(&buf[..delim]).into_owned();
+    let initial_body = buf[delim + 4..].to_vec();
+    Ok((headers, initial_body))
+}
 
-    let server_name = ServerName::try_from(API_HOST)
-        .map_err(|e| format!("invalid TLS server name {}: {}", API_HOST, e))?;
+fn parse_status_code(header_str: &str) -> Option<u16> {
+    header_str
+        .lines()
+        .next()?
+        .split_whitespace()
+        .nth(1)?
+        .parse::<u16>()
+        .ok()
+}
+
+fn header_value<'a>(header_str: &'a str, name: &str) -> Option<&'a str> {
+    header_str.lines().skip(1).find_map(|line| {
+        let (k, v) = line.split_once(':')?;
+        k.trim().eq_ignore_ascii_case(name).then(|| v.trim())
+    })
+}
+
+enum FetchOutcome {
+    Redirect(String),
+    Done,
+}
+
+fn stream_body(
+    stream: &mut dyn Read,
+    initial: &[u8],
+    is_chunked: bool,
+    content_len: Option<u64>,
+    max_bytes: usize,
+    on_chunk: &mut dyn FnMut(&[u8]) -> Result<(), String>,
+) -> Result<(), String> {
+    let mut received: usize = 0;
+    let mut emit = |slice: &[u8]| -> Result<(), String> {
+        let next = received
+            .checked_add(slice.len())
+            .ok_or_else(|| "response size overflow".to_string())?;
+        if next > max_bytes {
+            return Err(format!("response exceeded limit ({} bytes)", max_bytes));
+        }
+        received = next;
+        on_chunk(slice)
+    };
+
+    let mut buf = [0u8; 16 * 1024];
+    if is_chunked {
+        let mut dec = ChunkDecoder::default();
+        if !initial.is_empty() {
+            dec.push(initial, &mut emit)?;
+        }
+        while !dec.done {
+            match stream.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => dec.push(&buf[..n], &mut emit)?,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(format!("error reading chunked response: {}", e)),
+            }
+        }
+        if !dec.done {
+            return Err("truncated chunked HTTP response".to_string());
+        }
+        return Ok(());
+    }
+
+    if !initial.is_empty() {
+        emit(initial)?;
+    }
+    loop {
+        if content_len.is_some_and(|l| (received as u64) >= l) {
+            break;
+        }
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => emit(&buf[..n])?,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                if content_len.is_some_and(|l| (received as u64) < l) {
+                    return Err("truncated HTTP download (unexpected EOF)".to_string());
+                }
+                break;
+            }
+            Err(e) => return Err(format!("error reading HTTP response: {}", e)),
+        }
+    }
+    if let Some(expected) = content_len {
+        if (received as u64) != expected {
+            return Err(format!(
+                "incomplete HTTP response: got {} of {} bytes",
+                received, expected
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn http_get_once(
+    url: &str,
+    accept: &str,
+    io_timeout: Duration,
+    max_bytes: usize,
+    on_start: &mut dyn FnMut(Option<u64>),
+    on_chunk: &mut dyn FnMut(&[u8]) -> Result<(), String>,
+) -> Result<FetchOutcome, String> {
+    let (host, port, path) = parse_https_url(url)?;
+    let mut sock = connect_tcp(&host, port, io_timeout)?;
+    let server_name = ServerName::try_from(host.clone())
+        .map_err(|e| format!("invalid TLS server name {}: {}", host, e))?;
     let mut conn = ClientConnection::new(tls_config(), server_name)
         .map_err(|e| format!("failed to initialize TLS client connection: {}", e))?;
     let mut stream = rustls::Stream::new(&mut conn, &mut sock);
 
+    let host_header = if port == 443 {
+        host
+    } else {
+        format!("{host}:{port}")
+    };
     let req = format!(
-        "GET {} HTTP/1.1\r\n\
-         Host: {}\r\n\
+        "GET {path} HTTP/1.1\r\n\
+         Host: {host_header}\r\n\
          User-Agent: ag_unlocker/{}\r\n\
-         Accept: application/vnd.github.v3+json\r\n\
+         Accept: {accept}\r\n\
          Connection: close\r\n\r\n",
-        API_PATH,
-        API_HOST,
         current_version()
     );
-
     stream
         .write_all(req.as_bytes())
         .map_err(|e| format!("failed to write HTTP request: {}", e))?;
     stream
         .flush()
-        .map_err(|e| format!("failed to flush request: {}", e))?;
+        .map_err(|e| format!("failed to flush HTTP request: {}", e))?;
 
-    let mut response_buf = Vec::new();
-    let mut chunk = [0u8; 4096];
-    loop {
-        match stream.read(&mut chunk) {
-            Ok(0) => break,
-            Ok(n) => {
-                response_buf.extend_from_slice(&chunk[..n]);
-                if response_buf.len() > MAX_BODY {
-                    return Err(format!("response body exceeded limit ({} bytes)", MAX_BODY));
-                }
-            }
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                // Connection closed without TLS close_notify alert
-                break;
-            }
-            Err(e) => return Err(format!("error reading HTTPS response: {}", e)),
+    let (header_str, initial_body) = read_http_headers(&mut stream)?;
+    let code = parse_status_code(&header_str)
+        .ok_or_else(|| "invalid HTTP status line".to_string())?;
+    if matches!(code, 301 | 302 | 303 | 307 | 308) {
+        let loc = header_value(&header_str, "location")
+            .ok_or_else(|| format!("redirect HTTP {} without Location", code))?;
+        return Ok(FetchOutcome::Redirect(resolve_redirect(url, loc)?));
+    }
+    if code != 200 {
+        return Err(format!("HTTP {} while fetching {}", code, url));
+    }
+
+    let is_chunked = header_value(&header_str, "transfer-encoding")
+        .is_some_and(|v| v.to_ascii_lowercase().contains("chunked"));
+    let content_len = header_value(&header_str, "content-length")
+        .and_then(|v| v.parse::<u64>().ok());
+    if content_len.is_some_and(|l| l > max_bytes as u64) {
+        return Err(format!("response exceeded limit ({} bytes)", max_bytes));
+    }
+    on_start(content_len);
+    stream_body(
+        &mut stream,
+        &initial_body,
+        is_chunked,
+        content_len,
+        max_bytes,
+        on_chunk,
+    )?;
+    Ok(FetchOutcome::Done)
+}
+
+fn http_get_stream(
+    url: &str,
+    accept: &str,
+    io_timeout: Duration,
+    max_bytes: usize,
+    on_start: &mut dyn FnMut(Option<u64>),
+    on_chunk: &mut dyn FnMut(&[u8]) -> Result<(), String>,
+) -> Result<(), String> {
+    let mut current = url.to_string();
+    for _ in 0..=MAX_REDIRECTS {
+        match http_get_once(&current, accept, io_timeout, max_bytes, on_start, on_chunk)? {
+            FetchOutcome::Redirect(next) => current = next,
+            FetchOutcome::Done => return Ok(()),
         }
     }
+    Err("too many HTTP redirects".to_string())
+}
 
-    if response_buf.is_empty() {
-        return Err("empty response received from GitHub API".to_string());
+fn fetch_bytes(url: &str, accept: &str, timeout: Duration, max_bytes: usize) -> Result<Vec<u8>, String> {
+    let mut body = Vec::new();
+    http_get_stream(
+        url,
+        accept,
+        timeout,
+        max_bytes,
+        &mut |_| {},
+        &mut |slice| {
+            body.extend_from_slice(slice);
+            Ok(())
+        },
+    )?;
+    Ok(body)
+}
+
+/// Synchronously fetches the latest release from the GitHub API over HTTPS.
+pub fn fetch_latest_release() -> Result<ReleaseInfo, String> {
+    let url = format!("https://{}{}", API_HOST, api_path());
+    let body_bytes = fetch_bytes(&url, "application/vnd.github.v3+json", API_IO_TIMEOUT, MAX_API_BODY)?;
+    serde_json::from_slice(&body_bytes)
+        .map_err(|e| format!("failed to deserialize release JSON: {}", e))
+}
+
+fn underscore_patch_ver(ver: &str) -> String {
+    if let Some(pos) = ver.rfind('.') {
+        if ver[..pos].contains('.') && ver[pos + 1..].chars().all(|c| c.is_ascii_digit()) {
+            let mut s = ver.to_string();
+            s.replace_range(pos..=pos, "_");
+            return s;
+        }
     }
+    ver.to_string()
+}
 
-    let header_delim = response_buf
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .ok_or_else(|| "missing header delimiter in HTTP response".to_string())?;
+fn expected_asset_names(ver: &str, os: &str, arch: &str) -> Vec<String> {
+    let clean = ver.trim().trim_start_matches(|c| c == 'v' || c == 'V');
+    let alt = underscore_patch_ver(clean);
+    let mut forms = vec![clean.to_string()];
+    if alt != clean {
+        forms.push(alt);
+    }
+    let mut out = Vec::new();
+    for v in forms {
+        match os {
+            "windows" => out.push(format!("AG_{v}.exe")),
+            "linux" if arch == "aarch64" => {
+                out.push(format!("AG_{v}_linux_arm64.tar.gz"));
+                out.push(format!("AG_{v}_linux_aarch64.tar.gz"));
+            }
+            "linux" => out.push(format!("AG_{v}_linux.tar.gz")),
+            "macos" if arch == "x86_64" => {
+                out.push(format!("AG_{v}_macos_x64.tar.gz"));
+                out.push(format!("AG_{v}_macos.tar.gz"));
+            }
+            "macos" => out.push(format!("AG_{v}_macos.tar.gz")),
+            _ => {}
+        }
+    }
+    out
+}
 
-    let header_bytes = &response_buf[..header_delim];
-    let header_str = String::from_utf8_lossy(header_bytes);
-    let body_raw = &response_buf[header_delim + 4..];
+pub fn select_asset<'a>(rel: &'a ReleaseInfo, os: &str, arch: &str) -> Option<&'a ReleaseAsset> {
+    for candidate in expected_asset_names(rel.display_version(), os, arch) {
+        if let Some(asset) = rel
+            .assets
+            .iter()
+            .find(|a| a.name.eq_ignore_ascii_case(&candidate))
+        {
+            return Some(asset);
+        }
+    }
+    if os == "windows" {
+        let exes: Vec<&ReleaseAsset> = rel
+            .assets
+            .iter()
+            .filter(|a| {
+                let low = a.name.to_ascii_lowercase();
+                low.starts_with("ag_") && low.ends_with(".exe")
+            })
+            .collect();
+        if exes.len() == 1 {
+            return Some(exes[0]);
+        }
+    }
+    None
+}
 
-    let mut lines = header_str.lines();
-    let status_line = lines.next().unwrap_or("");
-    if !status_line.contains(" 200") {
+fn find_checksum_asset<'a>(rel: &'a ReleaseInfo, asset_name: &str) -> Option<&'a ReleaseAsset> {
+    let per_asset = format!("{asset_name}.sha256");
+    rel.assets.iter().find(|a| {
+        a.name.eq_ignore_ascii_case("SHA256SUMS.txt")
+            || a.name.eq_ignore_ascii_case("SHA256SUMS")
+            || a.name.eq_ignore_ascii_case(&per_asset)
+    })
+}
+
+pub fn parse_sha256_for_asset(text: &str, asset_name: &str) -> Option<String> {
+    let valid_hex = |s: &str| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit());
+    let mut single_line_hex = None;
+    let mut non_empty = 0usize;
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        non_empty += 1;
+        let mut parts = line.split_whitespace();
+        let Some(hash) = parts.next() else { continue };
+        if !valid_hex(hash) {
+            continue;
+        }
+        if let Some(file) = parts.next() {
+            let clean_file = file.trim_start_matches('*').trim_start_matches("./");
+            if clean_file.eq_ignore_ascii_case(asset_name) {
+                return Some(hash.to_ascii_lowercase());
+            }
+        } else {
+            single_line_hex = Some(hash.to_ascii_lowercase());
+        }
+    }
+    if non_empty == 1 {
+        return single_line_hex;
+    }
+    None
+}
+
+fn sibling_path(exe: &Path, suffix: &str) -> PathBuf {
+    let mut s = exe.as_os_str().to_os_string();
+    s.push(suffix);
+    PathBuf::from(s)
+}
+
+fn can_self_replace(exe: &Path) -> bool {
+    let Some(dir) = exe.parent() else { return false };
+    let probe = dir.join(format!(".ag_update_probe_{}", std::process::id()));
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+    {
+        Ok(_) => {
+            let _ = fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+fn has_valid_executable_magic(path: &Path) -> bool {
+    let Ok(mut f) = File::open(path) else {
+        return false;
+    };
+    let mut head = [0u8; 4];
+    if f.read_exact(&mut head).is_err() {
+        return false;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        head.starts_with(b"MZ")
+    }
+    #[cfg(target_os = "linux")]
+    {
+        head == *b"\x7fELF"
+    }
+    #[cfg(target_os = "macos")]
+    {
+        crate::macos::is_macho(&head)
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+    {
+        true
+    }
+}
+
+fn replace_executable(current_exe: &Path, staged_bin: &Path) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        let old_exe = sibling_path(current_exe, ".old");
+        let _ = fs::remove_file(&old_exe);
+        fs::rename(current_exe, &old_exe)
+            .map_err(|e| format!("не переименовать текущий файл: {e}"))?;
+        if let Err(e) = fs::rename(staged_bin, current_exe) {
+            let _ = fs::rename(&old_exe, current_exe);
+            return Err(format!("не записать обновление: {e}"));
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(staged_bin, fs::Permissions::from_mode(0o755))
+            .map_err(|e| format!("chmod: {e}"))?;
+        #[cfg(target_os = "macos")]
+        crate::macos::strip_quarantine(staged_bin);
+        fs::rename(staged_bin, current_exe)
+            .map_err(|e| format!("не заменить исполняемый файл: {e}"))?;
+        Ok(())
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn find_extracted_binary(dir: &Path) -> Option<PathBuf> {
+    let direct = dir.join("ag_unlocker");
+    if fs::symlink_metadata(&direct)
+        .map(|m| m.is_file())
+        .unwrap_or(false)
+    {
+        return Some(direct);
+    }
+    let entries = fs::read_dir(dir).ok()?;
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if fs::symlink_metadata(&p).map(|m| m.is_dir()).unwrap_or(false) {
+            let cand = p.join("ag_unlocker");
+            if fs::symlink_metadata(&cand)
+                .map(|m| m.is_file())
+                .unwrap_or(false)
+            {
+                return Some(cand);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(not(target_os = "windows"))]
+fn extract_tar_gz_binary(
+    archive: &Path,
+    extract_dir: &Path,
+    staged_bin: &Path,
+) -> Result<(), String> {
+    let _ = fs::remove_dir_all(extract_dir);
+    fs::create_dir_all(extract_dir).map_err(|e| format!("не создать каталог распаковки: {e}"))?;
+    let out = Command::new("tar")
+        .arg("-xzf")
+        .arg(archive)
+        .arg("-C")
+        .arg(extract_dir)
+        .output()
+        .map_err(|e| format!("не удалось запустить tar: {e}"))?;
+    if !out.status.success() {
+        let _ = fs::remove_dir_all(extract_dir);
         return Err(format!(
-            "GitHub API returned non-200 status: {}",
-            status_line
+            "tar завершился с ошибкой: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
-
-    let is_chunked = lines.any(|l| {
-        let lower = l.to_ascii_lowercase();
-        lower.starts_with("transfer-encoding:") && lower.contains("chunked")
-    });
-
-    let body_bytes = if is_chunked {
-        decode_chunked(body_raw)?
-    } else {
-        body_raw.to_vec()
-    };
-
-    let release: ReleaseInfo = serde_json::from_slice(&body_bytes)
-        .map_err(|e| format!("failed to deserialize release JSON: {}", e))?;
-
-    Ok(release)
+    let found = find_extracted_binary(extract_dir)
+        .ok_or_else(|| "в архиве не найден ag_unlocker".to_string())?;
+    let res = fs::rename(&found, staged_bin).or_else(|_| fs::copy(&found, staged_bin).map(|_| ()));
+    let _ = fs::remove_dir_all(extract_dir);
+    res.map_err(|e| format!("не подготовить бинарник: {e}"))
 }
 
-/// Checks for updates respecting `CHECK_INTERVAL` (8 hours).
-/// If `force` is false, it uses the cached result if available and fresh.
-/// If an update is available, returns `Ok(Some(release))`.
-pub fn check_update_cached(force: bool) -> Result<Option<ReleaseInfo>, String> {
-    let now_unix = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+fn download_to_file(
+    url: &str,
+    dest: &Path,
+    expected_sha256: Option<&str>,
+    mut on_progress: impl FnMut(u64, Option<u64>),
+) -> Result<u64, String> {
+    let mut file = File::create(dest).map_err(|e| format!("не создать {}: {e}", dest.display()))?;
+    let mut hasher = Sha256::new();
+    let mut downloaded: u64 = 0;
+    let mut total_hint: Option<u64> = None;
+    let mut last_report = Instant::now();
 
-    let path = cache_path();
-    if !force {
-        if let Ok(data) = fs::read_to_string(&path) {
-            if let Ok(cached) = serde_json::from_str::<CachedCheck>(&data) {
-                if now_unix >= cached.checked_at_unix
-                    && Duration::from_secs(now_unix - cached.checked_at_unix) < CHECK_INTERVAL
-                {
-                    return if cached.release.is_newer_than_current() {
-                        Ok(Some(cached.release))
-                    } else {
-                        Ok(None)
-                    };
-                }
+    http_get_stream(
+        url,
+        "application/octet-stream",
+        DOWNLOAD_IO_TIMEOUT,
+        MAX_DOWNLOAD_BYTES,
+        &mut |total| {
+            total_hint = total;
+            on_progress(0, total);
+        },
+        &mut |slice| {
+            file.write_all(slice)
+                .map_err(|e| format!("ошибка записи обновления: {e}"))?;
+            hasher.update(slice);
+            downloaded += slice.len() as u64;
+            if last_report.elapsed() >= Duration::from_millis(120) {
+                last_report = Instant::now();
+                on_progress(downloaded, total_hint);
             }
+            Ok(())
+        },
+    )?;
+    file.flush()
+        .map_err(|e| format!("ошибка сохранения обновления: {e}"))?;
+    on_progress(downloaded, total_hint.or(Some(downloaded)));
+
+    if let Some(expected) = expected_sha256 {
+        let actual = hex::encode(hasher.finalize());
+        if !actual.eq_ignore_ascii_case(expected) {
+            return Err("контрольная сумма SHA-256 не совпала".to_string());
+        }
+    }
+    Ok(downloaded)
+}
+
+pub fn perform_silent_update(
+    rel: &ReleaseInfo,
+    on_progress: impl FnMut(u64, Option<u64>),
+) -> Result<PathBuf, String> {
+    let exe = std::env::current_exe().map_err(|e| format!("не найден путь к программе: {e}"))?;
+    if !can_self_replace(&exe) {
+        return Err("нет прав на запись в папку программы".to_string());
+    }
+    let asset = select_asset(rel, std::env::consts::OS, std::env::consts::ARCH)
+        .ok_or_else(|| "в релизе нет сборки для этой платформы".to_string())?;
+
+    let expected_sha = if let Some(sum_asset) = find_checksum_asset(rel, &asset.name) {
+        let raw = fetch_bytes(
+            &sum_asset.browser_download_url,
+            "text/plain",
+            API_IO_TIMEOUT,
+            MAX_API_BODY,
+        )?;
+        let text = String::from_utf8_lossy(&raw);
+        Some(
+            parse_sha256_for_asset(&text, &asset.name)
+                .ok_or_else(|| "в SHA256SUMS не найден хеш сборки".to_string())?,
+        )
+    } else {
+        None
+    };
+
+    let part = sibling_path(&exe, ".part");
+    let _ = fs::remove_file(&part);
+
+    #[cfg(target_os = "windows")]
+    let download_target = part.clone();
+    #[cfg(not(target_os = "windows"))]
+    let download_target = sibling_path(&exe, ".download.tar.gz");
+    #[cfg(not(target_os = "windows"))]
+    let _ = fs::remove_file(&download_target);
+
+    let got = match download_to_file(
+        &asset.browser_download_url,
+        &download_target,
+        expected_sha.as_deref(),
+        on_progress,
+    ) {
+        Ok(n) => n,
+        Err(e) => {
+            let _ = fs::remove_file(&download_target);
+            return Err(e);
+        }
+    };
+    if asset.size > 0 && got != asset.size {
+        let _ = fs::remove_file(&download_target);
+        return Err(format!("неполный файл ({got} из {} байт)", asset.size));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let extract_dir = sibling_path(&exe, ".update_extract");
+        let extracted = extract_tar_gz_binary(&download_target, &extract_dir, &part);
+        let _ = fs::remove_file(&download_target);
+        if let Err(e) = extracted {
+            let _ = fs::remove_file(&part);
+            return Err(e);
         }
     }
 
-    let release = fetch_latest_release()?;
-    let cache_entry = CachedCheck {
-        checked_at_unix: now_unix,
-        release: release.clone(),
-    };
-    if let Ok(serialized) = serde_json::to_string(&cache_entry) {
-        fs::write(&path, serialized).ok();
+    if !has_valid_executable_magic(&part) {
+        let _ = fs::remove_file(&part);
+        return Err("скачанный файл не является исполняемым".to_string());
     }
+    if let Err(e) = replace_executable(&exe, &part) {
+        let _ = fs::remove_file(&part);
+        return Err(e);
+    }
+    Ok(exe)
+}
 
-    if release.is_newer_than_current() {
-        Ok(Some(release))
+pub fn updated_from_arg() -> Option<String> {
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == UPDATED_FROM_FLAG {
+            return args.next().filter(|v| !v.is_empty());
+        }
+        if let Some(val) = arg.strip_prefix(&format!("{UPDATED_FROM_FLAG}=")) {
+            if !val.is_empty() {
+                return Some(val.to_string());
+            }
+        }
+    }
+    None
+}
+
+pub fn cleanup_old_binaries() {
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let _ = fs::remove_file(sibling_path(&exe, ".part"));
+    let _ = fs::remove_file(sibling_path(&exe, ".download.tar.gz"));
+    let _ = fs::remove_dir_all(sibling_path(&exe, ".update_extract"));
+
+    let old = sibling_path(&exe, ".old");
+    if !old.exists() {
+        return;
+    }
+    if updated_from_arg().is_some() {
+        std::thread::Builder::new()
+            .name("update-cleanup".to_string())
+            .spawn(move || {
+                for _ in 0..12 {
+                    if fs::remove_file(&old).is_ok() || !old.exists() {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(150));
+                }
+            })
+            .ok();
     } else {
-        Ok(None)
+        let _ = fs::remove_file(&old);
     }
 }
 
-/// Watches for a newer release for as long as the receiver lives.
-///
-/// Checked once immediately — the banner has to be up before the licence screen
-/// is even answered — and then every `CHECK_INTERVAL` for a window that stays
-/// open. Only the first pass may answer from the on-disk cache: after that the
-/// thread has already waited the full interval, so re-reading a cache it wrote
-/// itself would just double the wait.
-pub fn spawn_watch(tx: std::sync::mpsc::Sender<ReleaseInfo>, wake: Box<dyn Fn() + Send>) {
+pub fn relaunch_updated(exe: &Path, old_version: &str) -> Result<(), String> {
+    let mut args: Vec<std::ffi::OsString> = Vec::new();
+    let mut skip_next = false;
+    for arg in std::env::args_os().skip(1) {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        let s = arg.to_string_lossy();
+        if s == UPDATED_FROM_FLAG {
+            skip_next = true;
+            continue;
+        }
+        if s.starts_with(&format!("{UPDATED_FROM_FLAG}=")) {
+            continue;
+        }
+        args.push(arg);
+    }
+    args.push(UPDATED_FROM_FLAG.into());
+    args.push(old_version.into());
+    Command::new(exe)
+        .args(&args)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("не удалось запустить обновлённую версию: {e}"))
+}
+
+fn should_auto_update() -> bool {
+    if updated_from_arg().is_some() {
+        return false;
+    }
+    if cfg!(debug_assertions) && std::env::var_os("AG_FORCE_AUTO_UPDATE").is_none() {
+        return false;
+    }
+    crate::settings::Settings::load().auto_update
+}
+
+pub fn spawn_watch(tx: std::sync::mpsc::Sender<UpdateEvent>, wake: Box<dyn Fn() + Send>) {
     std::thread::Builder::new()
         .name("update-watch".to_string())
-        .spawn(move || {
-            let mut first = true;
-            loop {
-                match check_update_cached(!first) {
-                    Ok(Some(rel)) => {
-                        // A closed receiver means the window is gone; so is the
-                        // reason to keep checking.
-                        if tx.send(rel).is_err() {
-                            return;
+        .spawn(move || loop {
+            match fetch_latest_release() {
+                Ok(rel) => {
+                    if rel.is_newer_than_current() {
+                        let ver = rel.display_version().to_string();
+                        if should_auto_update() {
+                            if tx
+                                .send(UpdateEvent::Downloading {
+                                    version: ver.clone(),
+                                    downloaded: 0,
+                                    total: None,
+                                })
+                                .is_err()
+                            {
+                                return;
+                            }
+                            wake();
+                            let tx_prog = tx.clone();
+                            let ver_prog = ver.clone();
+                            match perform_silent_update(&rel, |downloaded, total| {
+                                let _ = tx_prog.send(UpdateEvent::Downloading {
+                                    version: ver_prog.clone(),
+                                    downloaded,
+                                    total,
+                                });
+                                wake();
+                            }) {
+                                Ok(exe) => {
+                                    let _ = tx.send(UpdateEvent::ReadyToRestart {
+                                        version: ver,
+                                        exe,
+                                    });
+                                    wake();
+                                    return;
+                                }
+                                Err(reason) => {
+                                    if tx.send(UpdateEvent::Failed { release: rel, reason }).is_err()
+                                    {
+                                        return;
+                                    }
+                                    wake();
+                                }
+                            }
+                        } else {
+                            if tx.send(UpdateEvent::Available(rel)).is_err() {
+                                return;
+                            }
+                            wake();
                         }
-                        // egui sleeps until something asks it to repaint, so a
-                        // banner that only lands in a channel stays invisible
-                        // until the user happens to move the mouse.
-                        wake();
-                    }
-                    Ok(None) => {}
-                    Err(_e) => {
-                        // Background check: a failure is not the user's problem,
-                        // and there is no UI surface that could act on it.
-                        #[cfg(debug_assertions)]
-                        eprintln!("update check failed: {}", _e);
                     }
                 }
-                first = false;
-                std::thread::sleep(CHECK_INTERVAL);
+                Err(_e) => {
+                    #[cfg(debug_assertions)]
+                    eprintln!("update check failed: {}", _e);
+                }
             }
+            std::thread::sleep(CHECK_INTERVAL);
         })
         .ok();
 }
@@ -388,33 +1066,109 @@ mod tests {
     fn test_release_json_deserialization() {
         let sample = r#"{
             "tag_name": "v2.11.0_4",
-            "html_url": "https://github.com/confeden/Antigravity/releases/tag/v2.11.0_4",
+            "html_url": "https://github.com/soroka-ilya/Antigravity/releases/tag/v2.11.0_4",
             "name": "Релиз v2.11.0_4",
             "draft": false,
             "prerelease": false,
             "published_at": "2026-09-02T19:02:18Z",
             "body": "Release notes",
-            "assets": [
-                {
-                    "name": "AG_2.11.0_4.exe",
-                    "browser_download_url": "https://example.com/AG.exe",
-                    "size": 12345
-                }
-            ]
+            "assets": [{
+                "name": "AG_2.11.0_4.exe",
+                "browser_download_url": "https://example.com/AG.exe",
+                "size": 12345
+            }]
         }"#;
-
         let rel: ReleaseInfo = serde_json::from_str(sample).expect("valid json");
         assert_eq!(rel.tag_name, "v2.11.0_4");
         assert_eq!(rel.display_version(), "2.11.0_4");
         assert_eq!(rel.assets.len(), 1);
-        assert_eq!(rel.assets[0].name, "AG_2.11.0_4.exe");
     }
 
     #[test]
-    fn test_decode_chunked() {
+    fn test_decode_chunked_and_split_chunks() {
         let chunked = b"5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
-        let decoded = decode_chunked(chunked).expect("chunked decode");
-        assert_eq!(decoded, b"hello world");
+        assert_eq!(decode_chunked(chunked).unwrap(), b"hello world");
+        let mut out = Vec::new();
+        let mut dec = ChunkDecoder::default();
+        for b in chunked {
+            dec.push(&[*b], &mut |s| {
+                out.extend_from_slice(s);
+                Ok(())
+            })
+            .unwrap();
+        }
+        assert!(dec.done);
+        assert_eq!(out, b"hello world");
+    }
+
+    #[test]
+    fn test_parse_https_url_and_redirects() {
+        assert_eq!(
+            parse_https_url("https://github.com/a/b?x=1#frag").unwrap(),
+            ("github.com".into(), 443, "/a/b?x=1".into())
+        );
+        assert!(parse_https_url("http://example.com/a").is_err());
+        assert!(resolve_redirect("https://github.com/x", "http://evil.com/y").is_err());
+        assert_eq!(
+            resolve_redirect("https://github.com/x", "/dl/AG.exe").unwrap(),
+            "https://github.com/dl/AG.exe"
+        );
+    }
+
+    #[test]
+    fn test_select_asset_per_platform() {
+        let rel = ReleaseInfo {
+            tag_name: "v2.35.0.1".into(),
+            html_url: String::new(),
+            name: None,
+            body: None,
+            published_at: None,
+            prerelease: false,
+            draft: false,
+            assets: vec![
+                ReleaseAsset {
+                    name: "AG_2.35.0_1.exe".into(),
+                    browser_download_url: "https://example.com/win".into(),
+                    size: 100,
+                },
+                ReleaseAsset {
+                    name: "AG_2.35.0_1_linux.tar.gz".into(),
+                    browser_download_url: "https://example.com/lin".into(),
+                    size: 100,
+                },
+                ReleaseAsset {
+                    name: "AG_2.35.0_1_macos.tar.gz".into(),
+                    browser_download_url: "https://example.com/mac".into(),
+                    size: 100,
+                },
+            ],
+        };
+        assert_eq!(select_asset(&rel, "windows", "x86_64").unwrap().name, "AG_2.35.0_1.exe");
+        assert_eq!(select_asset(&rel, "linux", "x86_64").unwrap().name, "AG_2.35.0_1_linux.tar.gz");
+        assert_eq!(select_asset(&rel, "macos", "aarch64").unwrap().name, "AG_2.35.0_1_macos.tar.gz");
+    }
+
+    #[test]
+    fn test_parse_sha256_for_asset() {
+        let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let sums = format!("{hash}  ./AG_2.35.0.exe\nffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff  other.tar.gz\n");
+        assert_eq!(parse_sha256_for_asset(&sums, "AG_2.35.0.exe").as_deref(), Some(hash));
+        assert_eq!(parse_sha256_for_asset(&sums, "missing.exe"), None);
+    }
+
+    #[test]
+    fn test_replace_executable_round_trip() {
+        let dir = std::env::temp_dir().join("ag_update_replace_test");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("ag_test.exe");
+        let staged = dir.join("ag_test.exe.part");
+        fs::write(&exe, b"old-binary").unwrap();
+        fs::write(&staged, b"new-binary").unwrap();
+        replace_executable(&exe, &staged).unwrap();
+        assert_eq!(fs::read(&exe).unwrap(), b"new-binary");
+        assert!(!staged.exists());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

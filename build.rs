@@ -74,11 +74,18 @@ fn main() {
     println!("cargo:rerun-if-changed=src/canary.rs");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=AG_FULL_VERSION");
+    println!("cargo:rerun-if-env-changed=AG_UPDATE_REPO");
 
     if let Ok(full_ver) = env::var("AG_FULL_VERSION") {
         let trimmed = full_ver.trim();
         if !trimmed.is_empty() {
             println!("cargo:rustc-env=AG_FULL_VERSION={}", trimmed);
+        }
+    }
+    if let Ok(repo) = env::var("AG_UPDATE_REPO") {
+        let trimmed = repo.trim();
+        if !trimmed.is_empty() {
+            println!("cargo:rustc-env=AG_UPDATE_REPO={}", trimmed);
         }
     }
 

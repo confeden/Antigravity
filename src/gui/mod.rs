@@ -19,7 +19,7 @@ use std::sync::mpsc::{channel, Receiver};
 use crate::gate;
 use crate::ops::{self, Cmd, Event, Level, Status, Worker};
 use crate::settings::Settings;
-use crate::update::{self, ReleaseInfo};
+use crate::update::{self, ReleaseInfo, UpdateEvent};
 
 pub const TELEGRAM_GROUP_URL: &str = "https://t.me/nova_txt";
 /// The room the free keys are pinned in (spec item 9), not the group root.
@@ -39,6 +39,23 @@ enum Screen {
     Deactivated,
 }
 
+enum UpdateBanner {
+    Available(ReleaseInfo),
+    Downloading {
+        version: String,
+        downloaded: u64,
+        total: Option<u64>,
+    },
+    PendingRestart {
+        version: String,
+        exe: std::path::PathBuf,
+    },
+    Failed {
+        release: ReleaseInfo,
+        reason: String,
+    },
+}
+
 pub struct App {
     screen: Screen,
     key_input: String,
@@ -55,8 +72,8 @@ pub struct App {
 
     /// Raised once a newer release is on GitHub and never lowered — the banner
     /// has to survive the move from the licence screen to the main one.
-    update: Option<ReleaseInfo>,
-    update_rx: Receiver<ReleaseInfo>,
+    update: Option<UpdateBanner>,
+    update_rx: Receiver<UpdateEvent>,
 
     worker: Worker,
     events: Receiver<Event>,
@@ -186,21 +203,61 @@ impl App {
         self.busy.is_some()
     }
 
-    /// The "новая версия" button, drawn on both screens (spec item 10: it must
-    /// not disappear after the key is accepted).
+    /// The update banner, drawn on both screens (spec item 10: survives screen change).
     fn update_banner(&self, ui: &mut egui::Ui) {
-        let Some(rel) = &self.update else { return };
-        let label = format!("⬆  Доступна новая версия — {}", rel.display_version());
+        let Some(state) = &self.update else { return };
         let colors = theme::palette(ui);
-        let btn = egui::Button::new(egui::RichText::new(label).color(colors.on_accent))
-            .fill(colors.accent)
-            .corner_radius(egui::CornerRadius::same(theme::RADIUS_SMALL))
-            .min_size(egui::vec2(ui.available_width(), 32.0));
-        if ui.add(btn).clicked() {
-            // Always /latest, never the tag URL from the API response: the point
-            // is to land the user on whatever is newest when they click, not on
-            // the release this process happened to see hours ago.
-            crate::utils::open_url(update::RELEASES_LATEST_URL);
+        match state {
+            UpdateBanner::Available(rel) => {
+                let label = format!("⬆  Доступна новая версия — {}", rel.display_version());
+                let btn = egui::Button::new(egui::RichText::new(label).color(colors.on_accent))
+                    .fill(colors.accent)
+                    .corner_radius(egui::CornerRadius::same(theme::RADIUS_SMALL))
+                    .min_size(egui::vec2(ui.available_width(), 32.0));
+                if ui.add(btn).clicked() {
+                    crate::utils::open_url(&update::releases_latest_url());
+                }
+            }
+            UpdateBanner::Downloading {
+                version,
+                downloaded,
+                total,
+            } => {
+                let mb = *downloaded as f64 / (1024.0 * 1024.0);
+                let text = match total {
+                    Some(t) if *t > 0 => {
+                        let pct = ((*downloaded as f64 / *t as f64) * 100.0).min(100.0);
+                        format!("⬇  Обновление {version} — {pct:.0}% ({mb:.1} МБ)")
+                    }
+                    _ => format!("⬇  Скачиваю обновление {version}… ({mb:.1} МБ)"),
+                };
+                ui.label(egui::RichText::new(text).color(colors.accent_text).size(13.0));
+                if let Some(t) = total.filter(|&t| t > 0) {
+                    let frac = (*downloaded as f32 / t as f32).clamp(0.0, 1.0);
+                    ui.add(egui::ProgressBar::new(frac).desired_height(6.0));
+                } else {
+                    ui.add(egui::ProgressBar::new(0.0).desired_height(6.0).animate(true));
+                }
+            }
+            UpdateBanner::PendingRestart { version, .. } => {
+                let text = format!(
+                    "✓  Обновление {version} скачано — перезапуск после завершения операции…"
+                );
+                ui.label(egui::RichText::new(text).color(colors.ok).size(13.0));
+            }
+            UpdateBanner::Failed { release, reason } => {
+                let label = format!(
+                    "⬆  Обновление {} не поставилось само — открыть GitHub",
+                    release.display_version()
+                );
+                let btn = egui::Button::new(egui::RichText::new(label).color(colors.on_accent))
+                    .fill(colors.warn)
+                    .corner_radius(egui::CornerRadius::same(theme::RADIUS_SMALL))
+                    .min_size(egui::vec2(ui.available_width(), 32.0));
+                if ui.add(btn).on_hover_text(reason).clicked() {
+                    crate::utils::open_url(&update::releases_latest_url());
+                }
+            }
         }
         ui.add_space(10.0);
     }
@@ -221,8 +278,25 @@ impl App {
     }
 
     fn drain_events(&mut self) {
-        while let Ok(rel) = self.update_rx.try_recv() {
-            self.update = Some(rel);
+        while let Ok(ev) = self.update_rx.try_recv() {
+            self.update = Some(match ev {
+                UpdateEvent::Available(rel) => UpdateBanner::Available(rel),
+                UpdateEvent::Downloading {
+                    version,
+                    downloaded,
+                    total,
+                } => UpdateBanner::Downloading {
+                    version,
+                    downloaded,
+                    total,
+                },
+                UpdateEvent::ReadyToRestart { version, exe } => {
+                    UpdateBanner::PendingRestart { version, exe }
+                }
+                UpdateEvent::Failed { release, reason } => {
+                    UpdateBanner::Failed { release, reason }
+                }
+            });
         }
         while let Ok(signal) = self.gate_rx.try_recv() {
             match signal {
@@ -265,6 +339,32 @@ impl App {
                     self.busy = None;
                     self.screen = Screen::Deactivated;
                 }
+            }
+        }
+        self.maybe_finish_update();
+    }
+
+    fn maybe_finish_update(&mut self) {
+        if self.is_busy() || self.main_view.saving_proxy.is_some() {
+            return;
+        }
+        let Some(UpdateBanner::PendingRestart { version, exe }) = &self.update else {
+            return;
+        };
+        match update::relaunch_updated(exe, update::current_version()) {
+            Ok(()) => std::process::exit(0),
+            Err(reason) => {
+                let release = ReleaseInfo {
+                    tag_name: format!("v{version}"),
+                    html_url: update::releases_latest_url(),
+                    name: None,
+                    body: None,
+                    published_at: None,
+                    prerelease: false,
+                    draft: false,
+                    assets: Vec::new(),
+                };
+                self.update = Some(UpdateBanner::Failed { release, reason });
             }
         }
     }

@@ -152,6 +152,9 @@ pub struct Settings {
     /// UI color theme preference (`system`, `light`, or `dark`).
     #[serde(default)]
     pub theme: ThemeMode,
+
+    /// Automatically download and apply newer GitHub releases at startup.
+    pub auto_update: bool,
 }
 
 impl Default for Settings {
@@ -180,6 +183,7 @@ impl Default for Settings {
             own_proxy_enabled: false,
             manual_paths: Vec::new(),
             theme: ThemeMode::System,
+            auto_update: true,
         }
     }
 }
@@ -641,5 +645,14 @@ mod tests {
             let parsed = parse(&json).unwrap();
             assert_eq!(parsed.theme, mode);
         }
+    }
+
+    #[test]
+    fn auto_update_defaults_to_true_and_round_trips() {
+        assert!(Settings::default().auto_update);
+        let parsed = parse(r#"{"auto_update": false}"#).unwrap();
+        assert!(!parsed.auto_update);
+        let omitted = parse(r#"{"dns": true}"#).unwrap();
+        assert!(omitted.auto_update);
     }
 }
