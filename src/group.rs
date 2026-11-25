@@ -95,7 +95,12 @@ const REJECT_AFTER: u32 = 2;
 
 /// What the switch says once the pool refuses this PC's key: the key was
 /// replaced by a newer one (one PC per user), or this PC's code changed.
-pub const KEY_DEAD_NOTE: &str = "код перестал работать — получите новый в группе и вставьте его";
+pub fn key_dead_note() -> &'static str {
+    crate::i18n::tr(
+        "код перестал работать — получите новый в группе и вставьте его",
+        "code stopped working — get a new one in the group and paste it",
+    )
+}
 
 /// A server answered this key with a refusal.
 fn note_refused(key: &GroupKey) {

@@ -21,10 +21,10 @@ impl Page {
 
     fn label(self) -> &'static str {
         match self {
-            Self::Overview => "Обзор",
-            Self::Integration => "Интеграция",
-            Self::Settings => "Настройки",
-            Self::Log => "Журнал",
+            Self::Overview => crate::i18n::tr("Обзор", "Overview"),
+            Self::Integration => crate::i18n::tr("Интеграция", "Integration"),
+            Self::Settings => crate::i18n::tr("Настройки", "Settings"),
+            Self::Log => crate::i18n::tr("Журнал", "Log"),
         }
     }
 
@@ -188,7 +188,7 @@ fn navigation(app: &mut App, ui: &mut egui::Ui) {
     ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
         if ui
             .link(widgets::text_icon(
-                "Поддержать",
+                crate::i18n::tr("Поддержать", "Support"),
                 widgets::HEART,
                 colors.accent_text,
             ))
@@ -198,7 +198,7 @@ fn navigation(app: &mut App, ui: &mut egui::Ui) {
         }
         if ui
             .link(widgets::text_icon(
-                "Группа в ТГ",
+                crate::i18n::tr("Группа в ТГ", "Telegram group"),
                 widgets::SEND,
                 colors.accent_text,
             ))
@@ -232,9 +232,37 @@ fn title(app: &mut App, ui: &mut egui::Ui, text: &str) {
         ui.label(egui::RichText::new(text).size(24.0).strong());
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             theme_toggle(app, ui);
+            lang_toggle(app, ui);
         });
     });
     ui.add_space(8.0);
+}
+
+pub(super) fn lang_toggle(app: &mut App, ui: &mut egui::Ui) {
+    let colors = theme::palette(ui);
+    let next = app.lang.next();
+    let hint = match crate::i18n::current() {
+        crate::i18n::Lang::Ru => format!("Язык: {} (нажмите для смены на {})", app.lang.native_name(), next.native_name()),
+        crate::i18n::Lang::En => format!("Language: {} (click to switch to {})", app.lang.native_name(), next.native_name()),
+    };
+    let resp = ui
+        .add(
+            egui::Button::new(
+                egui::RichText::new(app.lang.short_label())
+                    .size(12.5)
+                    .strong()
+                    .color(colors.muted),
+            )
+            .frame_when_inactive(false)
+            .min_size(egui::vec2(34.0, 32.0)),
+        )
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    let resp = widgets::hover_text(resp, ui, &hint);
+    if resp.clicked() {
+        app.lang = next;
+        crate::i18n::set_current(next);
+        app.worker.send(Cmd::SetLang(next));
+    }
 }
 
 fn theme_toggle(app: &mut App, ui: &mut egui::Ui) {
@@ -253,12 +281,24 @@ fn theme_toggle_button(
     let dark = ui.visuals().dark_mode;
     let icon = if dark { widgets::SUN } else { widgets::MOON };
     let mut hint = if dark {
-        "Переключить на светлую тему".to_string()
+        crate::i18n::tr(
+            "Переключить на светлую тему",
+            "Switch to light theme",
+        )
+        .to_string()
     } else {
-        "Переключить на тёмную тему".to_string()
+        crate::i18n::tr(
+            "Переключить на тёмную тему",
+            "Switch to dark theme",
+        )
+        .to_string()
     };
     if current != crate::settings::ThemeMode::System {
-        hint.push_str("\nПравый клик — системная тема");
+        hint.push('\n');
+        hint.push_str(crate::i18n::tr(
+            "Правый клик — системная тема",
+            "Right-click for system theme",
+        ));
     }
     let resp = ui
         .add(
@@ -270,8 +310,8 @@ fn theme_toggle_button(
             .frame_when_inactive(false)
             .min_size(egui::vec2(32.0, 32.0)),
         )
-        .on_hover_cursor(egui::CursorIcon::PointingHand)
-        .on_hover_text(hint);
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    let resp = widgets::hover_text(resp, ui, &hint);
     let next = if resp.clicked() {
         Some(if dark {
             crate::settings::ThemeMode::Light
@@ -298,7 +338,15 @@ fn status_card(app: &mut App, ui: &mut egui::Ui) {
         widgets::card(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.add(egui::Spinner::new().size(16.0));
-                ui.label(egui::RichText::new("Проверяю систему…").size(15.0));
+                ui.label(
+                    egui::RichText::new(
+                        crate::i18n::tr(
+                            "Проверяю систему…",
+                            "Checking system…",
+                        ),
+                    )
+                    .size(15.0),
+                );
             });
         });
         return;
@@ -335,25 +383,55 @@ fn status_card(app: &mut App, ui: &mut egui::Ui) {
                 );
                 if h.tone == Tone::Ok {
                     ui.vertical(|ui| {
-                        ui.label(egui::RichText::new("Модель ответила").size(22.0).strong());
+                        ui.label(
+                            egui::RichText::new(
+                                crate::i18n::tr(
+                                    "Модель ответила",
+                                    "Model replied",
+                                ),
+                            )
+                            .size(22.0)
+                            .strong(),
+                        );
                         if let Some(ago) = f.answer {
-                            ui.label(egui::RichText::new(format!("Последний ответ {}", status::ago_text(ago))).size(12.5).color(colors.muted));
+                            let ago_s = status::ago_text(ago);
+                            let line = match crate::i18n::current() {
+                                crate::i18n::Lang::Ru => format!("Последний ответ {ago_s}"),
+                                crate::i18n::Lang::En => format!("Last reply {ago_s}"),
+                            };
+                            ui.label(
+                                egui::RichText::new(&line)
+                                    .size(12.5)
+                                    .color(colors.muted),
+                            );
                         }
                     });
                     if let Some(route) = f.route.as_deref().filter(|r| !r.is_empty()) {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.vertical(|ui| {
-                                ui.label(egui::RichText::new("Маршрут").size(12.0).color(colors.muted));
+                                ui.label(
+                                    egui::RichText::new(
+                                        crate::i18n::tr(
+                                            "Маршрут", "Route",
+                                        ),
+                                    )
+                                    .size(12.0)
+                                    .color(colors.muted),
+                                );
                                 ui.label(egui::RichText::new(route).size(13.5));
                             });
                         });
                     }
                 } else {
-                    ui.label(egui::RichText::new(&h.title).size(22.0).strong());
+                    ui.label(
+                        egui::RichText::new(&h.title)
+                            .size(22.0)
+                            .strong(),
+                    );
                 }
             });
             if h.tone != Tone::Ok {
-                ui.label(egui::RichText::new(&h.detail).size(13.5).color(colors.text));
+                widgets::wrapped_label(ui, &h.detail, 13.5, colors.text);
             }
             if let Some(action) = h.action {
                 ui.add_space(10.0);
@@ -374,18 +452,49 @@ fn status_card(app: &mut App, ui: &mut egui::Ui) {
                     .clone()
                     .filter(|(at, _)| at.elapsed() < REPORT_SHOWN_FOR);
                 ui.horizontal(|ui| {
-                    if ui
-                        .add_enabled(!busy, egui::Button::new(egui::RichText::new("Сохранить отчёт").size(12.5)))
-                        .on_hover_text("Всё, что нужно, чтобы понять, почему Antigravity отвечает или нет — одним файлом на рабочем столе: приложите его к сообщению")
-                        .clicked()
+                    let save_resp = ui.add_enabled(
+                        !busy,
+                        egui::Button::new(
+                            egui::RichText::new(
+                                crate::i18n::tr(
+                                    "Сохранить отчёт",
+                                    "Save report",
+                                ),
+                            )
+                            .size(12.5),
+                        ),
+                    );
+                    if widgets::hover_text(
+                        save_resp,
+                        ui,
+                        crate::i18n::tr(
+                            "Всё, что нужно, чтобы понять, почему Antigravity отвечает или нет — одним файлом на рабочем столе: приложите его к сообщению",
+                            "Everything needed to diagnose why Antigravity is or isn't replying — saved as one file on your Desktop",
+                        ),
+                    )
+                    .clicked()
                     {
                         copy = true;
                     }
                     if let Some((_, path)) = &saved {
-                        if ui
-                            .add(egui::Button::new(egui::RichText::new("Показать файл").size(12.5)))
-                            .on_hover_text("Открыть папку с отчётом")
-                            .clicked()
+                        let show_resp = ui.add(egui::Button::new(
+                            egui::RichText::new(
+                                crate::i18n::tr(
+                                    "Показать файл",
+                                    "Show file",
+                                ),
+                            )
+                            .size(12.5),
+                        ));
+                        if widgets::hover_text(
+                            show_resp,
+                            ui,
+                            crate::i18n::tr(
+                                "Открыть папку с отчётом",
+                                "Open folder with report",
+                            ),
+                        )
+                        .clicked()
                         {
                             reveal = Some(path.clone());
                         }
@@ -393,16 +502,15 @@ fn status_card(app: &mut App, ui: &mut egui::Ui) {
                 });
                 if let Some((_, path)) = &saved {
                     ui.add_space(4.0);
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "Отчёт сохранён на рабочий стол: «{}». Приложите этот файл к сообщению.",
-                            path.file_name()
-                                .map(|f| f.to_string_lossy().into_owned())
-                                .unwrap_or_default()
-                        ))
-                        .size(12.5)
-                        .color(theme::palette(ui).ok),
-                    );
+                    let fname = path
+                        .file_name()
+                        .map(|f| f.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    let msg = match crate::i18n::current() {
+                        crate::i18n::Lang::Ru => format!("Отчёт сохранён на рабочий стол: «{fname}». Приложите этот файл к сообщению."),
+                        crate::i18n::Lang::En => format!("Report saved to Desktop: \"{fname}\". Attach this file to your message."),
+                    };
+                    widgets::wrapped_label(ui, &msg, 12.5, theme::palette(ui).ok);
                     ui.ctx().request_repaint_after(Duration::from_millis(500));
                 }
                 if app
@@ -410,12 +518,14 @@ fn status_card(app: &mut App, ui: &mut egui::Ui) {
                     .is_some_and(|at| at.elapsed() < REPORT_SHOWN_FOR)
                 {
                     ui.add_space(4.0);
-                    ui.label(
-                        egui::RichText::new(
+                    widgets::wrapped_label(
+                        ui,
+                        crate::i18n::tr(
                             "Файл сохранить не удалось — отчёт скопирован, вставьте его в сообщение.",
-                        )
-                        .size(12.5)
-                        .color(theme::palette(ui).warn),
+                            "Could not save file — report copied to clipboard.",
+                        ),
+                        12.5,
+                        theme::palette(ui).warn,
                     );
                     ui.ctx().request_repaint_after(Duration::from_millis(500));
                 }
@@ -457,7 +567,7 @@ fn status_card(app: &mut App, ui: &mut egui::Ui) {
     }
     if f.relay_uses_vpn {
         ui.add_space(6.0);
-        ui.label(egui::RichText::new(status::VPN_TRAFFIC_NOTICE).color(theme::palette(ui).warn));
+        widgets::wrapped_label(ui, status::vpn_traffic_notice(), 14.0, theme::palette(ui).warn);
         vpn_exclusion_button(app, ui, &f);
     }
 }
@@ -498,11 +608,15 @@ fn overview(app: &mut App, ui: &mut egui::Ui) {
 }
 
 fn section_title(ui: &mut egui::Ui, label: &str) {
-    ui.label(egui::RichText::new(label).size(15.0).strong());
+    ui.label(
+        egui::RichText::new(label)
+            .size(15.0)
+            .strong(),
+    );
 }
 
 fn account_controls(app: &mut App, ui: &mut egui::Ui) {
-    section_title(ui, "Управление");
+    section_title(ui, crate::i18n::tr("Управление", "Controls"));
     cap_row(app, ui, Cap::ClientPatch);
     ui.separator();
     bypass_master(app, ui);
@@ -511,7 +625,7 @@ fn account_controls(app: &mut App, ui: &mut egui::Ui) {
 }
 
 fn network_controls(app: &mut App, ui: &mut egui::Ui) {
-    section_title(ui, "Сеть и прокси");
+    section_title(ui, crate::i18n::tr("Сеть и прокси", "Network & Proxy"));
     let caps = [Cap::Dns, Cap::LocalProxy, Cap::OwnProxy, Cap::GroupProxy];
     for (index, cap) in caps.into_iter().enumerate() {
         if index > 0 {
@@ -523,24 +637,20 @@ fn network_controls(app: &mut App, ui: &mut egui::Ui) {
 
 fn control_label(ui: &mut egui::Ui, icon: &str, title: &str, hint: &str) {
     let colors = theme::palette(ui);
-    ui.add(egui::Label::new(widgets::icon_text(
+    let resp = ui.add(egui::Label::new(widgets::icon_text(
         icon,
         title,
         colors.text,
-    )))
-    .on_hover_text(hint);
+    )));
+    widgets::hover_text(resp, ui, hint);
 }
 
 fn bypass_master(app: &mut App, ui: &mut egui::Ui) {
     let mut on = app.status.as_ref().is_some_and(|s| s.bypass_on());
     let enabled = app.status.is_some() && !app.is_busy();
-    let flipped = widgets::switch_row(ui, &mut on, enabled, "Обход ошибки 400", |ui| {
-        control_label(
-            ui,
-            widgets::ROUTE,
-            "Обход ошибки 400",
-            status::BYPASS_TEXT.1,
-        );
+    let label = crate::i18n::tr("Обход ошибки 400", "Error 400 bypass");
+    let flipped = widgets::switch_row(ui, &mut on, enabled, label, |ui| {
+        control_label(ui, widgets::ROUTE, label, status::bypass_text().1);
     });
     if flipped {
         let group_configured = app
@@ -557,7 +667,10 @@ fn integration(app: &mut App, ui: &mut egui::Ui) {
     let Some(status) = app.status.as_ref() else {
         ui.horizontal(|ui| {
             ui.add(egui::Spinner::new().size(14.0));
-            widgets::hint(ui, "Идёт поиск…");
+            widgets::hint(
+                ui,
+                crate::i18n::tr("Идёт поиск…", "Searching…"),
+            );
         });
         return;
     };
@@ -592,8 +705,13 @@ fn integration_group(app: &mut App, ui: &mut egui::Ui, name: &str, rows: &[Insta
         section_title(ui, name);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let found = rows.iter().filter(|row| row.path.is_some()).count();
+            let total = rows.len();
+            let found_text = match crate::i18n::current() {
+                crate::i18n::Lang::Ru => format!("Найдено {found} из {total}"),
+                crate::i18n::Lang::En => format!("Found {found} of {total}"),
+            };
             ui.label(
-                egui::RichText::new(format!("Найдено {found} из {}", rows.len()))
+                egui::RichText::new(&found_text)
                     .size(12.5)
                     .color(theme::palette(ui).muted),
             );
@@ -623,7 +741,16 @@ fn integration_row(app: &mut App, ui: &mut egui::Ui, row: &InstallRow) {
                     .frame_when_inactive(false)
                     .min_size(egui::vec2(32.0, 28.0)),
             );
-            if edit.on_hover_text("Указать путь вручную").clicked() {
+            if widgets::hover_text(
+                edit,
+                ui,
+                crate::i18n::tr(
+                    "Указать путь вручную",
+                    "Specify path manually",
+                ),
+            )
+            .clicked()
+            {
                 app.path_dialog = Some(
                     row.path
                         .as_ref()
@@ -634,22 +761,53 @@ fn integration_row(app: &mut App, ui: &mut egui::Ui, row: &InstallRow) {
             if let Some(path) = &row.path {
                 if row.manual
                     && ui
-                        .add_enabled(enabled, egui::Button::new("Отключить"))
+                        .add_enabled(
+                            enabled,
+                            egui::Button::new(
+                                crate::i18n::tr(
+                                    "Отключить",
+                                    "Remove",
+                                ),
+                            ),
+                        )
                         .clicked()
                 {
                     app.worker.send(Cmd::ForgetPath(path.clone()));
                 }
                 if row.patched == Some(false)
-                    && widgets::command(ui, widgets::REPAIR, "Пропатчить", false, enabled).clicked()
+                    && widgets::command(
+                        ui,
+                        widgets::REPAIR,
+                        crate::i18n::tr("Пропатчить", "Patch"),
+                        false,
+                        enabled,
+                    )
+                    .clicked()
                 {
                     app.worker.send(Cmd::PatchInstall(path.clone()));
                 }
             }
             let (icon, text, color) = match (&row.path, row.patched) {
-                (None, _) => ("", "Не найден", colors.muted),
-                (Some(_), Some(true)) => (widgets::CHECK, "Патч применён", colors.ok),
-                (Some(_), Some(false)) => ("", "Без патча", colors.muted),
-                (Some(_), None) => ("", "Патч не проверен", colors.muted),
+                (None, _) => (
+                    "",
+                    crate::i18n::tr("Не найден", "Not found"),
+                    colors.muted,
+                ),
+                (Some(_), Some(true)) => (
+                    widgets::CHECK,
+                    crate::i18n::tr("Патч применён", "Patched"),
+                    colors.ok,
+                ),
+                (Some(_), Some(false)) => (
+                    "",
+                    crate::i18n::tr("Без патча", "Unpatched"),
+                    colors.muted,
+                ),
+                (Some(_), None) => (
+                    "",
+                    crate::i18n::tr("Патч не проверен", "Not checked"),
+                    colors.muted,
+                ),
             };
             ui.label(widgets::icon_text(icon, text, color));
         });
@@ -703,13 +861,18 @@ fn vpn_exclusion_button(app: &mut App, ui: &mut egui::Ui, facts: &status::Facts)
         .vpn_path_copied
         .is_some_and(|at| at.elapsed() < Duration::from_secs(5));
     let label = if copied {
-        "Путь скопирован"
+        crate::i18n::tr("Путь скопирован", "Path copied")
     } else {
-        "Скопировать путь для исключения VPN"
+        crate::i18n::tr(
+            "Скопировать путь для исключения VPN",
+            "Copy path for VPN exclusion",
+        )
     };
     ui.horizontal(|ui| {
         if ui
-            .add(egui::Button::new(egui::RichText::new(label).size(13.0)))
+            .add(egui::Button::new(
+                egui::RichText::new(label).size(13.0),
+            ))
             .clicked()
         {
             if let Ok(exe) = vpn_exclusion_path(facts) {
@@ -726,8 +889,10 @@ fn vpn_exclusion_button(app: &mut App, ui: &mut egui::Ui, facts: &status::Facts)
     if info_open(ui, "vpn-info") {
         widgets::hint(
             ui,
-            "Копирует путь к запущенной службе обхода или к самому анлокеру, если служба \
-             выключена. Вставьте путь в список исключений VPN.",
+            crate::i18n::tr(
+                "Копирует путь к запущенной службе обхода или к самому анлокеру, если служба выключена. Вставьте путь в список исключений VPN.",
+                "Copies the path to the running bypass service or to the unlocker itself if the service is stopped. Paste it into your VPN exclusion list.",
+            ),
         );
     }
     if copied {
@@ -743,31 +908,41 @@ fn network_facts(app: &App, ui: &mut egui::Ui, relay_uses_vpn: bool) {
         return;
     };
     let vpn = if !r.tunnel {
-        "VPN не обнаружен.".to_string()
+        crate::i18n::tr("VPN не обнаружен.", "No VPN detected.").to_string()
     } else if r.vpn_exit.is_empty() {
-        "VPN включён — соединения службы с сервисами разблокировки идут мимо него.".to_string()
+        crate::i18n::tr(
+            "VPN включён — соединения службы с сервисами разблокировки идут мимо него.",
+            "VPN is on — service connections to unblocking servers bypass it.",
+        )
+        .to_string()
     } else if crate::upstream::region_is_blocked(&r.vpn_exit) {
-        format!(
-            "VPN включён, выход: {} — там ошибка 400, поэтому соединения идут мимо него.",
-            r.vpn_exit
-        )
+        match crate::i18n::current() {
+            crate::i18n::Lang::Ru => format!("VPN включён, выход: {} — там ошибка 400, поэтому соединения идут мимо него.", r.vpn_exit),
+            crate::i18n::Lang::En => format!("VPN is on, exit: {} — error 400 there, so connections bypass it.", r.vpn_exit),
+        }
     } else {
-        format!(
-            "VPN включён, выход: {} — используется как один из путей.",
-            r.vpn_exit
-        )
+        match crate::i18n::current() {
+            crate::i18n::Lang::Ru => format!("VPN включён, выход: {} — используется как один из путей.", r.vpn_exit),
+            crate::i18n::Lang::En => format!("VPN is on, exit: {} — used as one of the routes.", r.vpn_exit),
+        }
     };
     if !relay_uses_vpn {
         widgets::hint(ui, &vpn);
     }
     if !r.route.is_empty() {
-        widgets::hint(ui, &format!("Первый путь сейчас: {}.", r.route));
+        let route_msg = match crate::i18n::current() {
+            crate::i18n::Lang::Ru => format!("Первый путь сейчас: {}.", r.route),
+            crate::i18n::Lang::En => format!("Primary route now: {}.", r.route),
+        };
+        widgets::hint(ui, &route_msg);
     }
     if !r.loopback {
         widgets::hint(
             ui,
-            "Служба ещё не перехватывает имена серверов Google — Antigravity идёт через них, \
-             только если перезапущен после включения обхода.",
+            crate::i18n::tr(
+                "Служба ещё не перехватывает имена серверов Google — Antigravity идёт через них, только если перезапущен после включения обхода.",
+                "The service is not yet intercepting Google hostnames — Antigravity uses them only if restarted after enabling the bypass.",
+            ),
         );
     }
     ui.add_space(8.0);
@@ -806,9 +981,14 @@ fn providers_list(app: &mut App, ui: &mut egui::Ui) {
     let mut dropped = false;
 
     egui::CollapsingHeader::new(
-        egui::RichText::new("Какие DNS использовать")
-            .size(12.5)
-            .color(theme::palette(ui).muted),
+        egui::RichText::new(
+            crate::i18n::tr(
+                "Какие DNS использовать",
+                "Which DNS to use",
+            ),
+        )
+        .size(12.5)
+        .color(theme::palette(ui).muted),
     )
     .id_salt("providers")
     .default_open(true)
@@ -816,16 +996,24 @@ fn providers_list(app: &mut App, ui: &mut egui::Ui) {
         let first_on = providers.iter().position(|p| p.enabled);
         ui.horizontal(|ui| {
             ui.label(
-                egui::RichText::new("Порядок — перетаскиванием за «≡»")
-                    .size(12.0)
-                    .color(theme::palette(ui).muted),
+                egui::RichText::new(
+                    crate::i18n::tr(
+                        "Порядок — перетаскиванием за «≡»",
+                        "Order — drag by \"≡\"",
+                    ),
+                )
+                .size(12.0)
+                .color(theme::palette(ui).muted),
             );
             info_toggle(ui, "providers-info");
         });
         if info_open(ui, "providers-info") {
             widgets::hint(
                 ui,
-                "Зажмите полоски слева и перетащите. Первый в списке спрашивается первым.",
+                crate::i18n::tr(
+                    "Зажмите полоски слева и перетащите. Первый в списке спрашивается первым.",
+                    "Hold the handle on the left and drag. The first in the list is queried first.",
+                ),
             );
         }
         ui.add_space(4.0);
@@ -869,9 +1057,18 @@ fn providers_list(app: &mut App, ui: &mut egui::Ui) {
                         text
                     });
                     if !p.available {
-                        widgets::hint(ui, "— не задан");
+                        widgets::hint(
+                            ui,
+                            crate::i18n::tr("— не задан", "— not set"),
+                        );
                     } else if idle {
-                        widgets::hint(ui, "— не используется");
+                        widgets::hint(
+                            ui,
+                            crate::i18n::tr(
+                                "— не используется",
+                                "— not in use",
+                            ),
+                        );
                     }
                 })
                 .response;
@@ -943,11 +1140,7 @@ fn settings(app: &mut App, ui: &mut egui::Ui) {
     group_proxy_actions(app, ui);
     proxy_field(app, ui, Cap::GroupProxy);
     if crate::group::key_rejected() {
-        ui.label(
-            egui::RichText::new(crate::group::KEY_DEAD_NOTE)
-                .size(12.0)
-                .color(theme::palette(ui).bad),
-        );
+        widgets::wrapped_label(ui, crate::group::key_dead_note(), 12.0, theme::palette(ui).bad);
     }
     ui.add_space(4.0);
     ui.separator();
@@ -955,9 +1148,14 @@ fn settings(app: &mut App, ui: &mut egui::Ui) {
     ui.add_space(4.0);
     ui.separator();
     ui.add_space(4.0);
-    egui::CollapsingHeader::new("Дополнительные параметры сети")
-        .default_open(dev_open())
-        .show(ui, |ui| advanced_network(app, ui));
+    egui::CollapsingHeader::new(
+        crate::i18n::tr(
+            "Дополнительные параметры сети",
+            "Advanced network settings",
+        ),
+    )
+    .default_open(dev_open())
+    .show(ui, |ui| advanced_network(app, ui));
 }
 
 fn proxy_configured(app: &App, cap: Cap) -> bool {
@@ -972,30 +1170,43 @@ fn proxy_heading(app: &App, ui: &mut egui::Ui, cap: Cap) {
     let colors = theme::palette(ui);
     let on = app.status.as_ref().is_some_and(|s| s.get(cap).is_on());
     let (text, color) = if on {
-        ("Включён", colors.ok)
+        (crate::i18n::tr("Включён", "Enabled"), colors.ok)
     } else if proxy_configured(app, cap) {
-        ("Выключен", colors.muted)
+        (crate::i18n::tr("Выключен", "Disabled"), colors.muted)
     } else {
-        ("Не настроен", colors.muted)
+        (
+            crate::i18n::tr("Не настроен", "Not configured"),
+            colors.muted,
+        )
     };
     ui.horizontal(|ui| {
         section_title(ui, status::switch_text(cap).0);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(egui::RichText::new(text).size(12.0).color(color));
+            ui.label(
+                egui::RichText::new(text)
+                    .size(12.0)
+                    .color(color),
+            );
         });
     });
 }
 
 fn group_proxy_actions(app: &mut App, ui: &mut egui::Ui) {
     ui.horizontal_wrapped(|ui| {
-        let copy = widgets::command(
+        let copy = widgets::hover_text(
+            widgets::command(
+                ui,
+                widgets::COPY,
+                crate::i18n::tr("Скопировать команду", "Copy command"),
+                app.main_view.setup == Some(Setup::GroupCopy),
+                true,
+            ),
             ui,
-            widgets::COPY,
-            "Скопировать команду",
-            app.main_view.setup == Some(Setup::GroupCopy),
-            true,
-        )
-        .on_hover_text("Команда для получения кода в группе Nova");
+            crate::i18n::tr(
+                "Команда для получения кода в группе Nova",
+                "Command to get a code in the Nova group",
+            ),
+        );
         app.main_view.focus(Setup::GroupCopy, &copy);
         if copy.clicked() {
             let command = format!("/ag+{}", crate::hwid::pc_code());
@@ -1007,14 +1218,18 @@ fn group_proxy_actions(app: &mut App, ui: &mut egui::Ui) {
             } else {
                 app.main_view.proxy_saved = Some((
                     Cap::GroupProxy,
-                    Err("Не удалось скопировать команду.".into()),
+                    Err(crate::i18n::tr(
+                        "Не удалось скопировать команду.",
+                        "Failed to copy command.",
+                    )
+                    .into()),
                 ));
             }
         }
         let telegram = widgets::command(
             ui,
             widgets::SEND,
-            "Открыть Telegram",
+            crate::i18n::tr("Открыть Telegram", "Open Telegram"),
             app.main_view.setup == Some(Setup::GroupTelegram),
             true,
         );
@@ -1039,11 +1254,23 @@ fn proxy_field(app: &mut App, ui: &mut egui::Ui, cap: Cap) {
     };
     let color = theme::palette(ui);
     let (name, hint, value) = if own {
-        ("Адрес прокси", "адрес:порт", &mut app.own_proxy_input)
+        (
+            crate::i18n::tr("Адрес прокси", "Proxy address"),
+            crate::i18n::tr("адрес:порт", "host:port"),
+            &mut app.own_proxy_input,
+        )
     } else {
-        ("Код из группы", "Код из Telegram", &mut app.group_key_input)
+        (
+            crate::i18n::tr("Код из группы", "Group code"),
+            crate::i18n::tr("Код из Telegram", "Code from Telegram"),
+            &mut app.group_key_input,
+        )
     };
-    let label = ui.label(egui::RichText::new(name).size(12.5).color(color.muted));
+    let label = ui.label(
+        egui::RichText::new(name)
+            .size(12.5)
+            .color(color.muted),
+    );
     let mut submitted = false;
     ui.horizontal(|ui| {
         let button_width = if enabling { 186.0 } else { 128.0 };
@@ -1054,14 +1281,21 @@ fn proxy_field(app: &mut App, ui: &mut egui::Ui, cap: Cap) {
             .desired_width(available)
             .margin(egui::Margin::symmetric(9, 7))
             .background_color(if selected { color.soft } else { color.sunken });
-        let response = ui
-            .add_enabled(enabled, field)
-            .labelled_by(label.id)
-            .on_hover_text(if own {
-                "адрес:порт или логин:пароль@адрес:порт"
+        let response = widgets::hover_text(
+            ui.add_enabled(enabled, field).labelled_by(label.id),
+            ui,
+            if own {
+                crate::i18n::tr(
+                    "адрес:порт или логин:пароль@адрес:порт",
+                    "host:port or user:pass@host:port",
+                )
             } else {
-                "Правый клик — вставить код из буфера"
-            });
+                crate::i18n::tr(
+                    "Правый клик — вставить код из буфера",
+                    "Right-click to paste code from clipboard",
+                )
+            },
+        );
         app.main_view.focus(step, &response);
         if !own && response.secondary_clicked() && enabled {
             if let Some(text) = crate::utils::clipboard_text() {
@@ -1070,9 +1304,12 @@ fn proxy_field(app: &mut App, ui: &mut egui::Ui, cap: Cap) {
         }
         let can_save = enabled && ((!enabling && own) || !value.trim().is_empty());
         let save_text = if enabling {
-            "Сохранить и включить"
+            crate::i18n::tr(
+                "Сохранить и включить",
+                "Save and enable",
+            )
         } else {
-            "Сохранить"
+            crate::i18n::tr("Сохранить", "Save")
         };
         let enter = response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
         submitted = widgets::command(ui, widgets::CHECK, save_text, false, can_save).clicked()
@@ -1097,49 +1334,108 @@ fn proxy_field(app: &mut App, ui: &mut egui::Ui, cap: Cap) {
     if let Some((saved_cap, result)) = &app.main_view.proxy_saved {
         if *saved_cap == cap {
             let (text, ink) = match result {
-                Ok(()) => ("Сохранено", color.ok),
+                Ok(()) => (
+                    crate::i18n::tr("Сохранено", "Saved"),
+                    color.ok,
+                ),
                 Err(error) => (error.as_str(), color.bad),
             };
-            ui.label(egui::RichText::new(text).size(12.5).color(ink));
+            ui.label(
+                egui::RichText::new(text)
+                    .size(12.5)
+                    .color(ink),
+            );
         }
     }
 }
 
 /// User DNS joins the existing provider pool.
 fn custom_dns_field(app: &mut App, ui: &mut egui::Ui) {
-    section_title(ui, "Свой DNS");
+    section_title(ui, crate::i18n::tr("Свой DNS", "Custom DNS"));
     let colors = theme::palette(ui);
     let enabled = !app.is_busy();
     let label = ui.label(
-        egui::RichText::new("Адрес DNS")
-            .size(12.5)
-            .color(colors.muted),
+        egui::RichText::new(
+            crate::i18n::tr("Адрес DNS", "DNS address"),
+        )
+        .size(12.5)
+        .color(colors.muted),
     );
     ui.horizontal(|ui| {
-        let response = ui.add_enabled(
-            enabled,
-            egui::TextEdit::singleline(&mut app.custom_dns_input)
-                .hint_text("IPv4, DoH или DoT")
-                .desired_width((ui.available_width() - 128.0).max(80.0))
-                .margin(egui::Margin::symmetric(9, 7)),
-        ).labelled_by(label.id).on_hover_text(
-            "Несколько адресов можно разделить пробелами. Примеры: 77.88.8.8, https://dns.example.com/dns-query, tls://dns.example.com.",
+        let resp = ui
+            .add_enabled(
+                enabled,
+                egui::TextEdit::singleline(&mut app.custom_dns_input)
+                    .hint_text(
+                        crate::i18n::tr(
+                            "IPv4, DoH или DoT",
+                            "IPv4, DoH, or DoT",
+                        ),
+                    )
+                    .desired_width((ui.available_width() - 128.0).max(80.0))
+                    .margin(egui::Margin::symmetric(9, 7)),
+            )
+            .labelled_by(label.id);
+        let response = widgets::hover_text(
+            resp,
+            ui,
+            crate::i18n::tr(
+                "Несколько адресов можно разделить пробелами. Примеры: 77.88.8.8, https://dns.example.com/dns-query, tls://dns.example.com.",
+                "Separate multiple addresses with spaces. Examples: 77.88.8.8, https://dns.example.com/dns-query, tls://dns.example.com.",
+            ),
         );
         let enter = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-        if widgets::command(ui, widgets::CHECK, "Сохранить", false, enabled).clicked() || (enabled && enter) {
-            app.worker.send(Cmd::SetCustomDns(app.custom_dns_input.clone()));
+        if widgets::command(
+            ui,
+            widgets::CHECK,
+            crate::i18n::tr("Сохранить", "Save"),
+            false,
+            enabled,
+        )
+        .clicked()
+            || (enabled && enter)
+        {
+            app.worker
+                .send(Cmd::SetCustomDns(app.custom_dns_input.clone()));
         }
     });
 }
 
 fn cap_row(app: &mut App, ui: &mut egui::Ui, cap: Cap) {
     let (title, icon, setup) = match cap {
-        Cap::ClientPatch => ("Разблокировка входа", widgets::KEY, None),
-        Cap::Watchdog => ("Автопатч", widgets::REFRESH, None),
-        Cap::Dns => ("Обход через DNS-AI", widgets::DNS, None),
-        Cap::LocalProxy => ("Локальный прокси", widgets::SERVER, None),
-        Cap::OwnProxy => ("Свой HTTP-прокси", widgets::PROXY, Some(Setup::OwnAddress)),
-        Cap::GroupProxy => ("Прокси из группы", widgets::GROUP, Some(Setup::GroupCopy)),
+        Cap::ClientPatch => (
+            crate::i18n::tr(
+                "Разблокировать вход",
+                "Unlock sign-in",
+            ),
+            widgets::KEY,
+            None,
+        ),
+        Cap::Watchdog => (
+            crate::i18n::tr("Автопатч", "Auto-patch"),
+            widgets::REFRESH,
+            None,
+        ),
+        Cap::Dns => (
+            crate::i18n::tr("Обход через DNS-AI", "DNS-AI bypass"),
+            widgets::DNS,
+            None,
+        ),
+        Cap::LocalProxy => (
+            crate::i18n::tr("Локальный прокси", "Local proxy"),
+            widgets::SERVER,
+            None,
+        ),
+        Cap::OwnProxy => (
+            crate::i18n::tr("Свой HTTP-прокси", "Own HTTP proxy"),
+            widgets::PROXY,
+            Some(Setup::OwnAddress),
+        ),
+        Cap::GroupProxy => (
+            crate::i18n::tr("Прокси из группы", "Group proxy"),
+            widgets::GROUP,
+            Some(Setup::GroupCopy),
+        ),
         Cap::DnsRotation => (status::switch_text(cap).0, widgets::REFRESH, None),
     };
     let (_, hint) = status::switch_text(cap);
@@ -1157,16 +1453,16 @@ fn cap_row(app: &mut App, ui: &mut egui::Ui, cap: Cap) {
     let flipped = widgets::switch_row(ui, &mut on, enabled, title, |ui| {
         control_label(ui, icon, title, hint);
         let note = state.note().or(if new_setup.is_some() {
-            Some("Не настроен")
+            Some(crate::i18n::tr("Не настроен", "Not configured"))
         } else {
             None
         });
         if let Some(note) = note {
-            ui.label(egui::RichText::new(note).size(12.0).color(if blocked {
-                colors.warn
-            } else {
-                colors.muted
-            }));
+            ui.label(
+                egui::RichText::new(note)
+                    .size(12.0)
+                    .color(if blocked { colors.warn } else { colors.muted }),
+            );
         }
     });
     if flipped {
@@ -1199,13 +1495,18 @@ fn journal(app: &mut App, ui: &mut egui::Ui) {
     // Consume select-all/copy before egui's per-label selection sees the event.
     log_keys(app, ui);
     ui.horizontal(|ui| {
-        ui.label(egui::RichText::new(Page::Log.label()).size(24.0).strong());
+        ui.label(
+            egui::RichText::new(Page::Log.label())
+                .size(24.0)
+                .strong(),
+        );
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             theme_toggle(app, ui);
+            lang_toggle(app, ui);
             if widgets::command(
                 ui,
                 widgets::COPY,
-                "Скопировать журнал",
+                crate::i18n::tr("Скопировать журнал", "Copy log"),
                 false,
                 !app.log.is_empty(),
             )
@@ -1219,11 +1520,24 @@ fn journal(app: &mut App, ui: &mut egui::Ui) {
                 if at.elapsed() < show_for {
                     let colors = theme::palette(ui);
                     let (text, color) = if copied {
-                        ("Журнал скопирован", colors.ok)
+                        (
+                            crate::i18n::tr("Журнал скопирован", "Log copied"),
+                            colors.ok,
+                        )
                     } else {
-                        ("Не удалось скопировать", colors.bad)
+                        (
+                            crate::i18n::tr(
+                                "Не удалось скопировать",
+                                "Failed to copy",
+                            ),
+                            colors.bad,
+                        )
                     };
-                    ui.label(egui::RichText::new(text).size(12.0).color(color));
+                    ui.label(
+                        egui::RichText::new(text)
+                            .size(12.0)
+                            .color(color),
+                    );
                     ui.ctx()
                         .request_repaint_after(show_for.saturating_sub(at.elapsed()));
                 }
@@ -1237,7 +1551,7 @@ fn journal(app: &mut App, ui: &mut egui::Ui) {
         .auto_shrink([false, false])
         .show(ui, |ui| {
             if app.log.is_empty() {
-                widgets::hint(ui, "Пусто");
+                widgets::hint(ui, crate::i18n::tr("Пусто", "Empty"));
             }
             let colors = theme::palette(ui);
             let fill = ui.visuals().selection.bg_fill;
@@ -1249,7 +1563,8 @@ fn journal(app: &mut App, ui: &mut egui::Ui) {
                     Level::Step => colors.text,
                     Level::Info => colors.muted,
                 };
-                let mut text = egui::RichText::new(log_line(*level, line))
+                let line_str = log_line(*level, line);
+                let mut text = egui::RichText::new(&line_str)
                     .color(color)
                     .size(13.0);
                 if *level == Level::Step {
@@ -1310,16 +1625,39 @@ fn footer(app: &mut App, ui: &mut egui::Ui) {
     let colors = theme::palette(ui);
     ui.horizontal(|ui| {
         let (label, color) = match app.status.as_ref() {
-            Some(s) if s.relay_outdated => ("Служба устарела", colors.warn),
-            Some(s) if s.relay_running => ("Служба запущена", colors.ok),
-            Some(_) => ("Служба остановлена", colors.muted),
-            None => ("Проверка службы…", colors.muted),
+            Some(s) if s.relay_outdated => (
+                crate::i18n::tr("Служба устарела", "Service outdated"),
+                colors.warn,
+            ),
+            Some(s) if s.relay_running => (
+                crate::i18n::tr("Служба запущена", "Service running"),
+                colors.ok,
+            ),
+            Some(_) => (
+                crate::i18n::tr("Служба остановлена", "Service stopped"),
+                colors.muted,
+            ),
+            None => (
+                crate::i18n::tr(
+                    "Проверка службы…",
+                    "Checking service…",
+                ),
+                colors.muted,
+            ),
         };
         widgets::dot(ui, color);
-        ui.label(egui::RichText::new(label).size(12.5).color(colors.muted));
+        ui.label(
+            egui::RichText::new(label)
+                .size(12.5)
+                .color(colors.muted),
+        );
         if let Some(what) = &app.busy {
             ui.add(egui::Spinner::new().size(13.0));
-            ui.label(egui::RichText::new(what).size(12.5).color(colors.muted));
+            ui.label(
+                egui::RichText::new(what)
+                    .size(12.5)
+                    .color(colors.muted),
+            );
         }
         if app.main_view.page == Page::Overview {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1335,17 +1673,27 @@ fn footer(app: &mut App, ui: &mut egui::Ui) {
 
 fn deactivation_button(ui: &mut egui::Ui, enabled: bool) -> egui::Response {
     let colors = theme::palette(ui);
-    ui.add_enabled(
+    let resp = ui.add_enabled(
         enabled,
         egui::Button::new(widgets::icon_text(
             widgets::POWER,
-            "Полная деактивация",
+            crate::i18n::tr(
+                "Полная деактивация",
+                "Full deactivation",
+            ),
             colors.muted,
         ))
         .frame_when_inactive(false)
         .min_size(egui::vec2(0.0, 32.0)),
+    );
+    widgets::hover_text(
+        resp,
+        ui,
+        crate::i18n::tr(
+            "Снять патчи, выключить обход ошибки 400 и удалить фоновые службы",
+            "Remove patches, turn off error 400 bypass, and delete background services",
+        ),
     )
-    .on_hover_text("Снять патчи, выключить обход ошибки 400 и удалить фоновые службы")
 }
 
 fn deactivation_dialog(app: &mut App, ctx: &egui::Context) {
@@ -1354,17 +1702,49 @@ fn deactivation_dialog(app: &mut App, ctx: &egui::Context) {
     }
     let dialog = egui::Modal::new(egui::Id::new("confirm-deactivation")).show(ctx, |ui| {
         ui.set_max_width(420.0);
-        section_title(ui, "Полная деактивация");
-        ui.label("Antigravity будет закрыт. Патчи будут сняты, обход выключен, фоновые службы и данные анлокера удалены.");
+        section_title(
+            ui,
+            crate::i18n::tr(
+                "Полная деактивация",
+                "Full deactivation",
+            ),
+        );
+        widgets::wrapped_label(
+            ui,
+            crate::i18n::tr(
+                "Antigravity будет закрыт. Патчи будут сняты, обход выключен, фоновые службы и данные анлокера удалены.",
+                "Antigravity will be closed. Patches will be removed, bypass turned off, and background services and unlocker data deleted.",
+            ),
+            14.5,
+            theme::palette(ui).text,
+        );
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let confirm = widgets::command(ui, widgets::POWER, "Деактивировать", false, !app.is_busy()).clicked();
-            let cancel = ui.button("Отмена").clicked();
+            let confirm = widgets::command(
+                ui,
+                widgets::POWER,
+                crate::i18n::tr("Деактивировать", "Deactivate"),
+                false,
+                !app.is_busy(),
+            )
+            .clicked();
+            let cancel = ui
+                .button(
+                    crate::i18n::tr("Отмена", "Cancel"),
+                )
+                .clicked();
             (confirm, cancel)
-        }).inner
+        })
+        .inner
     });
     let (confirm, cancel) = dialog.inner;
     if confirm {
-        app.busy = Some("Полная деактивация".into());
+        app.busy = Some(
+            crate::i18n::tr(
+                "Полная деактивация",
+                "Full deactivation",
+            )
+            .into(),
+        );
         app.worker.send(Cmd::Deactivate);
     }
     if confirm || cancel || dialog.should_close() {
@@ -1380,41 +1760,55 @@ pub fn path_dialog(app: &mut App, ctx: &egui::Context) {
     let mut keep_open = true;
     let mut submit = false;
 
-    egui::Window::new("Путь к Antigravity")
-        .collapsible(false)
-        .resizable(false)
-        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-        .show(ctx, |ui| {
-            ui.set_min_width(420.0);
-            widgets::hint(
+    egui::Window::new(
+        crate::i18n::tr(
+            "Путь к Antigravity",
+            "Path to Antigravity",
+        ),
+    )
+    .collapsible(false)
+    .resizable(false)
+    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+    .show(ctx, |ui| {
+        ui.set_min_width(420.0);
+        widgets::hint(
+            ui,
+            crate::i18n::tr(
+                "Папка установки Antigravity, IDE или CLI. Можно указать вложенную — корень будет найден сам.",
+                "Installation folder for Antigravity, IDE, or CLI. A nested folder works too — the root will be found automatically.",
+            ),
+        );
+        ui.add_space(8.0);
+        ui.add(
+            egui::TextEdit::singleline(&mut text)
+                .desired_width(f32::INFINITY)
+                .hint_text("C:\\Users\\...\\Programs\\Antigravity"),
+        );
+        if let Some(err) = &app.path_dialog_error {
+            ui.add_space(6.0);
+            widgets::wrapped_label(ui, err, 12.5, theme::palette(ui).bad);
+        }
+        ui.add_space(10.0);
+        ui.horizontal(|ui| {
+            if widgets::primary(
                 ui,
-                "Папка установки Antigravity, IDE или CLI. Можно указать вложенную — \
-                 корень будет найден сам.",
-            );
-            ui.add_space(8.0);
-            ui.add(
-                egui::TextEdit::singleline(&mut text)
-                    .desired_width(f32::INFINITY)
-                    .hint_text("C:\\Users\\...\\Programs\\Antigravity"),
-            );
-            if let Some(err) = &app.path_dialog_error {
-                ui.add_space(6.0);
-                ui.label(
-                    egui::RichText::new(err)
-                        .color(theme::palette(ui).bad)
-                        .size(12.5),
-                );
+                crate::i18n::tr("Добавить", "Add"),
+                !text.trim().is_empty(),
+            )
+            .clicked()
+            {
+                submit = true;
             }
-            ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                if widgets::primary(ui, "Добавить", !text.trim().is_empty()).clicked() {
-                    submit = true;
-                }
-                if widgets::ghost(ui, "Отмена").clicked() {
-                    keep_open = false;
-                }
-            });
+            if widgets::ghost(
+                ui,
+                crate::i18n::tr("Отмена", "Cancel"),
+            )
+            .clicked()
+            {
+                keep_open = false;
+            }
         });
+    });
 
     if submit {
         let cleaned = crate::clean_input_path(&text);
@@ -1425,8 +1819,13 @@ pub fn path_dialog(app: &mut App, ctx: &egui::Context) {
                 keep_open = false;
             }
             None => {
-                app.path_dialog_error =
-                    Some("По этому пути установка Antigravity не найдена.".into());
+                app.path_dialog_error = Some(
+                    crate::i18n::tr(
+                        "По этому пути установка Antigravity не найдена.",
+                        "Antigravity installation not found at this path.",
+                    )
+                    .into(),
+                );
             }
         }
     }

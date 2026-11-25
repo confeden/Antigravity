@@ -22,8 +22,12 @@ use std::time::Duration;
 use crate::gate::View;
 use crate::ops::{Cap, Status};
 
-pub const VPN_TRAFFIC_NOTICE: &str = "Трафик анлокера идёт через VPN.\n\
-    Если возникают ошибки, добавьте анлокер в исключения приложения VPN.";
+pub fn vpn_traffic_notice() -> &'static str {
+    crate::i18n::tr(
+        "Трафик анлокера идёт через VPN.\nЕсли возникают ошибки, добавьте анлокер в исключения приложения VPN.",
+        "Unlocker traffic is going through VPN.\nIf errors occur, add the unlocker to your VPN app's exclusions.",
+    )
+}
 
 /// How the card is coloured, and how loud it is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,10 +60,16 @@ pub enum Action {
 impl Action {
     pub fn label(self) -> &'static str {
         match self {
-            Action::EnableAll => "Включить всё",
-            Action::Elevate => "Перезапустить от имени администратора",
-            Action::Repair => "Починить",
-            Action::Verify => "Пройти верификацию в браузере",
+            Action::EnableAll => crate::i18n::tr("Включить всё", "Enable all"),
+            Action::Elevate => crate::i18n::tr(
+                "Перезапустить от имени администратора",
+                "Restart as administrator",
+            ),
+            Action::Repair => crate::i18n::tr("Починить", "Repair"),
+            Action::Verify => crate::i18n::tr(
+                "Пройти верификацию в браузере",
+                "Verify in browser",
+            ),
         }
     }
 }
@@ -274,50 +284,76 @@ pub fn provider_name(name: &str) -> String {
 }
 
 /// The master switch of the bypass: what it is called and what it does.
-pub const BYPASS_TEXT: (&str, &str) = (
-    "Снять ошибку 400 в чате с ИИ",
-    "Сам находит рабочий путь до серверов Google и переключается, если путь \
-     перестал работать — с VPN и без.",
-);
+pub fn bypass_text() -> (&'static str, &'static str) {
+    (
+        crate::i18n::tr(
+            "Снять ошибку 400 в чате с ИИ",
+            "Fix error 400 in AI chat",
+        ),
+        crate::i18n::tr(
+            "Сам находит рабочий путь до серверов Google и переключается, если путь перестал работать — с VPN и без.",
+            "Automatically finds a working route to Google servers and switches if a route stops working — with or without VPN.",
+        ),
+    )
+}
 
 /// What a switch is called and what it does, in both front ends.
 pub fn switch_text(cap: Cap) -> (&'static str, &'static str) {
     match cap {
         Cap::ClientPatch => (
-            "Вход в аккаунт из-под санкций",
-            "Снимает блокировку входа в Google-аккаунт из санкционного региона.",
+            crate::i18n::tr(
+                "Вход в аккаунт из-под санкций",
+                "Account sign-in from restricted regions",
+            ),
+            crate::i18n::tr(
+                "Снимает блокировку входа в Google-аккаунт из санкционного региона.",
+                "Lifts the Google account sign-in block from restricted regions.",
+            ),
         ),
         Cap::Watchdog => (
-            "Автопатч",
-            "Сам накладывает патч на найденный Antigravity — сразу после установки и после каждого обновления, которое его стирает.",
+            crate::i18n::tr("Автопатч", "Auto-patch"),
+            crate::i18n::tr(
+                "Сам накладывает патч на найденный Antigravity — сразу после установки и после каждого обновления, которое его стирает.",
+                "Automatically patches detected Antigravity — right after installation and after every update that overwrites it.",
+            ),
         ),
         Cap::Dns => (
-            "Обход через DNS",
-            "Служба на этом компьютере отвечает на имена двух серверов Google и держит их \
-             разрешающимися через сервисы разблокировки. Без неё обход не работает.",
+            crate::i18n::tr("Обход через DNS", "DNS bypass"),
+            crate::i18n::tr(
+                "Служба на этом компьютере отвечает на имена двух серверов Google и держит их разрешающимися через сервисы разблокировки. Без неё обход не работает.",
+                "A local service resolves the two Google server hostnames through unblocking DNS providers. Without it, the bypass does not work.",
+            ),
         ),
         Cap::LocalProxy => (
-            "Локальный прокси",
-            "Соединения Antigravity с этими двумя серверами идут через посредника внутри \
-             вашего компьютера: он выбирает путь, который реально работает, и переключается \
-             сам. Содержимое не расшифровывается — посредник только передаёт байты.",
+            crate::i18n::tr("Локальный прокси", "Local proxy"),
+            crate::i18n::tr(
+                "Соединения Antigravity с этими двумя серверами идут через посредника внутри вашего компьютера: он выбирает путь, который реально работает, и переключается сам. Содержимое не расшифровывается — посредник только передаёт байты.",
+                "Antigravity connections to these two servers go through a local proxy on your computer: it picks a working route and switches automatically. Traffic is not decrypted — it only forwards bytes.",
+            ),
         ),
         Cap::GroupProxy => (
-            "Прокси из группы",
-            "Выделенный сервер группы: через него идут только запросы к моделям.",
+            crate::i18n::tr("Прокси из группы", "Group proxy"),
+            crate::i18n::tr(
+                "Выделенный сервер группы: через него идут только запросы к моделям.",
+                "Dedicated group server: only model requests go through it.",
+            ),
         ),
         Cap::OwnProxy => (
-            "Свой HTTP-прокси",
-            "Ваш собственный прокси в разрешённой стране — он всегда пробуется первым. \
-             Формат: логин:пароль@адрес:порт — или просто адрес:порт, если пароля нет, \
-             например ivan:secret@203.0.113.9:3128. Только HTTP-прокси, SOCKS не \
-             подойдёт. Google может не принять прокси из дата-центра даже там.",
+            crate::i18n::tr("Свой HTTP-прокси", "Own HTTP proxy"),
+            crate::i18n::tr(
+                "Ваш собственный прокси в разрешённой стране — он всегда пробуется первым. Формат: логин:пароль@адрес:порт — или просто адрес:порт, если пароля нет, например ivan:secret@203.0.113.9:3128. Только HTTP-прокси, SOCKS не подойдёт. Google может не принять прокси из дата-центра даже там.",
+                "Your own proxy in an allowed country — always tried first. Format: user:pass@host:port or host:port (e.g. user:secret@203.0.113.9:3128). HTTP proxies only, SOCKS is not supported.",
+            ),
         ),
         Cap::DnsRotation => (
-            "Ротация между серверами",
-            "Включено: запрос идёт ко всем включённым серверам, ответ сверяется \
-             с эталонным резолвером. Выключено: используется только первый \
-             включённый в списке, запасных не будет.",
+            crate::i18n::tr(
+                "Ротация между серверами",
+                "Server rotation",
+            ),
+            crate::i18n::tr(
+                "Включено: запрос идёт ко всем включённым серверам, ответ сверяется с эталонным резолвером. Выключено: используется только первый включённый в списке, запасных не будет.",
+                "On: queries race all enabled servers and answers are verified against a reference resolver. Off: only the first enabled server in the list is used, with no fallback.",
+            ),
         ),
     }
 }
@@ -329,71 +365,111 @@ pub fn switch_text(cap: Cap) -> (&'static str, &'static str) {
 fn blocked(b: &crate::gate::Blocker, exe: &str) -> Headline {
     let port = b.addr.rsplit(':').next().unwrap_or(&b.addr);
     let effect = match b.what.as_str() {
-        "door" => "Antigravity обращается к Google мимо обхода и получает ошибку 400",
-        "dns" => "подмена адресов не работает и запросы к Google идут медленнее",
-        _ => "обход ошибки 400 работает не полностью",
+        "door" => crate::i18n::tr(
+            "Antigravity обращается к Google мимо обхода и получает ошибку 400",
+            "Antigravity contacts Google directly bypassing the unlocker and gets error 400",
+        ),
+        "dns" => crate::i18n::tr(
+            "подмена адресов не работает и запросы к Google идут медленнее",
+            "address substitution is not working and requests to Google are slower",
+        ),
+        _ => crate::i18n::tr(
+            "обход ошибки 400 работает не полностью",
+            "error 400 bypass is only partially working",
+        ),
     };
-    // Port 53 held by a service is the one case where the image name is worse
-    // than useless: it is `svchost.exe`, which the user cannot act on. What
-    // actually holds it is nearly always Internet Connection Sharing, started
-    // behind the user's back by the Hyper-V default switch, the mobile hotspot
-    // or a virtual machine - so that is what the card says instead.
     let system_holder = b.by.is_empty() || b.by.eq_ignore_ascii_case("svchost.exe");
     if b.what == "dns" && b.cause == "held" && system_holder {
         return Headline {
             tone: Tone::Action,
-            title: format!("Порт {port} занят системной службой"),
-            detail: format!(
-                "Порт {port} держит системная служба Windows, поэтому {effect}. Обычно это \
-                 «Общий доступ к подключению к Интернету (ICS)» — его включают Hyper-V, \
-                 мобильный хот-спот и виртуальные машины. Откройте «Службы», остановите \
-                 «Общий доступ к подключению к Интернету (ICS)» и поставьте тип запуска \
-                 «Отключена». Обход займёт порт сам в течение минуты."
-            ),
+            title: match crate::i18n::current() {
+                crate::i18n::Lang::Ru => format!("Порт {port} занят системной службой"),
+                crate::i18n::Lang::En => format!("Port {port} is used by a system service"),
+            },
+            detail: match crate::i18n::current() {
+                crate::i18n::Lang::Ru => format!(
+                    "Порт {port} держит системная служба Windows, поэтому {effect}. Обычно это «Общий доступ к подключению к Интернету (ICS)» — его включают Hyper-V, мобильный хот-спот и виртуальные машины. Откройте «Службы», остановите «Общий доступ к подключению к Интернету (ICS)» и поставьте тип запуска «Отключена». Обход займёт порт сам в течение минуты."
+                ),
+                crate::i18n::Lang::En => format!(
+                    "Port {port} is held by a Windows system service, so {effect}. Usually this is Internet Connection Sharing (ICS) — enabled by Hyper-V, mobile hotspot, or virtual machines. Open Services, stop Internet Connection Sharing (ICS), and set its startup type to Disabled. The bypass will claim the port within a minute."
+                ),
+            },
             action: Some(Action::Repair),
         };
     }
     let (title, detail) = match b.cause.as_str() {
         "held" => {
             let who = if b.by.is_empty() {
-                "другая программа".to_string()
+                crate::i18n::tr("другая программа", "another program").to_string()
             } else {
-                format!("программа «{}»", b.by)
+                match crate::i18n::current() {
+                    crate::i18n::Lang::Ru => format!("программа «{}»", b.by),
+                    crate::i18n::Lang::En => format!("program \"{}\"", b.by),
+                }
             };
             (
-                format!("Порт {port} занят другой программой"),
-                format!(
-                    "Порт {port} на этом компьютере занимает {who}, поэтому {effect}. Закройте её \
-                     или отключите в ней веб-сервер — обход сам займёт порт в течение минуты. \
-                     Или нажмите «Починить»."
-                ),
+                match crate::i18n::current() {
+                    crate::i18n::Lang::Ru => format!("Порт {port} занят другой программой"),
+                    crate::i18n::Lang::En => format!("Port {port} is used by another program"),
+                },
+                match crate::i18n::current() {
+                    crate::i18n::Lang::Ru => format!(
+                        "Порт {port} на этом компьютере занимает {who}, поэтому {effect}. Закройте её или отключите в ней веб-сервер — обход сам займёт порт в течение минуты. Или нажмите «Починить»."
+                    ),
+                    crate::i18n::Lang::En => format!(
+                        "Port {port} is occupied by {who}, so {effect}. Close it or disable its web server — the bypass will claim the port within a minute, or click \"Repair\"."
+                    ),
+                },
             )
         }
         "reserved" => (
-            format!("Windows закрыла порт {port}"),
-            format!(
-                "Порт {port} зарезервирован системой — так делают Hyper-V, WSL и Docker, — \
-                 поэтому {effect}. Откройте командную строку от имени администратора, выполните \
-                 «net stop winnat», затем «net start winnat» и нажмите «Починить»."
-            ),
+            match crate::i18n::current() {
+                crate::i18n::Lang::Ru => format!("Windows закрыла порт {port}"),
+                crate::i18n::Lang::En => format!("Windows reserved port {port}"),
+            },
+            match crate::i18n::current() {
+                crate::i18n::Lang::Ru => format!(
+                    "Порт {port} зарезервирован системой — так делают Hyper-V, WSL и Docker, — поэтому {effect}. Откройте командную строку от имени администратора, выполните «net stop winnat», затем «net start winnat» и нажмите «Починить»."
+                ),
+                crate::i18n::Lang::En => format!(
+                    "Port {port} is reserved by Windows (Hyper-V, WSL, Docker), so {effect}. Run \"net stop winnat\" then \"net start winnat\" in an elevated command prompt, and click \"Repair\"."
+                ),
+            },
         ),
         "denied" => (
-            "Антивирус блокирует обход".to_string(),
-            format!(
-                "Антивирус или файрвол не даёт службе обхода открыть порт {port}, поэтому \
-                 {effect}. Добавьте в исключения антивируса файл {} — обход заработает сам в \
-                 течение минуты. Или нажмите «Починить».",
-                exe_or_default(exe)
-            ),
+            crate::i18n::tr(
+                "Антивирус блокирует обход",
+                "Antivirus is blocking the bypass",
+            )
+            .to_string(),
+            match crate::i18n::current() {
+                crate::i18n::Lang::Ru => format!(
+                    "Антивирус или файрвол не даёт службе обхода открыть порт {port}, поэтому {effect}. Добавьте в исключения антивируса файл {} — обход заработает сам в течение минуты. Или нажмите «Починить».",
+                    exe_or_default(exe)
+                ),
+                crate::i18n::Lang::En => format!(
+                    "Antivirus or firewall prevents the bypass service from opening port {port}, so {effect}. Add {} to your antivirus exclusions or click \"Repair\".",
+                    exe_or_default(exe)
+                ),
+            },
         ),
         _ => (
-            format!("Порт {port} недоступен"),
-            format!(
-                "Служба обхода не может открыть порт {port} ({}), поэтому {effect}. Нажмите \
-                 «Починить»; не помогло — {}",
-                b.error,
-                super::report::when_stuck()
-            ),
+            match crate::i18n::current() {
+                crate::i18n::Lang::Ru => format!("Порт {port} недоступен"),
+                crate::i18n::Lang::En => format!("Port {port} is unavailable"),
+            },
+            match crate::i18n::current() {
+                crate::i18n::Lang::Ru => format!(
+                    "Служба обхода не может открыть порт {port} ({}), поэтому {effect}. Нажмите «Починить»; не помогло — {}",
+                    b.error,
+                    super::report::when_stuck()
+                ),
+                crate::i18n::Lang::En => format!(
+                    "The bypass service cannot open port {port} ({}), so {effect}. Click \"Repair\"; if that doesn't help — {}",
+                    b.error,
+                    super::report::when_stuck()
+                ),
+            },
         ),
     };
     Headline {
@@ -418,16 +494,38 @@ fn exe_or_default(exe: &str) -> String {
 /// One blocker as a line of the report: what, where, why.
 pub fn blocker_line(b: &crate::gate::Blocker) -> String {
     let what = match b.what.as_str() {
-        "door" => "локальные адреса гейт-хостов",
-        "dns" => "DNS-релей",
-        _ => "локальный прокси",
+        "door" => crate::i18n::tr(
+            "локальные адреса гейт-хостов",
+            "local gate host addresses",
+        ),
+        "dns" => crate::i18n::tr("DNS-релей", "DNS relay"),
+        _ => crate::i18n::tr("локальный прокси", "local proxy"),
     };
     let why = match b.cause.as_str() {
-        "held" if !b.by.is_empty() => format!("порт занят программой «{}»", b.by),
-        "held" => "порт занят другой программой".to_string(),
-        "reserved" => "порт зарезервирован Windows (Hyper-V/WSL/Docker)".to_string(),
-        "denied" => "доступ запрещён — антивирус или файрвол".to_string(),
-        _ => "причина не определена".to_string(),
+        "held" if !b.by.is_empty() => match crate::i18n::current() {
+            crate::i18n::Lang::Ru => format!("порт занят программой «{}»", b.by),
+            crate::i18n::Lang::En => format!("port held by \"{}\"", b.by),
+        },
+        "held" => crate::i18n::tr(
+            "порт занят другой программой",
+            "port held by another program",
+        )
+        .to_string(),
+        "reserved" => crate::i18n::tr(
+            "порт зарезервирован Windows (Hyper-V/WSL/Docker)",
+            "port reserved by Windows (Hyper-V/WSL/Docker)",
+        )
+        .to_string(),
+        "denied" => crate::i18n::tr(
+            "доступ запрещён — антивирус или файрвол",
+            "access denied — antivirus or firewall",
+        )
+        .to_string(),
+        _ => crate::i18n::tr(
+            "причина не определена",
+            "unknown reason",
+        )
+        .to_string(),
     };
     format!("{what} ({}): {why} — {}", b.addr, b.error)
 }
@@ -438,107 +536,149 @@ pub fn headline(f: &Facts) -> Headline {
     if !f.installs_found && !f.patch_on && !f.bypass_on {
         return Headline {
             tone: Tone::Off,
-            title: "Antigravity не найден".into(),
-            detail: "Установите Antigravity или укажите папку с ним ниже — карандаш рядом с нужной строкой."
-                .into(),
+            title: crate::i18n::tr(
+                "Antigravity не найден",
+                "Antigravity not found",
+            )
+            .into(),
+            detail: crate::i18n::tr(
+                "Установите Antigravity или укажите папку с ним ниже — карандаш рядом с нужной строкой.",
+                "Install Antigravity or specify its folder below using the edit icon next to the row.",
+            )
+            .into(),
             action: None,
         };
     }
 
-    // Google itself stopped the account until it is verified. Above everything
-    // the bypass says: no route and no switch changes this, only the user in a
-    // browser - and the client does not always offer the button for it.
-    // Only while nothing has answered since: an answer after it means the
-    // account was verified, whatever the log still says.
     let verify_due = f
         .verify
         .as_ref()
         .filter(|(ago, _)| *ago <= VERIFY_FOR && f.answer.is_none_or(|a| a > *ago));
     if let Some((ago, _)) = verify_due {
+        let ago_s = ago_text(*ago);
         return Headline {
             tone: Tone::Action,
-            title: "Нужна верификация аккаунта Google".into(),
-            detail: format!(
-                "Google попросил подтвердить аккаунт — {}. Antigravity не всегда показывает \
-                 для этого кнопку. Нажмите кнопку ниже: страница Google откроется в браузере \
-                 по умолчанию — в нём должен быть выполнен вход в этот же аккаунт. После \
-                 подтверждения отправьте сообщение в Antigravity ещё раз.",
-                ago_text(*ago)
-            ),
+            title: crate::i18n::tr(
+                "Нужна верификация аккаунта Google",
+                "Google account verification required",
+            )
+            .into(),
+            detail: match crate::i18n::current() {
+                crate::i18n::Lang::Ru => format!(
+                    "Google попросил подтвердить аккаунт — {ago_s}. Antigravity не всегда показывает для этого кнопку. Нажмите кнопку ниже: страница Google откроется в браузере по умолчанию — в нём должен быть выполнен вход в этот же аккаунт. После подтверждения отправьте сообщение в Antigravity ещё раз."
+                ),
+                crate::i18n::Lang::En => format!(
+                    "Google asked to verify your account — {ago_s}. Antigravity doesn't always show a button for this. Click below to open Google's verification page in your default browser (signed into the same account), then send a message in Antigravity again."
+                ),
+            },
             action: Some(Action::Verify),
         };
     }
 
-    // Google errors the bypass cannot fix and must not be blamed for: both mean
-    // the request got past the gate. Only while nothing has answered since.
     let unanswered = |ago: Duration| f.answer.is_none_or(|a| a > ago);
     let unauthorized = f
         .unauthorized
         .filter(|(ago, n)| *ago <= crate::gate::RECENT && *n >= UNAUTH_LINES && unanswered(*ago));
     if let Some((ago, _)) = unauthorized {
+        let ago_s = ago_text(ago);
         return Headline {
             tone: Tone::Action,
-            title: "Antigravity нужно перезайти в аккаунт".into(),
-            detail: format!(
-                "Google отвечает ошибкой 401 — {}: учётные данные Antigravity перестали \
-                 совпадать. Выйдите из аккаунта в Antigravity и войдите заново. Обход эту \
-                 ошибку не исправит.",
-                ago_text(ago)
-            ),
+            title: crate::i18n::tr(
+                "Antigravity нужно перезайти в аккаунт",
+                "Antigravity needs to sign in again",
+            )
+            .into(),
+            detail: match crate::i18n::current() {
+                crate::i18n::Lang::Ru => format!(
+                    "Google отвечает ошибкой 401 — {ago_s}: учётные данные Antigravity перестали совпадать. Выйдите из аккаунта в Antigravity и войдите заново. Обход эту ошибку не исправит."
+                ),
+                crate::i18n::Lang::En => format!(
+                    "Google returned error 401 — {ago_s}: Antigravity credentials no longer match. Sign out in Antigravity and sign back in. The bypass cannot fix this error."
+                ),
+            },
             action: None,
         };
     }
-    // A refusal newer than the 503 is the news; the 503 was an earlier turn.
     let overloaded = f.overloaded.as_ref().filter(|(ago, _)| {
         *ago <= crate::gate::RECENT && unanswered(*ago) && f.refusal.is_none_or(|(r, _)| r > *ago)
     });
     if let Some((ago, model)) = overloaded {
+        let ago_s = ago_text(*ago);
         let which = if model.is_empty() {
             String::new()
         } else {
-            format!(" для модели «{model}»")
+            match crate::i18n::current() {
+                crate::i18n::Lang::Ru => format!(" для модели «{model}»"),
+                crate::i18n::Lang::En => format!(" for model \"{model}\""),
+            }
         };
         return Headline {
             tone: Tone::Action,
-            title: "Серверы Google перегружены".into(),
-            detail: format!(
-                "Google отвечает ошибкой 503 — {}: нет свободных мощностей{which}. Обход тут ни \
-                 при чём — запрос до Google дошёл. Рекомендуется выбрать в Antigravity другую \
-                 модель или повторить позже.",
-                ago_text(*ago)
-            ),
+            title: crate::i18n::tr(
+                "Серверы Google перегружены",
+                "Google servers are overloaded",
+            )
+            .into(),
+            detail: match crate::i18n::current() {
+                crate::i18n::Lang::Ru => format!(
+                    "Google отвечает ошибкой 503 — {ago_s}: нет свободных мощностей{which}. Обход тут ни при чём — запрос до Google дошёл. Рекомендуется выбрать в Antigravity другую модель или повторить позже."
+                ),
+                crate::i18n::Lang::En => format!(
+                    "Google returned error 503 — {ago_s}: no available capacity{which}. This is not a bypass issue — the request reached Google. Try another model in Antigravity or retry later."
+                ),
+            },
             action: None,
         };
     }
 
-    // The bypass needs an administrator to install and to repair. Asked for
-    // only when there is something it would install or repair.
     let service_broken = f.bypass_on && (!f.relay_running || f.relay_outdated || !f.rules);
     if !f.admin && (!f.bypass_on || service_broken) {
         return Headline {
             tone: Tone::Action,
-            title: "Нужны права администратора".into(),
-            detail: "Без них обход ошибки 400 не установить и не починить. Разблокировка входа \
-                     работает и так."
-                .into(),
+            title: crate::i18n::tr(
+                "Нужны права администратора",
+                "Administrator rights required",
+            )
+            .into(),
+            detail: crate::i18n::tr(
+                "Без них обход ошибки 400 не установить и не починить. Разблокировка входа работает и так.",
+                "Without them, the error 400 bypass cannot be installed or repaired. Sign-in unlock works without admin rights.",
+            )
+            .into(),
             action: Some(Action::Elevate),
         };
     }
 
     if !f.patch_on || !f.bypass_on {
         let what = match (f.patch_on, f.bypass_on) {
-            (false, false) => "Разблокировка входа и обход ошибки 400 выключены.",
-            (false, true) => "Разблокировка входа выключена.",
-            _ => "Обход ошибки 400 выключен.",
+            (false, false) => crate::i18n::tr(
+                "Разблокировка входа и обход ошибки 400 выключены.",
+                "Sign-in unlock and error 400 bypass are turned off.",
+            ),
+            (false, true) => crate::i18n::tr(
+                "Разблокировка входа выключена.",
+                "Sign-in unlock is turned off.",
+            ),
+            _ => crate::i18n::tr(
+                "Обход ошибки 400 выключен.",
+                "Error 400 bypass is turned off.",
+            ),
         };
         let closes = if f.patch_on {
             ""
         } else {
-            " Antigravity закроется на пару секунд."
+            crate::i18n::tr(
+                " Antigravity закроется на пару секунд.",
+                " Antigravity will close for a couple of seconds.",
+            )
         };
         return Headline {
             tone: Tone::Off,
-            title: "Включено не всё".into(),
+            title: crate::i18n::tr(
+                "Включено не всё",
+                "Not everything is enabled",
+            )
+            .into(),
             detail: format!("{what}{closes}"),
             action: Some(Action::EnableAll),
         };
@@ -548,26 +688,36 @@ pub fn headline(f: &Facts) -> Headline {
         return Headline {
             tone: Tone::Action,
             title: if !f.relay_running {
-                "Служба обхода не работает".into()
+                crate::i18n::tr(
+                    "Служба обхода не работает",
+                    "Bypass service is not running",
+                )
+                .into()
             } else if f.relay_outdated {
-                "Служба обхода устарела".into()
+                crate::i18n::tr(
+                    "Служба обхода устарела",
+                    "Bypass service is outdated",
+                )
+                .into()
             } else {
-                "Служба обхода работает не полностью".into()
+                crate::i18n::tr(
+                    "Служба обхода работает не полностью",
+                    "Bypass service is partially running",
+                )
+                .into()
             },
-            detail: "Без неё ошибка 400 не обходится. Кнопка переустановит и запустит её.".into(),
+            detail: crate::i18n::tr(
+                "Без неё ошибка 400 не обходится. Кнопка переустановит и запустит её.",
+                "Error 400 cannot be bypassed without it. The button will reinstall and start it.",
+            )
+            .into(),
             action: Some(Action::Repair),
         };
     }
 
-    // Something on this machine keeps part of the relay down (P53). Said with
-    // the thing to do about it - the 400 it causes says nothing of the sort.
     if let Some(b) = &f.proxy_blocked {
         return blocked(b, &f.relay_exe);
     }
-    // The DNS listener is the other half the relay cannot open by itself. Below
-    // the proxy because the proxy carries everything while it is up, and above
-    // "cut off" because a dead `:53` is a named, fixable cause and being cut
-    // off is a guess.
     if let Some(b) = &f.dns_blocked {
         return blocked(b, &f.relay_exe);
     }
@@ -576,26 +726,37 @@ pub fn headline(f: &Facts) -> Headline {
             Some(true) => {
                 return Headline {
                     tone: Tone::Action,
-                    title: "Антивирус или файрвол не пропускает обход".into(),
-                    detail: format!(
-                        "Служба обхода уже несколько минут не может соединиться ни с одним \
-                         сервером, хотя у других программ интернет есть. Так бывает, когда её \
-                         блокирует антивирус или файрвол. Добавьте в исключения антивируса и в \
-                         разрешённые программы файрвола файл {} и нажмите «Починить».",
-                        exe_or_default(&f.relay_exe)
-                    ),
+                    title: crate::i18n::tr(
+                        "Антивирус или файрвол не пропускает обход",
+                        "Antivirus or firewall is blocking the bypass",
+                    )
+                    .into(),
+                    detail: match crate::i18n::current() {
+                        crate::i18n::Lang::Ru => format!(
+                            "Служба обхода уже несколько минут не может соединиться ни с одним сервером, хотя у других программ интернет есть. Так бывает, когда её блокирует антивирус или файрвол. Добавьте в исключения антивируса и в разрешённые программы файрвола файл {} и нажмите «Починить».",
+                            exe_or_default(&f.relay_exe)
+                        ),
+                        crate::i18n::Lang::En => format!(
+                            "The bypass service hasn't been able to reach any server for minutes, while other apps have internet access. Add {} to your antivirus and firewall exclusions and click \"Repair\".",
+                            exe_or_default(&f.relay_exe)
+                        ),
+                    },
                     action: Some(Action::Repair),
                 }
             }
             Some(false) => {
                 return Headline {
                     tone: Tone::Off,
-                    title: "Нет подключения к интернету".into(),
-                    detail: "Ни служба обхода, ни анлокер не могут соединиться с серверами в \
-                             интернете. Проверьте подключение. Если интернет есть — антивирус \
-                             или файрвол мог заблокировать обе программы: добавьте их в \
-                             исключения."
-                        .into(),
+                    title: crate::i18n::tr(
+                        "Нет подключения к интернету",
+                        "No internet connection",
+                    )
+                    .into(),
+                    detail: crate::i18n::tr(
+                        "Ни служба обхода, ни анлокер не могут соединиться с серверами в интернете. Проверьте подключение. Если интернет есть — антивирус или файрвол мог заблокировать обе программы: добавьте их в исключения.",
+                        "Neither the bypass service nor the unlocker can reach the internet. Check your connection. If internet works, antivirus or firewall may be blocking both.",
+                    )
+                    .into(),
                     action: None,
                 }
             }
@@ -603,66 +764,84 @@ pub fn headline(f: &Facts) -> Headline {
         }
     }
 
-    // A refusal newer than the newest answer is the live problem.
     let refused_last = match (f.refusal, f.answer) {
         (Some((r, _)), Some(a)) => r < a,
         (Some(_), None) => true,
         _ => false,
     };
     if refused_last {
-        // With the door shut, Antigravity's calls go around the bypass: that
-        // is the cause, and «Чиним» would promise a fix the relay cannot make.
         if let Some(b) = &f.door_blocked {
             return blocked(b, &f.relay_exe);
         }
         let (ago, lines) = f.refusal.unwrap_or_default();
+        let ago_s = ago_text(ago);
         if ago > FIXING_FOR {
             return Headline {
                 tone: Tone::Wait,
-                title: "Нужна проверка".into(),
-                detail: format!(
-                    "Последний раз была ошибка 400 — {}, и после неё модель не отвечала. \
-                     Напишите что-нибудь в Antigravity: если ошибка повторится, обход её поймает \
-                     и сам сменит путь.",
-                    ago_text(ago)
-                ),
+                title: crate::i18n::tr("Нужна проверка", "Check needed").into(),
+                detail: match crate::i18n::current() {
+                    crate::i18n::Lang::Ru => format!(
+                        "Последний раз была ошибка 400 — {ago_s}, и после неё модель не отвечала. Напишите что-нибудь в Antigravity: если ошибка повторится, обход её поймает и сам сменит путь."
+                    ),
+                    crate::i18n::Lang::En => format!(
+                        "Last error 400 was {ago_s}, with no model reply since. Send a message in Antigravity: if it happens again, the bypass will catch it and switch routes."
+                    ),
+                },
                 action: None,
             };
         }
         if lines >= STUCK_LINES {
             return Headline {
                 tone: Tone::Action,
-                title: "Ошибка 400 повторяется".into(),
-                detail: format!(
-                    "Последняя — {}. Обход перебирает пути сам, но ни один пока не сработал. \
-                     Если у вас включён VPN или прокси, попробуйте выключить его или сменить сервер, \
-                     и отправьте сообщение ещё раз. Не помогло — {}",
-                    ago_text(ago),
-                    super::report::when_stuck()
-                ),
+                title: crate::i18n::tr(
+                    "Ошибка 400 повторяется",
+                    "Error 400 keeps repeating",
+                )
+                .into(),
+                detail: match crate::i18n::current() {
+                    crate::i18n::Lang::Ru => format!(
+                        "Последняя — {ago_s}. Обход перебирает пути сам, но ни один пока не сработал. Если у вас включён VPN или прокси, попробуйте выключить его или сменить сервер, и отправьте сообщение ещё раз. Не помогло — {}",
+                        super::report::when_stuck()
+                    ),
+                    crate::i18n::Lang::En => format!(
+                        "Last one — {ago_s}. The bypass is trying routes automatically, but none worked yet. If you have a VPN or proxy on, try turning it off or switching servers, then send a message again. Still failing — {}",
+                        super::report::when_stuck()
+                    ),
+                },
                 action: None,
             };
         }
         let detail = match &f.answered {
-            Some(a) if a.bypassed => format!(
-                "Ошибка 400 — {}. Antigravity обратился к Google мимо обхода; через минуту его \
-                 запросы пойдут через обход. Отправьте сообщение ещё раз — не помогло, \
-                 перезапустите Antigravity.",
-                ago_text(ago)
-            ),
-            Some(a) if !a.acted.is_empty() => format!(
-                "Ошибка 400 — {}. {}. Отправьте сообщение ещё раз.",
-                ago_text(ago),
-                capitalise(&a.acted)
-            ),
-            _ => format!(
-                "Ошибка 400 — {}. Обход её видит и перестраивается. Отправьте сообщение ещё раз.",
-                ago_text(ago)
-            ),
+            Some(a) if a.bypassed => match crate::i18n::current() {
+                crate::i18n::Lang::Ru => format!(
+                    "Ошибка 400 — {ago_s}. Antigravity обратился к Google мимо обхода; через минуту его запросы пойдут через обход. Отправьте сообщение ещё раз — не помогло, перезапустите Antigravity."
+                ),
+                crate::i18n::Lang::En => format!(
+                    "Error 400 — {ago_s}. Antigravity bypassed the unlocker; within a minute its requests will go through the bypass. Send a message again, or restart Antigravity."
+                ),
+            },
+            Some(a) if !a.acted.is_empty() => match crate::i18n::current() {
+                crate::i18n::Lang::Ru => format!(
+                    "Ошибка 400 — {ago_s}. {}. Отправьте сообщение ещё раз.",
+                    capitalise(&a.acted)
+                ),
+                crate::i18n::Lang::En => format!(
+                    "Error 400 — {ago_s}. {}. Send your message again.",
+                    capitalise(&a.acted)
+                ),
+            },
+            _ => match crate::i18n::current() {
+                crate::i18n::Lang::Ru => format!(
+                    "Ошибка 400 — {ago_s}. Обход её видит и перестраивается. Отправьте сообщение ещё раз."
+                ),
+                crate::i18n::Lang::En => format!(
+                    "Error 400 — {ago_s}. The bypass detected it and is adapting. Send your message again."
+                ),
+            },
         };
         return Headline {
             tone: Tone::Fixing,
-            title: "Чиним".into(),
+            title: crate::i18n::tr("Чиним", "Fixing").into(),
             detail,
             action: None,
         };
@@ -673,12 +852,19 @@ pub fn headline(f: &Facts) -> Headline {
             .route
             .as_deref()
             .filter(|r| !r.is_empty())
-            .map(|r| format!(" · путь: {r}"))
+            .map(|r| match crate::i18n::current() {
+                crate::i18n::Lang::Ru => format!(" · путь: {r}"),
+                crate::i18n::Lang::En => format!(" · route: {r}"),
+            })
             .unwrap_or_default();
+        let ago_s = ago_text(ago);
         return Headline {
             tone: Tone::Ok,
-            title: "Работает".into(),
-            detail: format!("Модель ответила {}{route}.", ago_text(ago)),
+            title: crate::i18n::tr("Работает", "Working").into(),
+            detail: match crate::i18n::current() {
+                crate::i18n::Lang::Ru => format!("Модель ответила {ago_s}{route}."),
+                crate::i18n::Lang::En => format!("Model replied {ago_s}{route}."),
+            },
             action: None,
         };
     }
@@ -686,18 +872,32 @@ pub fn headline(f: &Facts) -> Headline {
     if !f.relay_reporting {
         return Headline {
             tone: Tone::Wait,
-            title: "Служба запускается".into(),
-            detail: "Это занимает до минуты. Потом напишите что-нибудь в Antigravity.".into(),
+            title: crate::i18n::tr(
+                "Служба запускается",
+                "Service is starting",
+            )
+            .into(),
+            detail: crate::i18n::tr(
+                "Это занимает до минуты. Потом напишите что-нибудь в Antigravity.",
+                "This takes up to a minute. Then send a message in Antigravity.",
+            )
+            .into(),
             action: None,
         };
     }
 
     Headline {
         tone: Tone::Wait,
-        title: "Всё включено".into(),
-        detail: "Напишите что-нибудь в чат Antigravity — здесь появится подтверждение, что модель \
-                 ответила."
-            .into(),
+        title: crate::i18n::tr(
+            "Всё включено",
+            "Everything is enabled",
+        )
+        .into(),
+        detail: crate::i18n::tr(
+            "Напишите что-нибудь в чат Antigravity — здесь появится подтверждение, что модель ответила.",
+            "Send something in Antigravity chat — confirmation that the model replied will appear here.",
+        )
+        .into(),
         action: None,
     }
 }
@@ -714,25 +914,34 @@ fn capitalise(s: &str) -> String {
 pub fn ago_text(d: Duration) -> String {
     let secs = d.as_secs();
     if secs < 15 {
-        return "только что".to_string();
+        return crate::i18n::tr("только что", "just now").to_string();
     }
     if secs < 60 {
-        return format!(
-            "{} {} назад",
-            secs,
-            plural(secs, "секунду", "секунды", "секунд")
-        );
+        return match crate::i18n::current() {
+            crate::i18n::Lang::Ru => format!(
+                "{} {} назад",
+                secs,
+                plural(secs, "секунду", "секунды", "секунд")
+            ),
+            crate::i18n::Lang::En => format!("{secs}s ago"),
+        };
     }
     let mins = secs / 60;
     if mins < 60 {
-        return format!(
-            "{} {} назад",
-            mins,
-            plural(mins, "минуту", "минуты", "минут")
-        );
+        return match crate::i18n::current() {
+            crate::i18n::Lang::Ru => format!(
+                "{} {} назад",
+                mins,
+                plural(mins, "минуту", "минуты", "минут")
+            ),
+            crate::i18n::Lang::En => format!("{mins}m ago"),
+        };
     }
     let hours = mins / 60;
-    format!("{} {} назад", hours, plural(hours, "час", "часа", "часов"))
+    match crate::i18n::current() {
+        crate::i18n::Lang::Ru => format!("{} {} назад", hours, plural(hours, "час", "часа", "часов")),
+        crate::i18n::Lang::En => format!("{hours}h ago"),
+    }
 }
 
 /// Russian counts in three forms.

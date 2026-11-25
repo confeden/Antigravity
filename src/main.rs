@@ -39,6 +39,7 @@ mod gui;
 mod health;
 mod hosts_pin;
 mod hwid;
+mod i18n;
 mod instances;
 #[cfg(windows)]
 mod launch_guard;
@@ -605,9 +606,14 @@ fn is_gemini_bin(install: &Path) -> bool {
             .is_some_and(|n| n == ".gemini")
 }
 
+/// Label for the VS Code extension backend (`~/.gemini/bin`) in the active UI language.
+pub fn vscode_install_label() -> &'static str {
+    crate::i18n::tr("Antigravity для VS Code", "Antigravity for VS Code")
+}
+
 pub fn install_label(install: &Path) -> &'static str {
     if is_gemini_bin(install) && vscode_extension_installed() {
-        "Antigravity для VS Code"
+        vscode_install_label()
     } else if install.join("agy.exe").is_file() || install.join("agy").is_file() {
         "Antigravity CLI"
     } else if install.join("Antigravity IDE.exe").exists()
@@ -621,6 +627,7 @@ pub fn install_label(install: &Path) -> &'static str {
 }
 
 fn main() {
+    i18n::set_current(settings::Settings::load().lang);
     #[cfg(windows)]
     if env::args_os().nth(1).is_some_and(|a| a == launch_guard::FLAG) {
         launch_guard::run();
@@ -694,7 +701,10 @@ fn main() {
         // window does, so it is offered instead of a dead end: on Windows in a
         // console of its own, on Linux only when started from a terminal (a
         // double-clicked launcher has none, and gets the message instead).
-        let note = format!("Окно не открылось ({e}) — работаю в терминале.");
+        let note = match crate::i18n::current() {
+            crate::i18n::Lang::Ru => format!("Окно не открылось ({e}) — работаю в терминале."),
+            crate::i18n::Lang::En => format!("Window failed to open ({e}) — running in terminal mode."),
+        };
         #[cfg(target_os = "windows")]
         run_tui(Some(note));
         #[cfg(not(target_os = "windows"))]

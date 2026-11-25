@@ -26,9 +26,15 @@ pub const ENABLED: bool = cfg!(debug_assertions);
 /// group otherwise.
 pub fn when_stuck() -> &'static str {
     if ENABLED {
-        "нажмите «Сохранить отчёт» и пришлите файл с рабочего стола в группу."
+        crate::i18n::tr(
+            "нажмите «Сохранить отчёт» и пришлите файл с рабочего стола в группу.",
+            "click \"Save report\" and send the file from your Desktop to the group.",
+        )
     } else {
-        "напишите об этом в группу."
+        crate::i18n::tr(
+            "напишите об этом в группу.",
+            "write about it in the group.",
+        )
     }
 }
 
@@ -41,100 +47,168 @@ pub fn build(status: Option<&Status>, view: &View) -> String {
     let now = crate::utils::local_clock().map_or_else(String::new, |c| c.hms());
     let _ = writeln!(
         out,
-        "Antigravity Unlocker v{} — отчёт {}",
+        "Antigravity Unlocker v{} — {} {now}",
         crate::update::current_version(),
-        now
+        crate::i18n::tr("отчёт", "report"),
     );
 
     match status {
         Some(s) => status_part(&mut out, s),
         None => {
-            let _ = writeln!(out, "Состояние системы ещё не прочитано.");
+            let _ = writeln!(
+                out,
+                "{}",
+                crate::i18n::tr(
+                    "Состояние системы ещё не прочитано.",
+                    "System state has not been read yet.",
+                )
+            );
         }
     }
 
-    let _ = writeln!(out, "\n— Antigravity (его собственные логи)");
+    let _ = writeln!(
+        out,
+        "\n— {}",
+        crate::i18n::tr(
+            "Antigravity (его собственные логи)",
+            "Antigravity (its own logs)",
+        )
+    );
     match view.answered {
         Some(a) => {
+            let ago = super::status::ago_text(a.ago);
             let _ = writeln!(
                 out,
-                "Последний ответ модели: {} (за 12 ч: {})",
-                super::status::ago_text(a.ago),
-                a.count
+                "{}",
+                match crate::i18n::current() {
+                    crate::i18n::Lang::Ru => format!("Последний ответ модели: {ago} (за 12 ч: {})", a.count),
+                    crate::i18n::Lang::En => format!("Last model reply: {ago} (in 12h: {})", a.count),
+                }
             );
         }
         None => {
-            let _ = writeln!(out, "Ответов модели за 12 ч в логах нет.");
+            let _ = writeln!(
+                out,
+                "{}",
+                crate::i18n::tr(
+                    "Ответов модели за 12 ч в логах нет.",
+                    "No model replies in logs over the last 12h.",
+                )
+            );
         }
     }
     match view.refused_long {
         Some(r) => {
+            let ago = super::status::ago_text(r.ago);
+            let cnt = view.seen.map_or(0, |s| s.count);
             let _ = writeln!(
                 out,
-                "Последняя ошибка 400: {} (строк за 10 мин: {})",
-                super::status::ago_text(r.ago),
-                view.seen.map_or(0, |s| s.count)
+                "{}",
+                match crate::i18n::current() {
+                    crate::i18n::Lang::Ru => format!("Последняя ошибка 400: {ago} (строк за 10 мин: {cnt})"),
+                    crate::i18n::Lang::En => format!("Last error 400: {ago} (lines in 10m: {cnt})"),
+                }
             );
         }
         None => {
-            let _ = writeln!(out, "Ошибок 400 за 12 ч в логах нет.");
+            let _ = writeln!(
+                out,
+                "{}",
+                crate::i18n::tr(
+                    "Ошибок 400 за 12 ч в логах нет.",
+                    "No error 400 in logs over the last 12h.",
+                )
+            );
         }
     }
     if let Some(o) = &view.overloaded {
         let model = if o.model.is_empty() {
             String::new()
         } else {
-            format!(", модель {}", o.model)
+            match crate::i18n::current() {
+                crate::i18n::Lang::Ru => format!(", модель {}", o.model),
+                crate::i18n::Lang::En => format!(", model {}", o.model),
+            }
         };
+        let ago = super::status::ago_text(o.ago);
         let _ = writeln!(
             out,
-            "Ошибка 503 (нет мощностей у Google{model}): {}, строк за 10 мин: {}",
-            super::status::ago_text(o.ago),
-            o.count
+            "{}",
+            match crate::i18n::current() {
+                crate::i18n::Lang::Ru => format!("Ошибка 503 (нет мощностей у Google{model}): {ago}, строк за 10 мин: {}", o.count),
+                crate::i18n::Lang::En => format!("Error 503 (Google out of capacity{model}): {ago}, lines in 10m: {}", o.count),
+            }
         );
     }
     if let Some(e) = &view.server_errors {
+        let ago = super::status::ago_text(e.ago);
         let _ = writeln!(
             out,
-            "Ошибки на стороне Google (503/429/500) за 12 ч: {}, последняя {}",
-            e.count,
-            super::status::ago_text(e.ago)
+            "{}",
+            match crate::i18n::current() {
+                crate::i18n::Lang::Ru => format!("Ошибки на стороне Google (503/429/500) за 12 ч: {}, последняя {ago}", e.count),
+                crate::i18n::Lang::En => format!("Google server errors (503/429/500) in 12h: {}, last {ago}", e.count),
+            }
         );
     }
     if let Some(u) = &view.unauthorized {
+        let ago = super::status::ago_text(u.ago);
         let _ = writeln!(
             out,
-            "Ошибка 401 (учётные данные не приняты): {}, строк за 10 мин: {}",
-            super::status::ago_text(u.ago),
-            u.count
+            "{}",
+            match crate::i18n::current() {
+                crate::i18n::Lang::Ru => format!("Ошибка 401 (учётные данные не приняты): {ago}, строк за 10 мин: {}", u.count),
+                crate::i18n::Lang::En => format!("Error 401 (credentials rejected): {ago}, lines in 10m: {}", u.count),
+            }
         );
     }
-    // When, and on which host - never the link: it carries a one-time token,
-    // and the report is made to be sent to someone else.
     if let Some(v) = &view.verify {
         let host = v
             .url
             .strip_prefix("https://")
             .and_then(|r| r.split(['/', '?', '#']).next())
             .unwrap_or("");
+        let ago = super::status::ago_text(v.ago);
         let _ = writeln!(
             out,
-            "Google просил верификацию аккаунта: {} ({host})",
-            super::status::ago_text(v.ago)
+            "{}",
+            match crate::i18n::current() {
+                crate::i18n::Lang::Ru => format!("Google просил верификацию аккаунта: {ago} ({host})"),
+                crate::i18n::Lang::En => format!("Google requested account verification: {ago} ({host})"),
+            }
         );
     }
 
-    // Fresh from the file, not the window's copy: the route table's ages move
-    // every pass and the watcher does not wake the window for them.
-    let _ = writeln!(out, "\n— Служба обхода (её запись)");
+    let _ = writeln!(
+        out,
+        "\n— {}",
+        crate::i18n::tr(
+            "Служба обхода (её запись)",
+            "Bypass service (its record)",
+        )
+    );
     match crate::gate::read() {
         Some(r) => relay_part(&mut out, &r),
         None => {
-            let _ = writeln!(out, "Записи нет — служба не запущена или старая.");
+            let _ = writeln!(
+                out,
+                "{}",
+                crate::i18n::tr(
+                    "Записи нет — служба не запущена или старая.",
+                    "No record — service is not running or outdated.",
+                )
+            );
         }
     }
 
-    let _ = writeln!(out, "\n— Журнал службы (последние строки)");
+    let _ = writeln!(
+        out,
+        "\n— {}",
+        crate::i18n::tr(
+            "Журнал службы (последние строки)",
+            "Service log (recent lines)",
+        )
+    );
     let log = std::fs::read_to_string(crate::dns_forwarder::log_path()).unwrap_or_default();
     let lines: Vec<&str> = log.lines().collect();
     let from = lines.len().saturating_sub(LOG_LINES);
@@ -143,131 +217,209 @@ pub fn build(status: Option<&Status>, view: &View) -> String {
         let _ = writeln!(out, "{}", mask_addresses(line, own.as_deref()));
     }
     if lines.is_empty() {
-        let _ = writeln!(out, "(пусто)");
+        let _ = writeln!(out, "{}", crate::i18n::tr("(пусто)", "(empty)"));
     }
     out
 }
 
 fn onoff(s: &State) -> String {
     match s {
-        State::On => "вкл".to_string(),
-        State::Off => "выкл".to_string(),
-        State::Partial(n) => format!("частично ({n})"),
-        State::OffNote(n) => format!("выкл ({n})"),
-        State::Blocked(n) => format!("недоступно ({n})"),
+        State::On => crate::i18n::tr("вкл", "on").to_string(),
+        State::Off => crate::i18n::tr("выкл", "off").to_string(),
+        State::Partial(n) => format!("{} ({n})", crate::i18n::tr("частично", "partial")),
+        State::OffNote(n) => format!("{} ({n})", crate::i18n::tr("выкл", "off")),
+        State::Blocked(n) => format!("{} ({n})", crate::i18n::tr("недоступно", "unavailable")),
     }
 }
 
 fn status_part(out: &mut String, s: &Status) {
+    let yes = crate::i18n::tr("да", "yes");
+    let no = crate::i18n::tr("нет", "no");
     let _ = writeln!(
         out,
-        "Права администратора: {}",
-        if s.admin { "да" } else { "нет" }
+        "{}: {}",
+        crate::i18n::tr("Права администратора", "Administrator rights"),
+        if s.admin { yes } else { no }
     );
-    let _ = writeln!(out, "\n— Установки");
+    let _ = writeln!(
+        out,
+        "\n— {}",
+        crate::i18n::tr("Установки", "Installations")
+    );
     for row in &s.installs {
         let path = row
             .path
             .as_ref()
             .map(|p| mask_path(&p.display().to_string()))
-            .unwrap_or_else(|| "не найдена".to_string());
+            .unwrap_or_else(|| crate::i18n::tr("не найдена", "not found").to_string());
         let patched = match row.patched {
-            Some(true) => "пропатчена",
-            Some(false) => "НЕ пропатчена",
-            None => "не проверена",
+            Some(true) => crate::i18n::tr("пропатчена", "patched"),
+            Some(false) => crate::i18n::tr("НЕ пропатчена", "NOT patched"),
+            None => crate::i18n::tr("не проверена", "not checked"),
         };
         let _ = writeln!(out, "{}: {} — {}", row.label, path, patched);
     }
-    let _ = writeln!(out, "\n— Переключатели");
-    let _ = writeln!(out, "Разблокировка входа: {}", onoff(&s.client_patch));
-    let _ = writeln!(out, "Автопатч: {}", onoff(&s.watchdog));
-    let _ = writeln!(out, "Обход через DNS: {}", onoff(&s.dns));
-    let _ = writeln!(out, "Локальный прокси: {}", onoff(&s.local_proxy));
+    let _ = writeln!(
+        out,
+        "\n— {}",
+        crate::i18n::tr("Переключатели", "Switches")
+    );
+    let _ = writeln!(out, "{}: {}", crate::i18n::tr("Разблокировка входа", "Sign-in unlock"), onoff(&s.client_patch));
+    let _ = writeln!(out, "{}: {}", crate::i18n::tr("Автопатч", "Auto-patch"), onoff(&s.watchdog));
+    let _ = writeln!(out, "{}: {}", crate::i18n::tr("Обход через DNS", "DNS bypass"), onoff(&s.dns));
+    let _ = writeln!(out, "{}: {}", crate::i18n::tr("Локальный прокси", "Local proxy"), onoff(&s.local_proxy));
     let key_present = if crate::settings::group_key().is_empty() {
-        "нет"
+        crate::i18n::tr("нет", "none")
     } else if crate::group::key_rejected() {
-        "есть, но сервер его не принимает (перестал работать)"
+        crate::i18n::tr(
+            "есть, но сервер его не принимает (перестал работать)",
+            "present, but rejected by server (stopped working)",
+        )
     } else {
-        "есть"
+        crate::i18n::tr("есть", "present")
     };
     let _ = writeln!(
         out,
-        "Прокси из группы: {}, ключ: {}, код ПК: {}",
-        onoff(&s.group_proxy),
-        key_present,
-        crate::hwid::pc_code()
+        "{}",
+        match crate::i18n::current() {
+            crate::i18n::Lang::Ru => format!(
+                "Прокси из группы: {}, ключ: {}, код ПК: {}",
+                onoff(&s.group_proxy),
+                key_present,
+                crate::hwid::pc_code()
+            ),
+            crate::i18n::Lang::En => format!(
+                "Group proxy: {}, key: {}, PC code: {}",
+                onoff(&s.group_proxy),
+                key_present,
+                crate::hwid::pc_code()
+            ),
+        }
     );
-    let _ = writeln!(out, "Свой прокси: {}", onoff(&s.own_proxy));
+    let _ = writeln!(out, "{}: {}", crate::i18n::tr("Свой прокси", "Own proxy"), onoff(&s.own_proxy));
     let _ = writeln!(
         out,
-        "Служба: {}{}; правила DNS: {}",
+        "{}: {}{}; {}: {}",
+        crate::i18n::tr("Служба", "Service"),
         if s.relay_running {
-            "запущена"
+            crate::i18n::tr("запущена", "running")
         } else {
-            "НЕ запущена"
+            crate::i18n::tr("НЕ запущена", "NOT running")
         },
         if s.relay_outdated {
-            ", устарела"
+            crate::i18n::tr(", устарела", ", outdated")
         } else {
             ""
         },
-        if s.rules { "есть" } else { "НЕТ" }
+        crate::i18n::tr("правила DNS", "DNS rules"),
+        if s.rules {
+            crate::i18n::tr("есть", "present")
+        } else {
+            crate::i18n::tr("НЕТ", "NONE")
+        }
     );
     if let Some(vpn) = s.vpn {
-        let _ = writeln!(out, "VPN (по сокетам Antigravity): {:?}", vpn);
+        let _ = writeln!(out, "VPN: {:?}", vpn);
     }
     if let Some(eg) = s.relay_egress {
-        let _ = writeln!(out, "Сокеты службы: {:?}", eg);
+        let _ = writeln!(out, "{}: {:?}", crate::i18n::tr("Сокеты службы", "Service sockets"), eg);
     }
 }
 
 fn relay_part(out: &mut String, r: &Report) {
+    let yes = crate::i18n::tr("да", "yes");
+    let no = crate::i18n::tr("нет", "no");
+    let age_s = r.age().as_secs();
     let _ = writeln!(
         out,
-        "Версия службы: {} (эта программа ждёт {}), запись {} с назад",
-        r.version,
-        crate::dns_forwarder::RELAY_VERSION,
-        r.age().as_secs()
+        "{}",
+        match crate::i18n::current() {
+            crate::i18n::Lang::Ru => format!(
+                "Версия службы: {} (эта программа ждёт {}), запись {age_s} с назад",
+                r.version,
+                crate::dns_forwarder::RELAY_VERSION,
+            ),
+            crate::i18n::Lang::En => format!(
+                "Service version: {} (expected {}), record {age_s}s ago",
+                r.version,
+                crate::dns_forwarder::RELAY_VERSION,
+            ),
+        }
     );
     let _ = writeln!(
         out,
-        "Гейт-хосты через локальные адреса: {}",
-        if r.loopback { "да" } else { "нет" }
+        "{}: {}",
+        crate::i18n::tr(
+            "Гейт-хосты через локальные адреса",
+            "Gate hosts via local addresses",
+        ),
+        if r.loopback { yes } else { no }
     );
     for b in &r.blockers {
-        let _ = writeln!(out, "Мешает обходу: {}", super::status::blocker_line(b));
+        let _ = writeln!(
+            out,
+            "{}: {}",
+            crate::i18n::tr("Мешает обходу", "Blocking bypass"),
+            super::status::blocker_line(b)
+        );
     }
     if crate::proxy::port() != crate::proxy::DEFAULT_PORT {
         let _ = writeln!(
             out,
-            "Порт локального прокси: {} (перенесён со стандартного {})",
-            crate::proxy::port(),
-            crate::proxy::DEFAULT_PORT
-        );
-    }
-    if r.started_at != 0 {
-        let _ = writeln!(
-            out,
-            "Ответ из интернета служба получала: {}",
-            if r.reached_at == 0 {
-                "ни разу с запуска".to_string()
-            } else {
-                format!(
-                    "{} с назад",
-                    crate::gate::now_unix().saturating_sub(r.reached_at)
-                )
+            "{}",
+            match crate::i18n::current() {
+                crate::i18n::Lang::Ru => format!(
+                    "Порт локального прокси: {} (перенесён со стандартного {})",
+                    crate::proxy::port(),
+                    crate::proxy::DEFAULT_PORT
+                ),
+                crate::i18n::Lang::En => format!(
+                    "Local proxy port: {} (moved from default {})",
+                    crate::proxy::port(),
+                    crate::proxy::DEFAULT_PORT
+                ),
             }
         );
     }
+    if r.started_at != 0 {
+        let reached_text = if r.reached_at == 0 {
+            crate::i18n::tr(
+                "ни разу с запуска",
+                "never since start",
+            )
+            .to_string()
+        } else {
+            let secs = crate::gate::now_unix().saturating_sub(r.reached_at);
+            match crate::i18n::current() {
+                crate::i18n::Lang::Ru => format!("{secs} с назад"),
+                crate::i18n::Lang::En => format!("{secs}s ago"),
+            }
+        };
+        let _ = writeln!(
+            out,
+            "{}: {reached_text}",
+            crate::i18n::tr(
+                "Ответ из интернета служба получала",
+                "Service last received internet reply",
+            )
+        );
+    }
+    let exit_note = if r.vpn_exit.is_empty() {
+        String::new()
+    } else {
+        match crate::i18n::current() {
+            crate::i18n::Lang::Ru => format!(", выход: {}", r.vpn_exit),
+            crate::i18n::Lang::En => format!(", exit: {}", r.vpn_exit),
+        }
+    };
     let _ = writeln!(
         out,
-        "VPN держит маршрут по умолчанию: {}{}",
-        if r.tunnel { "да" } else { "нет" },
-        if r.vpn_exit.is_empty() {
-            String::new()
-        } else {
-            format!(", выход: {}", r.vpn_exit)
-        }
+        "{}: {}{exit_note}",
+        crate::i18n::tr(
+            "VPN держит маршрут по умолчанию",
+            "VPN holds default route",
+        ),
+        if r.tunnel { yes } else { no }
     );
     // The table's own first usable row, not `r.route`: that one is the
     // hysteresis memory (`routes::leader`) and can still name a route the order
@@ -279,67 +431,139 @@ fn relay_part(out: &mut String, r: &Report) {
         .find(|row| row.usable)
         .map(|row| row.label.as_str())
         .unwrap_or(r.route.as_str());
-    let _ = writeln!(out, "Первый маршрут сейчас: {}", non_empty(first));
+    let _ = writeln!(
+        out,
+        "{}: {}",
+        crate::i18n::tr(
+            "Первый маршрут сейчас",
+            "Current primary route",
+        ),
+        non_empty(first)
+    );
     if let Some(ok) = &r.last_ok {
+        let secs = crate::gate::now_unix().saturating_sub(ok.at);
+        let route = non_empty(&ok.route);
         let _ = writeln!(
             out,
-            "Последний ответ модели, который видела служба: {} с назад, маршрут: {}",
-            crate::gate::now_unix().saturating_sub(ok.at),
-            non_empty(&ok.route)
+            "{}",
+            match crate::i18n::current() {
+                crate::i18n::Lang::Ru => format!(
+                    "Последний ответ модели, который видела служба: {secs} с назад, маршрут: {route}"
+                ),
+                crate::i18n::Lang::En => format!(
+                    "Last model reply seen by service: {secs}s ago, route: {route}"
+                ),
+            }
         );
     }
     if let Some(e) = &r.last_400 {
+        let secs = crate::gate::now_unix().saturating_sub(e.at);
+        let route = non_empty(&e.route);
+        let bypassed = if e.bypassed {
+            crate::i18n::tr(" (мимо обхода)", " (bypassed unlocker)")
+        } else {
+            ""
+        };
         let _ = writeln!(
             out,
-            "Последняя ошибка 400, которую видела служба: {} с назад, строк: {}, маршрут: {}{}",
-            crate::gate::now_unix().saturating_sub(e.at),
-            e.count,
-            non_empty(&e.route),
-            if e.bypassed {
-                " (мимо обхода)"
-            } else {
-                ""
+            "{}",
+            match crate::i18n::current() {
+                crate::i18n::Lang::Ru => format!(
+                    "Последняя ошибка 400, которую видела служба: {secs} с назад, строк: {}, маршрут: {route}{bypassed}",
+                    e.count
+                ),
+                crate::i18n::Lang::En => format!(
+                    "Last error 400 seen by service: {secs}s ago, lines: {}, route: {route}{bypassed}",
+                    e.count
+                ),
             }
         );
         if !e.acted.is_empty() {
-            let _ = writeln!(out, "Что сделано: {}", e.acted);
+            let _ = writeln!(
+                out,
+                "{}: {}",
+                crate::i18n::tr("Что сделано", "Action taken"),
+                e.acted
+            );
         }
     }
-    let _ = writeln!(out, "Маршруты (в порядке выбора):");
+    let _ = writeln!(
+        out,
+        "{}",
+        crate::i18n::tr(
+            "Маршруты (в порядке выбора):",
+            "Routes (in priority order):",
+        )
+    );
     for row in &r.routes {
         let mut parts: Vec<String> = Vec::new();
         // One state word, not two: «доступен … отложен ещё на 10 мин» is what a
         // benched-but-still-offered route used to print, and it reads as a
         // contradiction to the person pasting it.
         parts.push(match (row.usable, row.bench_left) {
-            (false, _) => "сейчас не используется".to_string(),
-            (true, Some(b)) => format!("отложен ещё на {} мин, но в очереди", b / 60 + 1),
-            (true, None) => "доступен".to_string(),
+            (false, _) => crate::i18n::tr(
+                "сейчас не используется",
+                "currently unused",
+            )
+            .to_string(),
+            (true, Some(b)) => {
+                let mins = b / 60 + 1;
+                match crate::i18n::current() {
+                    crate::i18n::Lang::Ru => format!("отложен ещё на {mins} мин, но в очереди"),
+                    crate::i18n::Lang::En => format!("benched for {mins}m more, still queued"),
+                }
+            }
+            (true, None) => crate::i18n::tr("доступен", "available").to_string(),
         });
         if let Some(ms) = row.latency_ms {
-            parts.push(format!("{ms} мс"));
+            parts.push(match crate::i18n::current() {
+                crate::i18n::Lang::Ru => format!("{ms} мс"),
+                crate::i18n::Lang::En => format!("{ms} ms"),
+            });
         }
         if row.proven {
-            parts.push("проверен ответом модели".to_string());
+            parts.push(
+                crate::i18n::tr(
+                    "проверен ответом модели",
+                    "verified by model reply",
+                )
+                .to_string(),
+            );
         }
         if let Some(a) = row.ok_ago {
-            parts.push(format!("ответ {a} с назад"));
+            parts.push(match crate::i18n::current() {
+                crate::i18n::Lang::Ru => format!("ответ {a} с назад"),
+                crate::i18n::Lang::En => format!("reply {a}s ago"),
+            });
         }
         if let Some(a) = row.refused_ago {
-            parts.push(format!("ошибка 400 {a} с назад"));
+            parts.push(match crate::i18n::current() {
+                crate::i18n::Lang::Ru => format!("ошибка 400 {a} с назад"),
+                crate::i18n::Lang::En => format!("error 400 {a}s ago"),
+            });
         }
         // The tally, not just the two timestamps: «ответ 34 с назад, ошибка 400
         // 14 с назад» is the same line for a route that answers nine times out
         // of ten and for one that answers once in fifty, and three field
         // reports (2026-09-21) turned on telling those apart.
         if row.answers > 0 || row.refusals > 0 {
-            parts.push(format!("ответов {}, отказов {}", row.answers, row.refusals));
+            parts.push(match crate::i18n::current() {
+                crate::i18n::Lang::Ru => format!("ответов {}, отказов {}", row.answers, row.refusals),
+                crate::i18n::Lang::En => format!("replies {}, refusals {}", row.answers, row.refusals),
+            });
         }
         if let Some(b) = row.bench_left.filter(|_| !row.usable) {
-            parts.push(format!("отложен ещё на {} мин", b / 60 + 1));
+            let mins = b / 60 + 1;
+            parts.push(match crate::i18n::current() {
+                crate::i18n::Lang::Ru => format!("отложен ещё на {mins} мин"),
+                crate::i18n::Lang::En => format!("benched for {mins}m more"),
+            });
         }
         if row.open > 0 {
-            parts.push(format!("открытых соединений: {}", row.open));
+            parts.push(match crate::i18n::current() {
+                crate::i18n::Lang::Ru => format!("открытых соединений: {}", row.open),
+                crate::i18n::Lang::En => format!("open connections: {}", row.open),
+            });
         }
         let _ = writeln!(out, "  {} — {}", row.label, parts.join(", "));
     }

@@ -106,6 +106,7 @@ pub struct App {
     /// (`renderer::confirm`).
     frames: u8,
     theme: crate::settings::ThemeMode,
+    lang: crate::i18n::Lang,
 }
 
 impl App {
@@ -138,6 +139,7 @@ impl App {
         // from here on — two writers each saving the whole thing meant whichever
         // saved last silently reverted the other.
         let settings = Settings::load();
+        crate::i18n::set_current(settings.lang);
         theme::set_preference(&cc.egui_ctx, settings.theme);
         let screen = first_screen(&settings);
         // A debug build told to skip the key never passes the licence screen,
@@ -179,6 +181,7 @@ impl App {
             report_clipboard_at: None,
             frames: 0,
             theme: settings.theme,
+            lang: settings.lang,
         }
     }
 
@@ -190,7 +193,11 @@ impl App {
     /// not disappear after the key is accepted).
     fn update_banner(&self, ui: &mut egui::Ui) {
         let Some(rel) = &self.update else { return };
-        let label = format!("⬆  Доступна новая версия — {}", rel.display_version());
+        let ver = rel.display_version();
+        let label = match crate::i18n::current() {
+            crate::i18n::Lang::Ru => format!("⬆  Доступна новая версия — {ver}"),
+            crate::i18n::Lang::En => format!("⬆  New version available — {ver}"),
+        };
         let colors = theme::palette(ui);
         let btn = egui::Button::new(egui::RichText::new(label).color(colors.on_accent))
             .fill(colors.accent)
@@ -306,9 +313,18 @@ impl eframe::App for App {
             }
             Screen::Deactivated => {
                 egui::CentralPanel::default().show(ui, |ui| {
-                    ui.heading("Анлокер полностью деактивирован");
-                    ui.label("Патчи, обход ошибки 400 и фоновые службы удалены.");
-                    if ui.button("Закрыть").clicked() {
+                    ui.heading(crate::i18n::tr(
+                        "Анлокер полностью деактивирован",
+                        "Unlocker is completely deactivated",
+                    ));
+                    ui.label(crate::i18n::tr(
+                        "Патчи, обход ошибки 400 и фоновые службы удалены.",
+                        "Patches, error 400 bypass, and background services have been removed.",
+                    ));
+                    if ui
+                        .button(crate::i18n::tr("Закрыть", "Close"))
+                        .clicked()
+                    {
                         ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                     }
                 });
@@ -370,7 +386,11 @@ pub fn run() -> Result<(), String> {
             Err(e @ eframe::Error::WinitEventLoop(_)) => {
                 renderer::forget();
                 return Err(format!(
-                    "нет доступа к графическому дисплею: {}",
+                    "{}: {}",
+                    crate::i18n::tr(
+                        "нет доступа к графическому дисплею",
+                        "no access to graphical display",
+                    ),
                     without_source_location(&e.to_string())
                 ));
             }
@@ -382,7 +402,11 @@ pub fn run() -> Result<(), String> {
     // says more about this start (a session with no desktop) than about the
     // machine, so the next start gets the whole chain again.
     renderer::forget();
-    Err(format!("не удалось открыть окно ({})", failures.join("; ")))
+    Err(format!(
+        "{} ({})",
+        crate::i18n::tr("не удалось открыть окно", "failed to open window"),
+        failures.join("; ")
+    ))
 }
 
 /// winit's `os error at <file>.rs:<line>: <what>` is for its own developers;

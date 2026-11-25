@@ -82,7 +82,10 @@ impl Kind {
             #[cfg(windows)]
             Kind::Dx12 => "DirectX 12",
             #[cfg(windows)]
-            Kind::Warp => "DirectX 12 (программный)",
+            Kind::Warp => crate::i18n::tr(
+                "DirectX 12 (программный)",
+                "DirectX 12 (software)",
+            ),
             #[cfg(not(windows))]
             Kind::Wgpu => "Vulkan/GL",
             Kind::Gl => "OpenGL",
@@ -129,7 +132,11 @@ impl Kind {
                         })
                         .cloned()
                         .ok_or_else(|| {
-                            "программный адаптер DirectX 12 (WARP) не найден".to_string()
+                            crate::i18n::tr(
+                                "программный адаптер DirectX 12 (WARP) не найден",
+                                "DirectX 12 software adapter (WARP) not found",
+                            )
+                            .to_string()
                         })
                 }));
             }
@@ -308,7 +315,13 @@ pub fn install() {
         }
         crate::utils::message_box(
             "Antigravity Unlocker",
-            &format!("Программа аварийно завершилась.\n\n{what}"),
+            &format!(
+                "{}\n\n{what}",
+                crate::i18n::tr(
+                    "Программа аварийно завершилась.",
+                    "The program crashed unexpectedly.",
+                )
+            ),
         );
     }));
 }
