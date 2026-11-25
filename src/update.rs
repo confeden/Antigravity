@@ -16,7 +16,7 @@ use rustls::{ClientConfig, ClientConnection};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-pub const DEFAULT_REPO: &str = "soroka-ilya/Antigravity";
+pub const DEFAULT_REPO: &str = "confeden/Antigravity";
 pub const UPDATED_FROM_FLAG: &str = "--updated-from";
 pub const INSTALL_UPDATE_FLAG: &str = "--install-update";
 
@@ -1369,7 +1369,7 @@ mod tests {
     fn test_release_json_deserialization() {
         let sample = r#"{
             "tag_name": "v2.11.0_4",
-            "html_url": "https://github.com/soroka-ilya/Antigravity/releases/tag/v2.11.0_4",
+            "html_url": "https://github.com/confeden/Antigravity/releases/tag/v2.11.0_4",
             "name": "Релиз v2.11.0_4",
             "draft": false,
             "prerelease": false,
@@ -1497,13 +1497,13 @@ mod tests {
 
         let body_json = br#"{
             "tag_name": "v2.36.0",
-            "html_url": "https://github.com/soroka-ilya/Antigravity/releases/tag/v2.36.0",
+            "html_url": "https://github.com/confeden/Antigravity/releases/tag/v2.36.0",
             "draft": false,
             "prerelease": false,
             "assets": []
         }"#;
         let mut seen_etag: Option<String> = None;
-        let rel = fetch_latest_with_cache("soroka-ilya/Antigravity", Some(&cache), |inm| {
+        let rel = fetch_latest_with_cache("confeden/Antigravity", Some(&cache), |inm| {
             seen_etag = inm.map(|s| s.to_string());
             Ok(ConditionalFetch::Body {
                 bytes: body_json.to_vec(),
@@ -1514,7 +1514,7 @@ mod tests {
         assert!(seen_etag.is_none());
         assert_eq!(rel.tag_name, "v2.36.0");
 
-        let rel_cached = fetch_latest_with_cache("soroka-ilya/Antigravity", Some(&cache), |inm| {
+        let rel_cached = fetch_latest_with_cache("confeden/Antigravity", Some(&cache), |inm| {
             seen_etag = inm.map(|s| s.to_string());
             Ok(ConditionalFetch::NotModified)
         })
