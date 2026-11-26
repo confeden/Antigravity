@@ -33,6 +33,14 @@ pub fn install() -> Result<(), String> {
 }
 
 pub fn uninstall() -> Result<(), String> {
+    let compat_path = match crate::target_user::override_sid() {
+        Some(sid) => format!(
+            r"Registry::HKEY_USERS\{}\SOFTWARE\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers",
+            sid.replace('\'', "''")
+        ),
+        None => r"HKCU:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers"
+            .to_string(),
+    };
     registry(&format!(
         "@('HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options\\Antigravity.exe', \
            'HKLM:\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options\\Antigravity.exe') | ForEach-Object {{ \
@@ -53,7 +61,7 @@ pub fn uninstall() -> Result<(), String> {
                }} catch {{}} \
              }} \
            }}; \
-         $compat = 'HKCU:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\AppCompatFlags\\Layers'; \
+         $compat = '{compat_path}'; \
          if (Test-Path -LiteralPath $compat) {{ \
            try {{ \
              (Get-ItemProperty -LiteralPath $compat -ErrorAction SilentlyContinue).PSObject.Properties | \
@@ -65,7 +73,8 @@ pub fn uninstall() -> Result<(), String> {
                }} \
            }} catch {{}} \
          }}",
-        owner = OWNER
+        owner = OWNER,
+        compat_path = compat_path
     ))
 }
 

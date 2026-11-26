@@ -349,6 +349,12 @@ pub struct Worker {
 }
 
 impl Worker {
+    /// Inert worker placeholder before a user profile is selected.
+    pub fn idle() -> Self {
+        let (tx, _rx) = mpsc::channel();
+        Self { tx }
+    }
+
     pub fn send(&self, cmd: Cmd) {
         // A closed worker means the app is going down; there is nothing useful
         // to do about it and nothing to tell the user.

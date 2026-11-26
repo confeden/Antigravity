@@ -187,6 +187,9 @@ fn record_path() -> std::path::PathBuf {
 /// the software renderer by one bad start long ago. A machine that really
 /// cannot run DirectX 12 pays one relaunch per version for that.
 fn read_record() -> Option<(bool, Kind)> {
+    if !crate::target_user::is_ready() {
+        return None;
+    }
     let text = std::fs::read_to_string(record_path()).ok()?;
     let mut parts = text.split_whitespace();
     let (state, kind, version) = (parts.next()?, parts.next()?, parts.next()?);
@@ -197,6 +200,9 @@ fn read_record() -> Option<(bool, Kind)> {
 }
 
 fn write_record(ok: bool, kind: Kind) {
+    if !crate::target_user::is_ready() {
+        return;
+    }
     let path = record_path();
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).ok();
@@ -206,6 +212,20 @@ fn write_record(ok: bool, kind: Kind) {
     // and the panic relaunch, which carries its answer in the environment.
     let version = crate::update::current_version();
     std::fs::write(&path, format!("{state} {} {version}\n", kind.name())).ok();
+}
+
+/// Persists the confirmed renderer once the target user profile is known.
+pub fn persist_confirmed() {
+    if !CONFIRMED.load(Ordering::SeqCst) {
+        return;
+    }
+    let start = START
+        .load(Ordering::SeqCst)
+        .checked_sub(1)
+        .and_then(|i| CHAIN.get(i).copied());
+    if let Some(kind) = start.or_else(active) {
+        write_record(true, kind);
+    }
 }
 
 pub fn forget() {

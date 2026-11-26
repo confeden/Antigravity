@@ -58,6 +58,7 @@ mod resolvers;
 mod routes;
 mod settings;
 mod stale_env;
+mod target_user;
 mod tui;
 mod update;
 mod upstream;
@@ -349,8 +350,17 @@ pub fn find_all_installs() -> Vec<PathBuf> {
 
     #[cfg(target_os = "windows")]
     {
-        let ps_cmd = r#"Get-ItemProperty HKLM:\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*, HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*, HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\* | Where-Object { $_.DisplayName -like '*Antigravity*' -or $_.DisplayName -like '*agy*' -or $_.InstallLocation -like '*Antigravity*' } | ForEach-Object { $_.InstallLocation }"#;
-        if let Some(output) = utils::powershell_within(ps_cmd, Duration::from_secs(20)) {
+        let hkcu = match target_user::override_sid() {
+            Some(sid) => format!(
+                r"Registry::HKEY_USERS\{}\Software\Microsoft\Windows\CurrentVersion\Uninstall\*",
+                sid.replace('\'', "''")
+            ),
+            None => r"HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*".to_string(),
+        };
+        let ps_cmd = format!(
+            "Get-ItemProperty HKLM:\\Software\\Wow6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*, HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*, {hkcu} -ErrorAction SilentlyContinue | Where-Object {{ $_.DisplayName -like '*Antigravity*' -or $_.DisplayName -like '*agy*' -or $_.InstallLocation -like '*Antigravity*' }} | ForEach-Object {{ $_.InstallLocation }}"
+        );
+        if let Some(output) = utils::powershell_within(&ps_cmd, Duration::from_secs(20)) {
             if output.status.success() {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 for line in stdout.lines() {
@@ -677,6 +687,8 @@ fn main() {
     // A window of an older release left open would keep re-applying its own
     // state under this one.
     instances::close_others();
+
+    target_user::init_from_args();
 
     if tui::requested() {
         run_tui(None);

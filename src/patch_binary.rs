@@ -226,10 +226,11 @@ fn launch_in_user_session(app: &Path) -> std::io::Result<()> {
         .unwrap_or_default()
         .to_string_lossy()
         .replace('\'', "''");
+    let user_id = crate::target_user::task_user_id();
     let script = format!(
         "$ErrorActionPreference='Stop'; $n='AG Unlocker Reopen'; \
          $a=New-ScheduledTaskAction -Execute '{exe}' -WorkingDirectory '{dir}'; \
-         $p=New-ScheduledTaskPrincipal -UserId \"$env:USERDOMAIN\\$env:USERNAME\" \
+         $p=New-ScheduledTaskPrincipal -UserId {user_id} \
               -LogonType Interactive -RunLevel Limited; \
          $s=New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries \
               -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew \
@@ -246,6 +247,7 @@ fn launch_in_user_session(app: &Path) -> std::io::Result<()> {
         exe = q(app),
         dir = q(app.parent().unwrap_or(Path::new("."))),
         stem = stem,
+        user_id = user_id,
     );
     let out = crate::utils::powershell_within(&script, std::time::Duration::from_secs(45))
         .ok_or_else(|| std::io::Error::other("powershell did not answer"))?;

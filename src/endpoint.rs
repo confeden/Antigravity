@@ -172,12 +172,7 @@ pub fn remove_cli() -> Result<(), String> {
     if current_cli_endpoint().as_deref() != Some(DAILY_ENDPOINT) {
         return Ok(());
     }
-    let script = format!(
-        "[Environment]::SetEnvironmentVariable('{}',$null,'User')",
-        CLI_ENV_VAR
-    );
-    powershell(&script).ok_or_else(|| "не удалось удалить переменную среды".to_string())?;
-    Ok(())
+    set_env(CLI_ENV_VAR, None)
 }
 
 /// The variable that points the language server at the local gate proxy.
@@ -857,6 +852,9 @@ pub fn remove_proxy_if_ours(url: &str, ca_path: &str) -> Result<bool, String> {
 
 #[cfg(target_os = "windows")]
 fn current_env_in(name: &str, scope: &str) -> Option<String> {
+    if scope == "User" && crate::target_user::override_sid().is_some() {
+        return current_env(name);
+    }
     let out = powershell(&format!(
         "[Environment]::GetEnvironmentVariable('{}','{}')",
         name, scope
@@ -919,7 +917,75 @@ pub fn clear_node_ca(ca_path: &str) -> Result<(), String> {
 }
 
 #[cfg(target_os = "windows")]
+fn target_user_env_script(sid: &str, body: &str) -> String {
+    let sid_q = sid.replace('\'', "''");
+    let ntuser_q = crate::target_user::override_profile_dir()
+        .map(|p| p.join("NTUSER.DAT").to_string_lossy().replace('\'', "''"))
+        .unwrap_or_default();
+    format!(
+        "$ErrorActionPreference='Stop'; \
+         $sid='{sid_q}'; \
+         $mounted=$false; \
+         $hiveRoot=\"Registry::HKEY_USERS\\$sid\"; \
+         if (-not (Test-Path -LiteralPath $hiveRoot)) {{ \
+           $ntuser='{ntuser_q}'; \
+           if ($ntuser -and (Test-Path -LiteralPath $ntuser)) {{ \
+             $hiveRoot='Registry::HKEY_USERS\\AGUnlockerTarget'; \
+             & reg.exe load 'HKU\\AGUnlockerTarget' $ntuser | Out-Null; \
+             if ($LASTEXITCODE -eq 0) {{ $mounted=$true }} \
+           }} \
+         }}; \
+         try {{ \
+           $envPath=\"$hiveRoot\\Environment\"; \
+           {body} \
+         }} finally {{ \
+           if ($mounted) {{ \
+             [GC]::Collect(); \
+             [GC]::WaitForPendingFinalizers(); \
+             & reg.exe unload 'HKU\\AGUnlockerTarget' | Out-Null \
+           }} \
+         }}"
+    )
+}
+
+#[cfg(target_os = "windows")]
 fn set_env(name: &str, value: Option<&str>) -> Result<(), String> {
+    if let Some(sid) = crate::target_user::override_sid() {
+        let name_q = name.replace('\'', "''");
+        let action = match value {
+            Some(v) => {
+                let val_q = v.replace('\'', "''");
+                format!(
+                    "if (-not (Test-Path -LiteralPath $envPath)) {{ New-Item -Path $envPath -Force | Out-Null }}; \
+                     Set-ItemProperty -LiteralPath $envPath -Name '{name_q}' -Value '{val_q}' -Type String"
+                )
+            }
+            None => format!(
+                "if (Test-Path -LiteralPath $envPath) {{ \
+                   Remove-ItemProperty -LiteralPath $envPath -Name '{name_q}' -ErrorAction SilentlyContinue \
+                 }}"
+            ),
+        };
+        let body = format!(
+            "{action}; \
+             try {{ \
+               Add-Type -Namespace AG -Name EnvNotify -MemberDefinition '[DllImport(\"user32.dll\", SetLastError=true, CharSet=CharSet.Auto)] public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint Msg, UIntPtr wParam, string lParam, uint fuFlags, uint uTimeout, out UIntPtr lpdwResult);' -ErrorAction SilentlyContinue; \
+               $res=[UIntPtr]::Zero; \
+               [AG.EnvNotify]::SendMessageTimeout([IntPtr]0xffff, 0x001A, [UIntPtr]::Zero, 'Environment', 2, 1000, [ref]$res) | Out-Null \
+             }} catch {{}}"
+        );
+        let script = target_user_env_script(sid, &body);
+        let out = powershell(&script).ok_or_else(|| format!("не удалось записать {}", name))?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            return Err(if stderr.is_empty() {
+                format!("не удалось записать {}", name)
+            } else {
+                format!("не удалось записать {}: {}", name, stderr)
+            });
+        }
+        return Ok(());
+    }
     let literal = match value {
         Some(v) => format!("'{}'", v),
         None => "$null".to_string(),
@@ -951,6 +1017,24 @@ fn set_env(name: &str, value: Option<&str>) -> Result<(), String> {
 
 #[cfg(target_os = "windows")]
 fn current_env(name: &str) -> Option<String> {
+    if let Some(sid) = crate::target_user::override_sid() {
+        let name_q = name.replace('\'', "''");
+        let body = format!(
+            "if (Test-Path -LiteralPath $envPath) {{ \
+               $k=Get-Item -LiteralPath $envPath -ErrorAction SilentlyContinue; \
+               if ($null -ne $k) {{ \
+                 try {{ $v=$k.GetValue('{name_q}', $null); if ($null -ne $v) {{ [string]$v }} }} \
+                 finally {{ $k.Dispose() }} \
+               }} \
+             }}"
+        );
+        let out = powershell(&target_user_env_script(sid, &body))?;
+        if !out.status.success() {
+            return None;
+        }
+        let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        return (!value.is_empty()).then_some(value);
+    }
     let out = powershell(&format!(
         "[Environment]::GetEnvironmentVariable('{}','User')",
         name
@@ -1004,12 +1088,7 @@ fn current_env(name: &str) -> Option<String> {
 
 #[cfg(target_os = "windows")]
 fn current_cli_endpoint() -> Option<String> {
-    let out = powershell(&format!(
-        "[Environment]::GetEnvironmentVariable('{}','User')",
-        CLI_ENV_VAR
-    ))?;
-    let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (!value.is_empty()).then_some(value)
+    current_env(CLI_ENV_VAR)
 }
 
 #[cfg(not(target_os = "windows"))]
