@@ -34,6 +34,7 @@ const WIN_H: f32 = 650.0;
 const LOG_LIMIT: usize = 400;
 
 enum Screen {
+    SelectUser,
     License,
     Main,
     Deactivated,
@@ -41,6 +42,8 @@ enum Screen {
 
 pub struct App {
     screen: Screen,
+    user_profiles: Vec<crate::target_user::UserProfile>,
+    user_selected: usize,
     key_input: String,
     key_rejected: bool,
     /// Cleared after the first frame gives the key field focus, so a paste needs
@@ -119,34 +122,10 @@ impl App {
         let up_ctx = cc.egui_ctx.clone();
         update::spawn_watch(up_tx, Box::new(move || up_ctx.request_repaint()));
 
-        // The worker wakes the UI itself: egui sleeps until something asks it to
-        // repaint, so an event that only lands in a channel is an event the user
-        // never sees.
-        let (ev_tx, events) = channel();
-        let ctx = cc.egui_ctx.clone();
-        let worker = ops::spawn(ev_tx, Box::new(move || ctx.request_repaint()));
-
-        // Its own thread and its own channel rather than a command on the
-        // worker's queue: the worker can be minutes deep in a patch run, and
-        // "is Antigravity hitting the gate right now" is exactly the question
-        // that must still answer while it is.
-        let (gate_tx, gate_rx) = channel();
-        let gate_ctx = cc.egui_ctx.clone();
-        gate::spawn_watch(gate_tx, Box::new(move || gate_ctx.request_repaint()));
-
-        // Read once, only to pre-fill the two fields. The worker owns the file
-        // from here on — two writers each saving the whole thing meant whichever
-        // saved last silently reverted the other.
-        let settings = Settings::load();
-        theme::set_preference(&cc.egui_ctx, settings.theme);
-        let screen = first_screen(&settings);
-        // A debug build told to skip the key never passes the licence screen,
-        // which is where `Unlocked` is otherwise sent from.
-        if matches!(screen, Screen::Main) {
-            worker.send(Cmd::Unlocked);
-        }
-        Self {
-            screen,
+        let mut app = Self {
+            screen: Screen::SelectUser,
+            user_profiles: Vec::new(),
+            user_selected: 0,
             key_input: String::new(),
             key_rejected: false,
             key_needs_focus: true,
@@ -155,21 +134,19 @@ impl App {
             key_cooldown: std::time::Duration::from_millis(100),
             update: None,
             update_rx,
-            worker,
-            events,
+            worker: Worker::idle(),
+            events: channel().1,
             status: None,
             gate: gate::View::default(),
             gate_at: std::time::Instant::now(),
-            gate_rx,
+            gate_rx: channel().1,
             log: Vec::new(),
             log_all_selected: false,
             busy: None,
             main_view: main_view::ViewState::default(),
-            own_proxy_input: settings.own_proxy.clone(),
-            custom_dns_input: settings.custom_dns.clone(),
-            // The saved code stays in the field across restarts and updates,
-            // where it can be seen and replaced.
-            group_key_input: settings.group_key.clone(),
+            own_proxy_input: String::new(),
+            custom_dns_input: String::new(),
+            group_key_input: String::new(),
             providers_local: Vec::new(),
             providers_reordering: false,
             vpn_path_copied: None,
@@ -178,8 +155,62 @@ impl App {
             report_saved: None,
             report_clipboard_at: None,
             frames: 0,
-            theme: settings.theme,
+            theme: crate::settings::ThemeMode::System,
+        };
+
+        if !crate::target_user::is_ready() {
+            let profiles = crate::target_user::list_profiles();
+            if profiles.len() > 1 {
+                app.user_selected = profiles.iter().position(|p| p.is_current).unwrap_or(0);
+                app.user_profiles = profiles;
+                return app;
+            }
+            crate::target_user::mark_current_ready();
         }
+        app.start_session(&cc.egui_ctx);
+        app
+    }
+
+    fn start_session(&mut self, ctx: &egui::Context) {
+        // The worker wakes the UI itself: egui sleeps until something asks it to
+        // repaint, so an event that only lands in a channel is an event the user
+        // never sees.
+        let (ev_tx, events) = channel();
+        let ev_ctx = ctx.clone();
+        let worker = ops::spawn(ev_tx, Box::new(move || ev_ctx.request_repaint()));
+
+        // Its own thread and its own channel rather than a command on the
+        // worker's queue: the worker can be minutes deep in a patch run, and
+        // "is Antigravity hitting the gate right now" is exactly the question
+        // that must still answer while it is.
+        let (gate_tx, gate_rx) = channel();
+        let gate_ctx = ctx.clone();
+        gate::spawn_watch(gate_tx, Box::new(move || gate_ctx.request_repaint()));
+
+        // Read once, only to pre-fill the two fields. The worker owns the file
+        // from here on — two writers each saving the whole thing meant whichever
+        // saved last silently reverted the other.
+        let settings = Settings::load();
+        theme::set_preference(ctx, settings.theme);
+        let screen = first_screen(&settings);
+        // A debug build told to skip the key never passes the licence screen,
+        // which is where `Unlocked` is otherwise sent from.
+        if matches!(screen, Screen::Main) {
+            worker.send(Cmd::Unlocked);
+        }
+
+        self.worker = worker;
+        self.events = events;
+        self.gate_rx = gate_rx;
+        self.screen = screen;
+        self.own_proxy_input = settings.own_proxy.clone();
+        self.custom_dns_input = settings.custom_dns.clone();
+        // The saved code stays in the field across restarts and updates,
+        // where it can be seen and replaced.
+        self.group_key_input = settings.group_key.clone();
+        self.theme = settings.theme;
+        renderer::persist_confirmed();
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(title()));
     }
 
     fn is_busy(&self) -> bool {
@@ -288,6 +319,18 @@ impl eframe::App for App {
         self.drain_events();
 
         match self.screen {
+            Screen::SelectUser => {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    let width = ui.available_width().min(580.0);
+                    ui.horizontal_top(|ui| {
+                        ui.add_space((ui.available_width() - width) / 2.0);
+                        ui.vertical(|ui| {
+                            ui.set_max_width(width);
+                            select_user_view(self, ui);
+                        });
+                    });
+                });
+            }
             Screen::Main => {
                 main_view::view(self, ui);
                 main_view::path_dialog(self, &ui.ctx().clone());
@@ -409,8 +452,123 @@ fn first_screen(settings: &Settings) -> Screen {
     Screen::License
 }
 
+fn select_user_view(app: &mut App, ui: &mut egui::Ui) {
+    ui.set_max_width(ui.available_width() - 14.0);
+    ui.add_space(6.0);
+    app.update_banner(ui);
+
+    ui.vertical_centered(|ui| {
+        ui.add_space(40.0);
+        ui.label(
+            egui::RichText::new("Antigravity Unlocker")
+                .size(28.0)
+                .strong(),
+        );
+    });
+
+    ui.add_space(36.0);
+
+    let mut confirm = false;
+    if !app.user_profiles.is_empty() {
+        let count = app.user_profiles.len();
+        ui.input(|i| {
+            if i.key_pressed(egui::Key::ArrowDown) {
+                app.user_selected = (app.user_selected + 1) % count;
+            } else if i.key_pressed(egui::Key::ArrowUp) {
+                app.user_selected = (app.user_selected + count - 1) % count;
+            } else if i.key_pressed(egui::Key::Enter) {
+                confirm = true;
+            }
+        });
+    }
+
+    widgets::card(ui, |ui| {
+        ui.label(egui::RichText::new("Выбор пользователя").size(15.0).strong());
+        ui.add_space(4.0);
+        widgets::hint(
+            ui,
+            "Выберите профиль Windows, для которого нужно выполнить действия.",
+        );
+        let current = std::env::var("USERNAME").unwrap_or_default();
+        if !current.is_empty() {
+            widgets::hint(ui, &format!("Запущено от имени: {current}"));
+        }
+        ui.add_space(10.0);
+
+        let colors = theme::palette(ui);
+        egui::ScrollArea::vertical()
+            .max_height(260.0)
+            .show(ui, |ui| {
+                for (idx, p) in app.user_profiles.iter().enumerate() {
+                    let selected = idx == app.user_selected;
+                    let mut job = egui::text::LayoutJob::default();
+                    job.append(
+                        &p.username,
+                        0.0,
+                        egui::TextFormat::simple(egui::FontId::proportional(14.0), colors.text),
+                    );
+                    if p.is_current {
+                        job.append(
+                            " (текущий)",
+                            0.0,
+                            egui::TextFormat::simple(
+                                egui::FontId::proportional(13.0),
+                                colors.accent_text,
+                            ),
+                        );
+                    }
+                    job.append(
+                        &format!("\n{}", p.profile_dir.display()),
+                        0.0,
+                        egui::TextFormat::simple(egui::FontId::proportional(12.0), colors.muted),
+                    );
+
+                    let fill = if selected { colors.soft } else { colors.sunken };
+                    let stroke = egui::Stroke::new(
+                        if selected { 1.5 } else { 1.0 },
+                        if selected { colors.accent } else { colors.line },
+                    );
+                    let btn = egui::Button::new(job)
+                        .fill(fill)
+                        .stroke(stroke)
+                        .corner_radius(egui::CornerRadius::same(theme::RADIUS_SMALL))
+                        .min_size(egui::vec2(ui.available_width(), 0.0));
+                    let resp = ui.add(btn).on_hover_cursor(egui::CursorIcon::PointingHand);
+                    if resp.clicked() {
+                        app.user_selected = idx;
+                    }
+                    if resp.double_clicked() {
+                        app.user_selected = idx;
+                        confirm = true;
+                    }
+                    ui.add_space(6.0);
+                }
+            });
+
+        ui.add_space(10.0);
+        if widgets::primary(ui, "Продолжить", !app.user_profiles.is_empty()).clicked() {
+            confirm = true;
+        }
+    });
+
+    if confirm {
+        if let Some(profile) = app.user_profiles.get(app.user_selected).cloned() {
+            crate::target_user::apply(&profile);
+            app.start_session(ui.ctx());
+        }
+    }
+}
+
 fn title() -> String {
-    format!("Antigravity Unlocker {}", update::current_version())
+    if crate::target_user::is_override() {
+        format!(
+            "Antigravity Unlocker {} — {}",
+            update::current_version(),
+            crate::target_user::selected_username().unwrap_or_default()
+        )
+    } else {
+        format!("Antigravity Unlocker {}", update::current_version())
+    }
 }
 
 #[cfg(test)]

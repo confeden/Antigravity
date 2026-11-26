@@ -404,6 +404,19 @@ pub fn desktop_dir() -> Option<PathBuf> {
         fn CoTaskMemFree(block: *mut c_void);
     }
 
+    let profile = || {
+        env::var("USERPROFILE")
+            .ok()
+            .filter(|p| !p.is_empty())
+            .map(PathBuf::from)
+    };
+    if crate::target_user::is_override() {
+        return profile()
+            .map(|p| p.join("OneDrive").join("Desktop"))
+            .filter(|p| p.is_dir())
+            .or_else(|| profile().map(|p| p.join("Desktop")).filter(|p| p.is_dir()))
+            .or_else(profile);
+    }
     let known = {
         let mut raw: *mut u16 = std::ptr::null_mut();
         let hr = unsafe { SHGetKnownFolderPath(&DESKTOP, 0, std::ptr::null_mut(), &mut raw) };
@@ -423,12 +436,6 @@ pub fn desktop_dir() -> Option<PathBuf> {
             }
             None
         }
-    };
-    let profile = || {
-        env::var("USERPROFILE")
-            .ok()
-            .filter(|p| !p.is_empty())
-            .map(PathBuf::from)
     };
     known
         .filter(|p| p.is_dir())
@@ -556,8 +563,18 @@ pub fn relaunch_elevated_with(params: &str) -> bool {
     let Ok(exe) = env::current_exe() else {
         return false;
     };
+    let full_params = match crate::target_user::selected_username() {
+        Some(user) if !params.contains("--user") => {
+            if params.trim().is_empty() {
+                format!("--user \"{user}\"")
+            } else {
+                format!("{params} --user \"{user}\"")
+            }
+        }
+        _ => params.to_string(),
+    };
     let op = wide("runas");
-    let params_w = wide(params);
+    let params_w = wide(&full_params);
     let file = wide(&exe.to_string_lossy());
     let dir = exe
         .parent()
@@ -572,7 +589,7 @@ pub fn relaunch_elevated_with(params: &str) -> bool {
             std::ptr::null_mut(),
             op.as_ptr(),
             file.as_ptr(),
-            if params.is_empty() {
+            if full_params.is_empty() {
                 std::ptr::null()
             } else {
                 params_w.as_ptr()

@@ -176,6 +176,19 @@ mod windows_impl {
         // user, no password stored, and the console it gets is hidden. It needs
         // the "log on as a batch job" right, so a machine that refuses falls back
         // to the old principal rather than ending up with no task at all.
+        let user_id = crate::target_user::task_user_id();
+        let fallback_principal = if crate::target_user::is_override() {
+            format!(
+                "$fp=New-ScheduledTaskPrincipal -UserId {user_id} -LogonType Interactive -RunLevel Limited; "
+            )
+        } else {
+            String::new()
+        };
+        let fallback_arg = if crate::target_user::is_override() {
+            "-Principal $fp "
+        } else {
+            ""
+        };
         let cmd = format!(
             "Stop-ScheduledTask -TaskName '{task}' -ErrorAction SilentlyContinue; \
              $a=New-ScheduledTaskAction -Execute '{exe}' -Argument '{flag}'; \
@@ -186,17 +199,20 @@ mod windows_impl {
                   -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1); \
              $d='Antigravity Unlocker: локальный DNS-релей'; \
              try {{ \
-               $p=New-ScheduledTaskPrincipal -UserId \"$env:USERDOMAIN\\$env:USERNAME\" \
+               $p=New-ScheduledTaskPrincipal -UserId {user_id} \
                     -LogonType S4U -RunLevel Limited; \
                Register-ScheduledTask -TaskName '{task}' -Action $a -Trigger $t -Settings $s \
                     -Principal $p -Description $d -Force -ErrorAction Stop | Out-Null }} \
              catch {{ \
-               Register-ScheduledTask -TaskName '{task}' -Action $a -Trigger $t -Settings $s \
-                    -Description $d -Force -ErrorAction Stop | Out-Null }}; \
+               {fallback_principal}Register-ScheduledTask -TaskName '{task}' -Action $a -Trigger $t -Settings $s \
+                    {fallback_arg}-Description $d -Force -ErrorAction Stop | Out-Null }}; \
              Start-ScheduledTask -TaskName '{task}'",
             exe = dst.display(),
             flag = FORWARDER_FLAG,
-            task = TASK_NAME
+            task = TASK_NAME,
+            user_id = user_id,
+            fallback_principal = fallback_principal,
+            fallback_arg = fallback_arg
         );
 
         let out = powershell(&cmd).ok_or_else(|| "не удалось запустить PowerShell".to_string())?;
@@ -243,13 +259,15 @@ mod windows_impl {
                       -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew \
                       -ExecutionTimeLimit ([TimeSpan]::Zero) \
                       -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1); \
-                 Register-ScheduledTask -TaskName '{task}' -Action $a -Trigger $t \
-                      -Settings $s -Description 'Antigravity Unlocker: локальный DNS-релей' \
+                 {fallback_principal}Register-ScheduledTask -TaskName '{task}' -Action $a -Trigger $t \
+                      -Settings $s {fallback_arg}-Description 'Antigravity Unlocker: локальный DNS-релей' \
                       -Force -ErrorAction Stop | Out-Null; \
                  Start-ScheduledTask -TaskName '{task}'",
                 exe = dst.display(),
                 flag = FORWARDER_FLAG,
-                task = TASK_NAME
+                task = TASK_NAME,
+                fallback_principal = fallback_principal,
+                fallback_arg = fallback_arg
             );
             if powershell(&cmd).is_some_and(|o| o.status.success()) {
                 if wait_for_relay() {
@@ -418,6 +436,19 @@ mod windows_impl {
             return Err("exe не установлен в %ProgramData%".to_string());
         }
         let _ = crate::launch_guard::uninstall();
+        let user_id = crate::target_user::task_user_id();
+        let fallback_principal = if crate::target_user::is_override() {
+            format!(
+                "$fp=New-ScheduledTaskPrincipal -UserId {user_id} -LogonType Interactive -RunLevel Limited; "
+            )
+        } else {
+            String::new()
+        };
+        let fallback_arg = if crate::target_user::is_override() {
+            "-Principal $fp "
+        } else {
+            ""
+        };
         let cmd = format!(
             "Stop-ScheduledTask -TaskName '{task}' -ErrorAction SilentlyContinue; \
              $a=New-ScheduledTaskAction -Execute '{exe}' -Argument '{flag}'; \
@@ -428,17 +459,20 @@ mod windows_impl {
                   -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1); \
              $d='Antigravity Unlocker: сторож патча'; \
              try {{ \
-               $p=New-ScheduledTaskPrincipal -UserId \"$env:USERDOMAIN\\$env:USERNAME\" \
+               $p=New-ScheduledTaskPrincipal -UserId {user_id} \
                     -LogonType S4U -RunLevel Limited; \
                Register-ScheduledTask -TaskName '{task}' -Action $a -Trigger $t -Settings $s \
                     -Principal $p -Description $d -Force -ErrorAction Stop | Out-Null }} \
              catch {{ \
-               Register-ScheduledTask -TaskName '{task}' -Action $a -Trigger $t -Settings $s \
-                    -Description $d -Force -ErrorAction Stop | Out-Null }}; \
+               {fallback_principal}Register-ScheduledTask -TaskName '{task}' -Action $a -Trigger $t -Settings $s \
+                    {fallback_arg}-Description $d -Force -ErrorAction Stop | Out-Null }}; \
              Start-ScheduledTask -TaskName '{task}' -ErrorAction SilentlyContinue",
             exe = exe.display(),
             flag = WATCHDOG_FLAG,
-            task = WATCHDOG_TASK_NAME
+            task = WATCHDOG_TASK_NAME,
+            user_id = user_id,
+            fallback_principal = fallback_principal,
+            fallback_arg = fallback_arg
         );
         let out = powershell(&cmd).ok_or_else(|| "не удалось запустить PowerShell".to_string())?;
         if out.status.success() {

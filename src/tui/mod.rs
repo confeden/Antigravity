@@ -84,6 +84,41 @@ pub fn run(note: Option<String>) -> Result<(), String> {
                 &format!("Программа аварийно завершилась.\n\n{info}"),
             );
         }));
+        if !crate::target_user::is_ready() {
+            let profiles = crate::target_user::list_profiles();
+            if profiles.len() > 1 {
+                println!("Выберите профиль Windows для выполнения действий:");
+                for (idx, p) in profiles.iter().enumerate() {
+                    let tag = if p.is_current { " (текущий)" } else { "" };
+                    println!(
+                        "  {}) {}{} — {}",
+                        idx + 1,
+                        p.username,
+                        tag,
+                        p.profile_dir.display()
+                    );
+                }
+                let default_idx = profiles.iter().position(|p| p.is_current).unwrap_or(0);
+                print!("Номер [{}]: ", default_idx + 1);
+                let _ = std::io::stdout().flush();
+                let mut line = String::new();
+                let _ = std::io::stdin().read_line(&mut line);
+                let trimmed = line.trim();
+                let chosen_idx = if trimmed.is_empty() {
+                    default_idx
+                } else {
+                    trimmed
+                        .parse::<usize>()
+                        .ok()
+                        .and_then(|n| n.checked_sub(1))
+                        .filter(|&i| i < profiles.len())
+                        .unwrap_or(default_idx)
+                };
+                crate::target_user::apply(&profiles[chosen_idx]);
+            } else {
+                crate::target_user::mark_current_ready();
+            }
+        }
     }
 
     let mut terminal = ratatui::try_init().map_err(|e| format!("терминал недоступен: {e}"))?;
