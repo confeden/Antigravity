@@ -1,6 +1,8 @@
+import argparse
 import json
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -12,15 +14,10 @@ if hasattr(sys.stdout, 'reconfigure'):
 if hasattr(sys.stderr, 'reconfigure'):
     sys.stderr.reconfigure(encoding='utf-8', errors='replace')
 
-# Must match src\auth.rs (LICENSE_VERSION_SEP): the license key is derived from
-# base_secret + SEP + MAJOR.MINOR, so a key holds for every patch of a minor.
-LICENSE_VERSION_SEP = "::"
-
 
 def read_canary_const(name, canary_rs_path=r"src\canary.rs"):
-    """Reads a committed const out of src/canary.rs. Same single-source-of-truth
-    trick as read_base_secret, so build.rs, the binary, this script and
-    tools/canary_check.py cannot drift apart."""
+    """Reads a committed const out of src/canary.rs, so build.rs, the binary,
+    this script and tools/canary_check.py cannot drift apart."""
     with open(canary_rs_path, 'r', encoding='utf-8') as f:
         src = f.read()
     m = re.search(r'pub const %s: &str = "([^"]*)"' % re.escape(name), src)
@@ -423,9 +420,14 @@ def prune_dev_cache(target_dir, release_profile):
 def publish_windows_exe(source, destination):
     """Publish the new image without stopping a running copy of the old one."""
     directory, filename = os.path.split(destination)
-    with tempfile.TemporaryDirectory(prefix="ag-build-", dir=directory) as staging:
+    # Stage directly inside `directory` rather than `TemporaryDirectory`: on Python 3.12+
+    # on Windows a temp dir gets a non-inherited 0700 DACL that `os.replace` preserves,
+    # stripping Authenticated Users / Users when built elevated.
+    tag = f"ag-build-{secrets.token_hex(4)}"
+    fresh = os.path.join(directory, f".{filename}.{tag}.tmp")
+    previous = os.path.join(directory, f".{filename}.{tag}.previous")
+    try:
         # Cargo's convenience copy is a hardlink into its cache. Ship a copy.
-        fresh = os.path.join(staging, filename)
         shutil.copy2(source, fresh)
         try:
             os.replace(fresh, destination)
@@ -433,7 +435,6 @@ def publish_windows_exe(source, destination):
             if not os.path.isfile(destination):
                 raise
             # Windows permits renaming a mapped image but denies deleting it.
-            previous = os.path.join(directory, f".{filename}.{os.path.basename(staging)}.previous")
             os.replace(destination, previous)
             try:
                 os.replace(fresh, destination)
@@ -449,6 +450,55 @@ def publish_windows_exe(source, destination):
                 os.remove(previous)
             except PermissionError:
                 print(f"[INFO] Предыдущий EXE занят запущенным процессом: {previous}")
+    finally:
+        if os.path.exists(fresh):
+            try:
+                os.remove(fresh)
+            except OSError:
+                pass
+
+
+def find_iscc():
+    configured = os.environ.get("ISCC")
+    candidates = [configured] if configured else [shutil.which("ISCC.exe")]
+    if not configured:
+        for base in (os.environ.get("ProgramFiles(x86)"), os.environ.get("ProgramFiles"),
+                     os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs")):
+            if base:
+                candidates.extend(os.path.join(base, f"Inno Setup {major}", "ISCC.exe") for major in (7, 6))
+    if not configured and os.name == "nt":
+        import winreg
+
+        key_prefix = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
+        for root in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+            for view in (winreg.KEY_WOW64_32KEY, winreg.KEY_WOW64_64KEY):
+                for major in (7, 6):
+                    try:
+                        with winreg.OpenKey(root, f"{key_prefix}\\Inno Setup {major}_is1", 0,
+                                            winreg.KEY_READ | view) as key:
+                            directory, _ = winreg.QueryValueEx(key, "InstallLocation")
+                        if directory:
+                            candidates.append(os.path.join(directory, "ISCC.exe"))
+                    except FileNotFoundError:
+                        continue
+    for path in candidates:
+        if path and os.path.isfile(path):
+            return os.path.abspath(path)
+    raise RuntimeError("Установите Inno Setup 6.7+ или укажите путь к ISCC.exe в переменной ISCC.")
+
+
+def build_windows_installer(compiler, source, version, destination):
+    with tempfile.TemporaryDirectory(prefix="ag-inno-") as staging:
+        subprocess.check_call([
+            compiler, "/Qp", f"/DAppVersion={version.replace('_', '.')}",
+            f"/DAppExecutable={os.path.abspath(source)}", f"/DBuildOutput={staging}",
+            os.path.abspath("installer.iss"),
+        ])
+        publish_windows_exe(os.path.join(staging, "setup.exe"), destination)
+
+
+def installer_filename(version):
+    return f"AI_Unlocker_setup-{version}.exe"
 
 
 def prune_old_releases(release_dir, version):
@@ -457,8 +507,9 @@ def prune_old_releases(release_dir, version):
     The release notes and scripts beside the .exe files and bundles stay.
     Every published version is on GitHub Releases; the others were test builds.
     Returns (entries removed, bytes freed)."""
-    output = re.compile(r"^AG_(.+?)(\.exe|_(?:linux|macos)\.tar\.gz|_linux|_macos)$")
-    previous_exe = re.compile(r"^\.AG_.+\.exe\.ag-build-[a-z0-9_]+\.previous$")
+    output = re.compile(r"^AG_(.+?)(_portable\.exe|\.exe|_(?:linux|macos)\.tar\.gz|_linux|_macos)$")
+    installer = re.compile(r"^AI_Unlocker_setup-(.+?)(\.exe)$")
+    previous_exe = re.compile(r"^\.(?:AG_|AI_Unlocker_setup-).+\.exe\.ag-build-[a-z0-9_]+\.previous$")
     removed = freed = 0
     for entry in _entries(release_dir):
         if previous_exe.fullmatch(entry.name) and entry.is_file(follow_symlinks=False):
@@ -466,7 +517,7 @@ def prune_old_releases(release_dir, version):
             if not os.path.exists(entry.path):
                 removed += 1
             continue
-        m = output.match(entry.name)
+        m = output.fullmatch(entry.name) or installer.fullmatch(entry.name)
         if not m or m.group(1) == version:
             continue
         if entry.is_dir(follow_symlinks=False) != (m.group(2) in ("_linux", "_macos")):
@@ -1093,221 +1144,36 @@ def build_macos_bundle(version):
         return None
 
 
-def read_base_secret(auth_rs_path):
-    """Reads the committed base secret straight from src\\auth.rs, so the source
-    is the single source of truth for both the binary and the key generator."""
-    with open(auth_rs_path, 'r', encoding='utf-8') as f:
-        src = f.read()
-    m = re.search(r'const\s+LICENSE_BASE_SECRET\s*:\s*&str\s*=\s*"([^"]*)"', src)
-    if not m:
-        raise RuntimeError("LICENSE_BASE_SECRET not found in src/auth.rs")
-    return m.group(1)
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Сборка AI Unlocker")
+    parser.add_argument(
+        "--portable",
+        "--windows-portable",
+        action="store_true",
+        help="Собрать только переносимую Windows-версию (release/AG_<ver>_portable.exe).",
+    )
+    args = parser.parse_args(argv)
 
-
-def main():
     # Set correct working directory to where this script is located
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
     print("[INFO] Starting build process...")
 
-    VERSION = "2.35.0"
+    VERSION = "2.35.2"
     version = VERSION
-    # env!("CARGO_PKG_VERSION") only sees MAJOR.MINOR.PATCH, so the key salt uses
-    # the same trimmed value the binary will compile with.
-    #
-    # The build number is separated by "_" so it can never be mistaken for a
-    # fourth semver component: "2.9.1_14" splits to "2.9.1" here, whereas
-    # "2.9.1.14" put through the old ".".join(...[:3]) would have been fine but
-    # any future edit to this line could silently write a 4-part version into
-    # Cargo.toml - and a changed Cargo version re-salts and invalidates every
-    # licence key that has ever been issued. Both spellings are accepted.
     cargo_version = ".".join(version.split("_")[0].split(".")[:3])
     print(f"[INFO] Build version: {version}")
 
-    # `.secrets.json` is now purely an owner marker: when present, this machine
-    # is the author's, so the key generator is produced and fresh keys printed.
-    # A clone from GitHub has no such file, so it builds a working binary but
-    # generates NO keys - users must fetch a free key from t.me/nova_txt.
-    is_owner = os.path.exists(".secrets.json")
-
-    main_rs_path = r"src\main.rs"
-    auth_rs_path = r"src\auth.rs"
-
-    # The secret is committed in the sources; the key generator derives from the
-    # exact same base + version salt, so its keys always match this build.
-    base_secret = read_base_secret(auth_rs_path)
-    # Keys are bound to MAJOR.MINOR only (src/auth.rs::license_version): 2.32.1's
-    # key also opens 2.32.4.
-    license_version = ".".join(cargo_version.split(".")[:2])
-    key_secret_phrase = f"{base_secret}{LICENSE_VERSION_SEP}{license_version}"
-
-    keygen_code = "SECRET_PHRASE = " + repr(key_secret_phrase) + chr(10) + """
-import hashlib
-import random
-import string
-
-VERSION = SECRET_PHRASE.rsplit('::', 1)[-1]
-MARK = '67'  # every key ends with these two digits
-NL = chr(10)
-
-
-def generate_key():
-    # The key must END with the mark. The tail is the hash signature, so draw
-    # nonces until it ends in '67': 1 in 256 on average, well under a millisecond.
-    chars = string.ascii_uppercase + string.digits
-    while True:
-        nonce = ''.join(random.choices(chars, k=12))
-        data = (nonce + SECRET_PHRASE).encode('utf-8')
-        signature = hashlib.sha256(data).hexdigest().upper()[:12]
-        if signature.endswith(MARK):
-            return nonce + signature
-
-
-def telegram_text(key):
-    # Backticks make the key monospace (tap-to-copy) once sent in Telegram.
-    return 'Ключ для v' + VERSION + '.x' + NL + NL + '`' + key + '`'
-
-
-def html_clip(key):
-    # CF_HTML: only the key is <code>, the sentence stays plain.
-    crlf = chr(13) + chr(10)
-    frag = 'Ключ для v' + VERSION + '.x<br><br><code>' + key + '</code>'
-    pre = '<html><body><!--StartFragment-->'
-    post = '<!--EndFragment--></body></html>'
-    head = 'Version:0.9' + crlf + 'StartHTML:%010d' + crlf + 'EndHTML:%010d' + crlf + 'StartFragment:%010d' + crlf + 'EndFragment:%010d' + crlf
-    n = len((head % (0, 0, 0, 0)).encode('utf-8'))
-    b = lambda s: len(s.encode('utf-8'))
-    sh = n
-    sf = sh + b(pre)
-    ef = sf + b(frag)
-    eh = ef + b(post)
-    return ((head % (sh, eh, sf, ef)) + pre + frag + post).encode('utf-8') + bytes(1)
-
-
-def copy_to_clipboard(root, text, html=None):
-    # Windows clipboard directly, so the text survives closing the window.
     try:
-        import ctypes
-        from ctypes import wintypes
-        u32, k32 = ctypes.windll.user32, ctypes.windll.kernel32
-        k32.GlobalAlloc.restype = wintypes.HGLOBAL
-        k32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
-        k32.GlobalLock.restype = ctypes.c_void_p
-        k32.GlobalLock.argtypes = [wintypes.HGLOBAL]
-        k32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
-        u32.SetClipboardData.argtypes = [wintypes.UINT, wintypes.HANDLE]
-        u32.OpenClipboard.argtypes = [wintypes.HWND]
-        data = (text + chr(0)).encode('utf-16-le')
-        if not u32.OpenClipboard(None):
-            raise OSError('clipboard busy')
-        try:
-            u32.EmptyClipboard()
-            h = k32.GlobalAlloc(0x0002, len(data))  # GMEM_MOVEABLE
-            p = k32.GlobalLock(h)
-            ctypes.memmove(p, data, len(data))
-            k32.GlobalUnlock(h)
-            u32.SetClipboardData(13, h)  # CF_UNICODETEXT
-            if html:
-                u32.RegisterClipboardFormatW.argtypes = [wintypes.LPCWSTR]
-                fmt = u32.RegisterClipboardFormatW('HTML Format')
-                h2 = k32.GlobalAlloc(0x0002, len(html))
-                p2 = k32.GlobalLock(h2)
-                ctypes.memmove(p2, html, len(html))
-                k32.GlobalUnlock(h2)
-                u32.SetClipboardData(fmt, h2)
-        finally:
-            u32.CloseClipboard()
-        return True
-    except Exception:
-        try:
-            root.clipboard_clear()
-            root.clipboard_append(text)
-            root.update()
-            return True
-        except Exception:
-            return False
-
-
-def main():
-    import tkinter as tk
-
-    root = tk.Tk()
-    root.title('Antigravity Keygen v' + VERSION)
-    root.geometry('440x250')
-    root.resizable(False, False)
-    root.configure(bg='#1e1e2e')
-
-    tk.Label(root, text='Ключ для Telegram', bg='#1e1e2e', fg='#89b4fa',
-             font=('Segoe UI', 15, 'bold')).pack(pady=(14, 8))
-    preview = tk.Label(root, bg='#181825', fg='#a6e3a1', font=('Consolas', 13, 'bold'),
-                       justify='left', anchor='w', padx=14, pady=10)
-    preview.pack(fill='x', padx=20)
-    status = tk.Label(root, bg='#1e1e2e', fg='#a6adc8', font=('Segoe UI', 10))
-    status.pack(pady=8)
-
-    state = {'text': '', 'html': None}
-
-    def new_key():
-        key = generate_key()
-        state['html'] = html_clip(key)
-        state['text'] = telegram_text(key)
-        preview.config(text=state['text'].replace('`', ''))
-        copy()
-
-    def copy():
-        ok = copy_to_clipboard(root, state['text'], state['html'])
-        status.config(text='Скопировано - вставляйте в Telegram' if ok else 'Не удалось скопировать',
-                      fg='#a6e3a1' if ok else '#f38ba8')
-
-    row = tk.Frame(root, bg='#1e1e2e')
-    row.pack(pady=6)
-    style = dict(bg='#313244', fg='#cdd6f4', activebackground='#45475a', activeforeground='#ffffff',
-                 font=('Segoe UI', 11, 'bold'), bd=0, height=2, width=18, cursor='hand2')
-    tk.Button(row, text='Копировать', command=copy, **style).pack(side='left', padx=8)
-    tk.Button(row, text='Новый ключ', command=new_key, **style).pack(side='left', padx=8)
-
-    new_key()
-    root.mainloop()
-
-
-if __name__ == '__main__':
-    main()
-"""
-
-    dist_keygen_path = "dist_keygen.py"
-    dist_keygen_gui_path = "dist_keygen.pyw"
-
-    try:
-        # 1. Sync the version in Cargo.toml so env!("CARGO_PKG_VERSION") - which
-        #    both the binary and the key salt use - matches this release.
+        # 1. Sync the version in Cargo.toml so env!("CARGO_PKG_VERSION") matches this build.
         with open("Cargo.toml", 'r', encoding='utf-8') as f:
             cargo_content = f.read()
         cargo_content = re.sub(r'^version\s*=\s*"[^"]*"', f'version = "{cargo_version}"', cargo_content, flags=re.MULTILINE)
         with open("Cargo.toml", 'w', encoding='utf-8') as f:
             f.write(cargo_content)
 
-        # 2. Owner-only: (re)generate the key generator for THIS version. Never
-        #    created on a plain clone from GitHub - those builds ship no keys.
-        if is_owner:
-            with open(dist_keygen_path, 'w', encoding='utf-8') as f:
-                f.write(keygen_code)
-            # Same code, .pyw: double-click opens the window with no console.
-            with open(dist_keygen_gui_path, 'w', encoding='utf-8') as f:
-                f.write(keygen_code)
-            # Double-click launcher: .pyw has no file association on every PC.
-            q = '"'
-            vbs = (
-                f'Set sh = CreateObject({q}WScript.Shell{q})\r\n'
-                f'Set fso = CreateObject({q}Scripting.FileSystemObject{q})\r\n'
-                'dir = fso.GetParentFolderName(WScript.ScriptFullName)\r\n'
-                'sh.CurrentDirectory = dir\r\n'
-                f'sh.Run {q}pythonw {q}{q}{q} & dir & {q}\\{dist_keygen_gui_path}{q}{q}{q}, 0, False\r\n'
-            )
-            with open("dist_keygen.vbs", 'w', encoding='ascii', newline='') as f:
-                f.write(vbs)
-
-        # 3. Build the release binary (only the main target). No source edits are
-        #    made, so there is nothing sensitive that could be left behind.
+        # 2. Build the release binary (only the main target).
         print("[INFO] Запуск компиляции (Release mode)...")
+        installer_compiler = None if args.portable else find_iscc()
         cargo_env = os.environ.copy()
         cargo_env["AG_FULL_VERSION"] = version
         home = os.path.expanduser("~")
@@ -1331,20 +1197,21 @@ if __name__ == '__main__':
             raise RuntimeError("cargo не сообщил, где собранный exe")
 
         os.makedirs("release", exist_ok=True)
-        out_path = os.path.abspath(os.path.join("release", f"AG_{version}.exe"))
-        publish_windows_exe(built_exe, out_path)
-        check_shipped_binary(out_path, [home + "\\", "\\.cargo\\registry"], windows=True)
-
-        # Shrink the exe in place; it stays a runnable AG_<ver>.exe.
+        portable_path = os.path.abspath(os.path.join("release", f"AG_{version}_portable.exe"))
+        publish_windows_exe(built_exe, portable_path)
+        check_shipped_binary(portable_path, [home + "\\", "\\.cargo\\registry"], windows=True)
         if UPX_ENABLED:
-            print("[INFO] Сжатие исполняемого файла...")
-            compress_exe_inplace(out_path)
-        else:
-            print("[INFO] UPX-сжатие отключено — отгружается несжатый .exe "
-                  "(меньше ложных срабатываний антивирусов).")
+            compress_exe_inplace(portable_path)
 
-        print("\n[УСПЕХ] Сборка завершена!")
-        print(f"Ваш исполняемый файл: {out_path}")
+        if args.portable:
+            print(f"Переносимая сборка Windows: {portable_path}")
+            return 0
+
+        out_path = os.path.abspath(os.path.join("release", installer_filename(version)))
+        build_windows_installer(installer_compiler, portable_path, version, out_path)
+
+        print(f"Установщик Windows: {out_path}")
+        print(f"Переносимая сборка для TUI: {portable_path}")
 
         # Provenance record. Written after compression so the hash is of the file
         # that actually ships.
@@ -1375,17 +1242,7 @@ if __name__ == '__main__':
             print(f"[INFO] target\\ (cargo test, rust-analyzer): удалено {_mb(freed)} того, "
                   f"что не использовалось {DEV_CACHE_KEEP_DAYS} дней.")
 
-        if is_owner:
-            print(f"Ваш генератор ключей для этой версии: {dist_keygen_path}")
-            print(f"\n[i] Ключи привязаны к линейке {license_version}.x: подходят ко всем")
-            print("    патчам линейки; после смены первых двух чисел VERSION людям")
-            print("    понадобится новый ключ из t.me/nova_txt.")
-            # Auto-generate some keys for convenience.
-            print(f"\n5 ключей для версии {cargo_version}:")
-            # -B: no __pycache__ left beside the sources for one import.
-            subprocess.check_call(["python", "-B", "-c", "import dist_keygen; print(dist_keygen.generate_key())"])
-        else:
-            print("\nДля работы необходим ключ - получить его можно бесплатно в группе t.me/nova_txt")
+        return 0
 
     except subprocess.CalledProcessError as e:
         # No cache is pruned after a failed build: see "Build caches" above.

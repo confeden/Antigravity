@@ -41,7 +41,8 @@ pub fn build(status: Option<&Status>, view: &View) -> String {
     let now = crate::utils::local_clock().map_or_else(String::new, |c| c.hms());
     let _ = writeln!(
         out,
-        "Antigravity Unlocker v{} — отчёт {}",
+        "{} v{} — отчёт {}",
+        crate::APP_NAME,
         crate::update::current_version(),
         now
     );
@@ -86,9 +87,13 @@ pub fn build(status: Option<&Status>, view: &View) -> String {
         } else {
             format!(", модель {}", o.model)
         };
+        let label = match o.kind {
+            crate::ls_log::OverloadKind::Capacity => "Ошибка 503 (нет мощностей у Google",
+            crate::ls_log::OverloadKind::Quota => "Ошибка 429 (исчерпан лимит токенов",
+        };
         let _ = writeln!(
             out,
-            "Ошибка 503 (нет мощностей у Google{model}): {}, строк за 10 мин: {}",
+            "{label}{model}): {}, строк за 10 мин: {}",
             super::status::ago_text(o.ago),
             o.count
         );
@@ -286,6 +291,19 @@ fn relay_part(out: &mut String, r: &Report) {
             "Последний ответ модели, который видела служба: {} с назад, маршрут: {}",
             crate::gate::now_unix().saturating_sub(ok.at),
             non_empty(&ok.route)
+        );
+    }
+    if let Some(err) = &r.last_paid_error {
+        let _ = writeln!(
+            out,
+            "Последний сбой PAID: {} с назад, host={}, stage={}, status={}, reason={}, conn={} — {}",
+            crate::gate::now_unix().saturating_sub(err.at),
+            err.host,
+            err.stage,
+            err.status,
+            err.reason,
+            err.conn_id,
+            err.summary
         );
     }
     if let Some(e) = &r.last_400 {

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Installs Antigravity Unlocker into the GNOME/KDE application menu, so from then
+# Installs AI Unlocker into the GNOME/KDE application menu, so from then
 # on it launches with a normal double-click from Activities/the app grid - no
 # terminal, no commands. Everything lands under the home dir; no root needed to
 # install (root is asked for only at patch time, by the launcher).
@@ -23,7 +23,7 @@ cat >"$DESKTOP_FILE" <<EOF
 [Desktop Entry]
 Type=Application
 Version=1.0
-Name=Antigravity Unlocker
+Name=AI Unlocker
 Comment=Разблокировать Antigravity 2.0 / IDE / CLI
 Exec=bash "$APP_DIR/launch.sh"
 $ICON_LINE
@@ -38,7 +38,7 @@ gio set "$DESKTOP_FILE" metadata::trusted true 2>/dev/null || true
 update-desktop-database "$DESKTOP_DIR" 2>/dev/null || true
 
 echo
-echo "Готово. «Antigravity Unlocker» добавлен в меню приложений."
+echo "Готово. «AI Unlocker» добавлен в меню приложений."
 echo "Запускайте его двойным кликом из списка программ (Activities / app grid)."
 echo
 read -r -p "Нажмите Enter для выхода..." _ || true

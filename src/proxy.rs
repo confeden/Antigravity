@@ -43,14 +43,18 @@ use crate::utils::no_window;
 pub const LISTEN_IP: &str = "127.0.0.1";
 /// The port the proxy starts on, and keeps for as long as it can have it.
 pub const DEFAULT_PORT: u16 = 53129;
+/// Dedicated loopback port for PAID application routing so FREE and PAID traffic stay isolated.
+pub const DEFAULT_PAID_PORT: u16 = 53130;
 /// Where it moves when it cannot (P26). 53129 is inside Windows' dynamic range
 /// (49152-65535), which is where Hyper-V, WSL 2 and Docker reserve ports and
 /// where every outgoing connection borrows one; these sit below it, where
 /// neither happens on a default Windows.
 const FALLBACK_PORTS: [u16; 6] = [43129, 44129, 45129, 46129, 47129, 48129];
+const PAID_FALLBACK_PORTS: [u16; 6] = [43130, 44130, 45130, 46130, 47130, 48130];
 
 /// The port this process bound, 0 until it has (the relay's own answer).
 static PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+static PAID_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
 
 /// The file the relay records a moved port in, beside `settings.json` - the one
 /// place the window (another process, as the same user) and the relay agree on.
@@ -59,42 +63,96 @@ fn port_file() -> PathBuf {
     crate::dns_forwarder::log_dir().join("proxy_port")
 }
 
-/// The port the local proxy listens on: the one this process bound, else the
-/// one the relay recorded, else the default. Everything that names the proxy -
-/// the variable, the door's hop, the egress probe - asks this.
-pub fn port() -> u16 {
-    match PORT.load(std::sync::atomic::Ordering::Relaxed) {
-        0 => fs::read_to_string(port_file())
+fn paid_port_file() -> PathBuf {
+    crate::dns_forwarder::log_dir().join("paid_proxy_port")
+}
+
+fn read_port_slot(atomic: &std::sync::atomic::AtomicU16, file: &PathBuf, default: u16) -> u16 {
+    match atomic.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => fs::read_to_string(file)
             .ok()
             .and_then(|s| s.trim().parse::<u16>().ok())
             .filter(|p| *p != 0)
-            .unwrap_or(DEFAULT_PORT),
+            .unwrap_or(default),
         p => p,
     }
 }
 
-/// Takes `port` as this machine's, in this process and on disk.
-fn adopt(port: u16) {
-    PORT.store(port, std::sync::atomic::Ordering::Relaxed);
+fn adopt_port_slot(
+    atomic: &std::sync::atomic::AtomicU16,
+    file: &PathBuf,
+    default: u16,
+    port: u16,
+) {
+    atomic.store(port, std::sync::atomic::Ordering::Relaxed);
     // Never from a test: the file is the real user's, and the relay reads it.
     if cfg!(test) {
         return;
     }
-    if port == DEFAULT_PORT {
-        fs::remove_file(port_file()).ok();
+    if port == default {
+        fs::remove_file(file).ok();
     } else {
-        let path = port_file();
-        if let Some(dir) = path.parent() {
+        if let Some(dir) = file.parent() {
             fs::create_dir_all(dir).ok();
         }
-        fs::write(path, port.to_string()).ok();
+        fs::write(file, port.to_string()).ok();
     }
 }
 
-/// The URL the variable held before any move - still ours, never a foreign
-/// proxy to stand aside for (`endpoint::is_ours_on_any_port`).
-pub fn default_url() -> String {
-    format!("http://{}:{}", LISTEN_IP, DEFAULT_PORT)
+/// The port the local proxy listens on: the one this process bound, else the
+/// one the relay recorded, else the default. Everything that names the proxy -
+/// the variable, the door's hop, the egress probe - asks this.
+pub fn port() -> u16 {
+    read_port_slot(&PORT, &port_file(), DEFAULT_PORT)
+}
+
+/// The port the dedicated PAID proxy listens on.
+pub fn paid_port() -> u16 {
+    read_port_slot(&PAID_PORT, &paid_port_file(), DEFAULT_PAID_PORT)
+}
+
+/// Takes `port` as this machine's, in this process and on disk.
+fn adopt(port: u16) {
+    adopt_port_slot(&PORT, &port_file(), DEFAULT_PORT, port);
+}
+
+fn adopt_paid(port: u16) {
+    adopt_port_slot(&PAID_PORT, &paid_port_file(), DEFAULT_PAID_PORT, port);
+}
+
+pub fn paid_proxy_url() -> String {
+    url_at(paid_port())
+}
+
+pub fn all_our_urls() -> Vec<String> {
+    let mut urls = Vec::with_capacity(16);
+    for p in std::iter::once(port())
+        .chain(std::iter::once(DEFAULT_PORT))
+        .chain(FALLBACK_PORTS.iter().copied())
+        .chain(std::iter::once(paid_port()))
+        .chain(std::iter::once(DEFAULT_PAID_PORT))
+        .chain(PAID_FALLBACK_PORTS.iter().copied())
+    {
+        let u = url_at(p);
+        if !urls.contains(&u) {
+            urls.push(u);
+        }
+    }
+    urls
+}
+
+pub fn all_paid_urls() -> Vec<String> {
+    let mut urls = Vec::with_capacity(8);
+    for p in std::iter::once(paid_port())
+        .chain(std::iter::once(DEFAULT_PAID_PORT))
+        .chain(PAID_FALLBACK_PORTS.iter().copied())
+    {
+        let u = url_at(p);
+        if !urls.contains(&u) {
+            urls.push(u);
+        }
+    }
+    urls
 }
 
 /// Common name of the certificate authority older versions generated on this
@@ -238,10 +296,26 @@ pub fn url_at(port: u16) -> String {
 /// would route Antigravity into it. Linux has no table to ask, and there the
 /// proxy never moves.
 pub fn wait_for_our_listener(budget: Duration) -> Option<u16> {
+    wait_for_listener_slot(budget, port, || {
+        bound().then(|| PORT.load(std::sync::atomic::Ordering::Relaxed))
+    })
+}
+
+pub fn wait_for_our_paid_listener(budget: Duration) -> Option<u16> {
+    wait_for_listener_slot(budget, paid_port, || {
+        paid_bound().then(|| PAID_PORT.load(std::sync::atomic::Ordering::Relaxed))
+    })
+}
+
+fn wait_for_listener_slot(
+    budget: Duration,
+    read_port: fn() -> u16,
+    bound_port: impl Fn() -> Option<u16>,
+) -> Option<u16> {
     let deadline = Instant::now() + budget;
     loop {
-        let p = port();
-        if ours_answers(p) {
+        let p = read_port();
+        if ours_answers_at(bound_port(), p) {
             return Some(p);
         }
         if Instant::now() >= deadline {
@@ -251,10 +325,9 @@ pub fn wait_for_our_listener(budget: Duration) -> Option<u16> {
     }
 }
 
-fn ours_answers(port: u16) -> bool {
-    if bound() {
-        // The relay asking about itself: `PORT` is set before `PROXY_BOUND`.
-        return PORT.load(std::sync::atomic::Ordering::Relaxed) == port;
+fn ours_answers_at(bound_port: Option<u16>, port: u16) -> bool {
+    if let Some(local) = bound_port {
+        return local == port;
     }
     if !answers_at(addr_at(port)) {
         return false;
@@ -896,7 +969,12 @@ fn probe_request(mut sock: TcpStream) -> Result<(), String> {
 ///
 /// Returns the target. Anything that is not a CONNECT is refused rather than
 /// guessed at: this proxy exists for one client and one method.
+#[cfg(test)]
 fn read_connect(sock: &mut TcpStream) -> Request {
+    read_request(sock, false)
+}
+
+fn read_request(sock: &mut TcpStream, paid: bool) -> Request {
     let mut head = Vec::new();
     let mut byte = [0u8; 1];
     while !head.ends_with(b"\r\n\r\n") {
@@ -915,16 +993,23 @@ fn read_connect(sock: &mut TcpStream) -> Request {
             Ok(_) => head.push(byte[0]),
         }
     }
-    match parse_connect(&String::from_utf8_lossy(&head)) {
-        Some((host, port)) => Request::Connect(host, port),
-        None => Request::Malformed,
+    let head = String::from_utf8_lossy(&head);
+    if let Some((host, port)) = parse_connect(&head) {
+        return Request::Connect(host, port);
     }
+    if paid {
+        if let Some((host, port, head)) = crate::paid::plain_http(&head) {
+            return Request::Http(host, port, head);
+        }
+    }
+    Request::Malformed
 }
 
 /// What arrived on a freshly accepted socket.
 #[derive(Debug, PartialEq, Eq)]
 enum Request {
     Connect(String, u16),
+    Http(String, u16, Vec<u8>),
     /// Something that is not a CONNECT. Answered, because the client is there.
     Malformed,
     /// Nothing arrived. Closed in silence, because there is nobody to answer.
@@ -1186,15 +1271,18 @@ fn try_builtin_exit(client: TcpStream, _host: &str, _port: u16) -> Result<(), Tc
 
 fn serve(mut client: TcpStream, _if_index: u32) {
     client.set_read_timeout(Some(REQUEST_IDLE)).ok();
-    let (host, port) = match read_connect(&mut client) {
+    let (host, port) = match read_request(&mut client, false) {
         Request::Connect(host, port) => (host, port),
-        Request::Malformed => {
+        Request::Http(_, _, _) | Request::Malformed => {
             client.write_all(RESP_NOT_ALLOWED).ok();
             return;
         }
         Request::Gone => return,
     };
+    serve_free_connect(client, &host, port);
+}
 
+fn serve_free_connect(mut client: TcpStream, host: &str, port: u16) {
     // Four routes for a gate host, each handing the client back untouched if it
     // cannot serve it, in the order the route table puts them (routes.rs):
     //
@@ -1213,9 +1301,9 @@ fn serve(mut client: TcpStream, _if_index: u32) {
     // decided before `200 Connection Established` goes out, so falling from
     // one to the next costs the client nothing (I35), and a tunnel already
     // open keeps its route whatever the table says next.
-    if port == 443 && is_gate_host(&host) {
-        let _gate = routes::begin_gate_connection(&client, &host);
-        serve_gate(client, &host, port);
+    if port == 443 && is_gate_host(host) {
+        let _gate = routes::begin_gate_connection(&client, host);
+        serve_gate(client, host, port);
         return;
     }
 
@@ -1226,7 +1314,7 @@ fn serve(mut client: TcpStream, _if_index: u32) {
     // black-screened the Desktop app with `BadCertificate`. The gate hosts are
     // reached cert-free through the routes above; nothing here needs a CA.
     client.set_read_timeout(None).ok();
-    tunnel(client, &host, port);
+    tunnel(client, host, port);
 }
 
 /// The most one gate connection may spend walking routes that fail to open.
@@ -1289,9 +1377,14 @@ fn serve_gate(client: TcpStream, host: &str, port: u16) {
 /// connections to this one, so it is only worth answering DNS with a loopback
 /// address while both are up.
 static PROXY_BOUND: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static PAID_BOUND: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub fn bound() -> bool {
     PROXY_BOUND.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn paid_bound() -> bool {
+    PAID_BOUND.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// How long a taken port is given to come free, and how often it is retried.
@@ -1317,10 +1410,20 @@ const BIND_RETRY_WAIT: Duration = Duration::from_secs(3);
 /// port), the proxy moves to one outside the dynamic range and records it
 /// (`adopt`), so the variable written after it names the port that answers.
 fn bind_listener() -> Result<TcpListener, crate::gate::Blocker> {
-    bind_from(port(), &FALLBACK_PORTS)
+    bind_from_slot(port(), &FALLBACK_PORTS, "proxy", adopt)
 }
 
+#[cfg(test)]
 fn bind_from(first: u16, fallbacks: &[u16]) -> Result<TcpListener, crate::gate::Blocker> {
+    bind_from_slot(first, fallbacks, "proxy", adopt)
+}
+
+fn bind_from_slot(
+    first: u16,
+    fallbacks: &[u16],
+    blocker_what: &str,
+    adopt_fn: fn(u16),
+) -> Result<TcpListener, crate::gate::Blocker> {
     let mut failed: Option<(std::io::Error, crate::portcheck::Cause)> = None;
     for attempt in 0..BIND_TRIES {
         match TcpListener::bind(addr_at(first)) {
@@ -1332,7 +1435,7 @@ fn bind_from(first: u16, fallbacks: &[u16]) -> Result<TcpListener, crate::gate::
                         attempt + 1
                     ));
                 }
-                adopt(first);
+                adopt_fn(first);
                 return Ok(listener);
             }
             Err(e) => {
@@ -1368,12 +1471,12 @@ fn bind_from(first: u16, fallbacks: &[u16]) -> Result<TcpListener, crate::gate::
                     "порт {} недоступен ({}) — локальный прокси перенесён на {}",
                     first, err, other
                 ));
-                adopt(other);
+                adopt_fn(other);
                 return Ok(listener);
             }
         }
     }
-    Err(cause.blocker("proxy", addr_at(first), &err))
+    Err(cause.blocker(blocker_what, addr_at(first), &err))
 }
 
 /// How often a listener that could not be bound is tried again. A user who adds
@@ -1436,9 +1539,136 @@ pub fn run(if_index: u32) -> Result<(), String> {
     Ok(())
 }
 
+/// Runs the dedicated PAID loopback proxy on `paid_port()` (default 53130).
+pub fn run_paid() -> Result<(), String> {
+    let mut said: Option<crate::gate::Blocker> = None;
+    let listener = loop {
+        match bind_from_slot(paid_port(), &PAID_FALLBACK_PORTS, "paid_proxy", adopt_paid) {
+            Ok(listener) => {
+                if said.is_some() {
+                    crate::dns_forwarder::log_proxy(&format!(
+                        "платный прокси поднялся на порту {}",
+                        paid_port()
+                    ));
+                }
+                break listener;
+            }
+            Err(blocker) => {
+                if said.as_ref() != Some(&blocker) {
+                    crate::dns_forwarder::log_proxy(&format!(
+                        "paid proxy not started: не занять {} — {}",
+                        blocker.addr, blocker.error
+                    ));
+                    said = Some(blocker);
+                }
+                thread::sleep(REBIND_EVERY);
+            }
+        }
+    };
+    PAID_BOUND.store(true, std::sync::atomic::Ordering::Relaxed);
+    for stream in listener.incoming() {
+        let Ok(stream) = stream else { continue };
+        thread::spawn(move || serve_paid(stream));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn is_desktop_proxy_client(image: &std::path::Path) -> bool {
+    let Some(name) = image.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let Some(parent) = image.parent() else {
+        return false;
+    };
+    if name.eq_ignore_ascii_case("Antigravity.exe") {
+        return parent.join("resources/bin/language_server.exe").is_file()
+            && crate::install_label(parent) == "Antigravity 2.0";
+    }
+    let name = name.to_ascii_lowercase();
+    name.starts_with("language_server")
+        && name.ends_with(".exe")
+        && parent.file_name().is_some_and(|name| name.eq_ignore_ascii_case("bin"))
+        && parent
+            .parent()
+            .and_then(std::path::Path::file_name)
+            .is_some_and(|name| name.eq_ignore_ascii_case("resources"))
+}
+
+fn serve_paid(mut client: TcpStream) {
+    client.set_read_timeout(Some(REQUEST_IDLE)).ok();
+    let (host, port, http) = match read_request(&mut client, true) {
+        Request::Connect(host, port) => (host, port, None),
+        Request::Http(host, port, head) => (host, port, Some(head)),
+        Request::Malformed => {
+            client.write_all(RESP_NOT_ALLOWED).ok();
+            return;
+        }
+        Request::Gone => return,
+    };
+    use crate::paid::PaidApp::AntigravityDesktop;
+    // CLI and VS Code can keep the shared environment on this port after
+    // Desktop opts out. The connecting process is what identifies Desktop.
+    #[cfg(windows)]
+    let desktop = crate::portcheck::client_image(&client)
+        .is_some_and(|image| is_desktop_proxy_client(&image));
+    #[cfg(not(windows))]
+    let desktop = false;
+    let active = crate::paid::active_apps();
+    let desktop_free = desktop && !active.contains(&AntigravityDesktop);
+    if desktop_free && http.is_none() {
+        serve_free_connect(client, &host, port);
+        return;
+    }
+    if !desktop_free && !active.is_empty() {
+        client.set_read_timeout(None).ok();
+        if let Ok(peer) = client.try_clone() {
+            let app = desktop.then_some(AntigravityDesktop);
+            if let Err(error) = crate::paid::serve(peer, &host, port, http.as_deref(), app) {
+                if !error.starts_with("PAID отказ") {
+                    crate::dns_forwarder::log_proxy(&error);
+                }
+                client.write_all(RESP_BAD_GATEWAY).ok();
+            }
+        } else {
+            client.write_all(RESP_BAD_GATEWAY).ok();
+        }
+        return;
+    }
+    if let Some(head) = http {
+        if port != 80 {
+            client.write_all(RESP_NOT_ALLOWED).ok();
+            return;
+        }
+        if let Ok(mut target) = connect_bounded(&host, port, TUNNEL_OPEN_BUDGET) {
+            if target.write_all(&head).is_ok() {
+                client.set_read_timeout(None).ok();
+                splice(client, target);
+                return;
+            }
+        }
+    }
+    client.write_all(RESP_BAD_GATEWAY).ok();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn desktop_proxy_client_matches_its_server_but_not_the_ide_or_cli() {
+        use std::path::Path;
+        assert!(is_desktop_proxy_client(Path::new(
+            r"C:\Apps\Antigravity\Resources\bin\language_server.exe"
+        )));
+        assert!(!is_desktop_proxy_client(Path::new(
+            r"C:\Apps\Antigravity IDE\resources\app\extensions\antigravity\bin\language_server.exe"
+        )));
+        assert!(!is_desktop_proxy_client(Path::new(
+            r"C:\Users\User\.gemini\bin\agy.exe"
+        )));
+    }
 
     /// Live: what the direct route would dial for each gate host - on Linux the
     /// provider pool's substituted address, never the system resolver's Google.

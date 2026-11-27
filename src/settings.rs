@@ -51,11 +51,13 @@ pub struct Settings {
     #[serde(default)]
     pub group_key: String,
 
-    /// The licence key this machine last had accepted. Kept so a restart or an
-    /// `_N` update starts straight on the main screen; a key for another 3-digit
-    /// version fails `auth::verify_key` and the licence screen comes back.
-    #[serde(default)]
-    pub license_key: String,
+    // Preserve saved keys in existing settings for users who run an older build.
+    #[serde(
+        default,
+        rename = "license_key",
+        skip_serializing_if = "String::is_empty"
+    )]
+    legacy_license_key: String,
 
     /// When the group code and the user's own proxy were last set (unix
     /// seconds, 0 = never). The one added later goes first in the route table
@@ -161,7 +163,7 @@ impl Default for Settings {
             client_patch: false,
             auto_patch: true,
             group_key: String::new(),
-            license_key: String::new(),
+            legacy_license_key: String::new(),
             group_key_at: 0,
             own_proxy_at: 0,
             patch_declined: false,
@@ -473,12 +475,12 @@ pub fn manual_paths() -> Vec<PathBuf> {
 /// Read by the relay, which restores the proxy variable at every start: without
 /// this it put back a route the window had just switched off.
 pub fn local_proxy_wanted() -> bool {
-    cached().local_proxy
+    !crate::paid::antigravity_enabled() && cached().local_proxy
 }
 
 /// Whether the configured group proxy may be used as a route.
 pub fn group_proxy_enabled() -> bool {
-    cached().group_proxy_wanted()
+    !crate::paid::antigravity_enabled() && cached().group_proxy_wanted()
 }
 
 /// The user's own proxy was set after the group code, so it goes first.

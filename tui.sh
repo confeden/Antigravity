@@ -1,5 +1,5 @@
 #!/bin/sh
-# Antigravity Unlocker — терминальный режим одной командой (Linux x86-64):
+# AI Unlocker — терминальный режим одной командой (Linux x86-64):
 #
 #   curl -fsSL https://raw.githubusercontent.com/confeden/Antigravity/main/tui.sh | sh
 #
@@ -15,7 +15,7 @@ BIN="$DIR/ag_unlocker"
 case "$(uname -m)" in
     x86_64 | amd64) ;;
     *)
-        echo "Antigravity Unlocker собран только для x86-64, а здесь $(uname -m)." >&2
+        echo "AI Unlocker собран только для x86-64, а здесь $(uname -m)." >&2
         exit 1
         ;;
 esac
@@ -39,7 +39,7 @@ case "$VER" in
         ;;
     *)
         if [ ! -x "$BIN" ] || [ "$(cat "$BIN.version" 2>/dev/null)" != "$VER" ]; then
-            echo "Скачиваю Antigravity Unlocker $VER…" >&2
+            echo "Скачиваю AI Unlocker $VER…" >&2
             mkdir -p "$DIR"
             TMP=$(mktemp -d)
             trap 'rm -rf "$TMP"' EXIT

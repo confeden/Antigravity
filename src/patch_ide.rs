@@ -39,7 +39,7 @@ fn backup_once(target: &Path) {
 /// on the same directory, then a rename over the target (atomic replace on
 /// Windows and POSIX). A crash or power loss leaves either the old file or the
 /// new one, never a half-written 15 MB `main.js`.
-fn write_atomic(path: &Path, content: &str) -> std::io::Result<()> {
+pub(crate) fn write_atomic(path: &Path, content: &str) -> std::io::Result<()> {
     // Per process, for the reason `patch_binary::temp_path` gives.
     crate::patch_binary::sweep_stale_temps(path);
     let tmp = crate::patch_binary::temp_path(path);
@@ -74,6 +74,10 @@ fn restore_js(target: &Path) -> Result<bool, String> {
         return Ok(true);
     }
     let content = fs::read_to_string(target).map_err(|e| format!("{}: {e}", target.display()))?;
+    #[cfg(windows)]
+    if crate::paid_windows::remove_bootstrap(target, &content)? && !has_marker(&content) {
+        return Ok(true);
+    }
     if has_marker(&content) {
         return Err(format!(
             "{}: бэкап отсутствует — для полного отката переустановите Antigravity",

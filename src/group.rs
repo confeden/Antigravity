@@ -674,11 +674,22 @@ fn idle_expired(idle: Duration, awaiting: bool) -> bool {
     }
 }
 
-enum End {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PumpEnd {
     Client,
     Idle,
     Upstream,
     NoAnswer,
+    Stopped,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PumpOutcome {
+    pub why: PumpEnd,
+    pub to_client: u64,
+    pub to_upstream: u64,
+    pub duration: Duration,
+    pub io_err: Option<String>,
 }
 
 /// `closed` is set when the server ended the stream cleanly (close_notify): rustls
@@ -703,28 +714,51 @@ fn drain_tls_reader(conn: &mut ClientConnection, pending: &mut Vec<u8>, closed: 
     moved
 }
 
-fn tls_pump(
+pub(crate) fn tls_pump(
+    client: TcpStream,
+    conn: ClientConnection,
+    upstream_sock: TcpStream,
+    leftover: Vec<u8>,
+    keep_open: impl FnMut() -> bool,
+) {
+    let _ = tls_pump_report(client, conn, upstream_sock, leftover, keep_open);
+}
+
+pub(crate) fn tls_pump_report(
     mut client: TcpStream,
     mut conn: ClientConnection,
     mut upstream_sock: TcpStream,
     leftover: Vec<u8>,
-) {
+    mut keep_open: impl FnMut() -> bool,
+) -> PumpOutcome {
     client.set_nonblocking(true).ok();
     upstream_sock.set_nonblocking(true).ok();
+    conn.set_buffer_limit(Some(256 * 1024));
+    let started = Instant::now();
     let activity = crate::routes::serving_activity();
     let mut buf = [0u8; 16 * 1024];
     let mut pending: Vec<u8> = leftover;
+    let mut pending_up: Vec<u8> = Vec::new();
     let mut idle = Duration::ZERO;
     let mut backoff = crate::proxy::PUMP_MIN_SLEEP;
     let mut client_eof = false;
+    let mut client_fin_pending = false;
     let mut upstream_eof = false;
     let mut closed = false;
-    let mut _delivered: u64 = 0;
-    let mut _sent: u64 = 0;
+    let mut delivered: u64 = 0;
+    let mut sent: u64 = 0;
     let mut awaiting = false;
-    let mut _why = End::Client;
+    let mut why = PumpEnd::Client;
+    let mut io_err: Option<String> = None;
 
-    while !(client_eof && upstream_eof && pending.is_empty()) {
+    loop {
+        if client_eof && pending_up.is_empty() && !client_fin_pending && upstream_eof && pending.is_empty() {
+            break;
+        }
+        if !keep_open() {
+            why = PumpEnd::Stopped;
+            break;
+        }
         let mut moved = false;
         let mut payload = false;
 
@@ -737,24 +771,29 @@ fn tls_pump(
                     if m {
                         payload = true;
                     }
+                    if !closed && !client_eof {
+                        io_err.get_or_insert_with(|| "tls_unexpected_eof".to_string());
+                    }
                     upstream_eof = true;
-                    _why = End::Upstream;
+                    why = PumpEnd::Upstream;
                 }
                 Ok(_) => match conn.process_new_packets() {
                     Ok(_) => moved = true,
-                    Err(_) => {
+                    Err(err) => {
                         let _ = drain_tls_reader(&mut conn, &mut pending, &mut closed);
                         client_eof = true;
                         upstream_eof = true;
-                        _why = End::Upstream;
+                        why = PumpEnd::Upstream;
+                        io_err.get_or_insert_with(|| format!("tls:{err}"));
                     }
                 },
                 Err(e) if crate::proxy::would_block(&e) => {}
-                Err(_) => {
+                Err(e) => {
                     let _ = drain_tls_reader(&mut conn, &mut pending, &mut closed);
                     client_eof = true;
                     upstream_eof = true;
-                    _why = End::Upstream;
+                    why = PumpEnd::Upstream;
+                    io_err.get_or_insert_with(|| format!("upstream_read:{}", e.kind() as u32));
                 }
             }
         }
@@ -769,7 +808,7 @@ fn tls_pump(
             }
             if closed && !upstream_eof {
                 upstream_eof = true;
-                _why = End::Upstream;
+                why = PumpEnd::Upstream;
             }
         }
 
@@ -779,11 +818,11 @@ fn tls_pump(
                     client_eof = true;
                     upstream_eof = true;
                     pending.clear();
-                    _why = End::Client;
+                    why = PumpEnd::Client;
                 }
                 Ok(n) => {
                     pending.drain(..n);
-                    _delivered += n as u64;
+                    delivered += n as u64;
                     if let Some(a) = &activity {
                         a.to_client(n as u64);
                     }
@@ -791,52 +830,111 @@ fn tls_pump(
                     payload = true;
                 }
                 Err(e) if crate::proxy::would_block(&e) => break,
-                Err(_) => {
+                Err(e) => {
                     client_eof = true;
                     upstream_eof = true;
                     pending.clear();
-                    _why = End::Client;
+                    why = PumpEnd::Client;
+                    io_err.get_or_insert_with(|| format!("client_write:{}", e.kind() as u32));
                 }
             }
         }
-        if !client_eof {
-            match client.read(&mut buf) {
-                Ok(0) => {
-                    conn.send_close_notify();
-                    client_eof = true;
-                    _why = End::Client;
-                }
-                Ok(n) => {
-                    if conn.writer().write_all(&buf[..n]).is_ok() {
-                        _sent += n as u64;
-                        if let Some(a) = &activity {
-                            a.to_upstream(n as u64);
-                        }
-                        moved = true;
-                        payload = true;
-                        awaiting = true;
-                    } else {
-                        client_eof = true;
-                        upstream_eof = true;
-                        _why = End::Upstream;
+        if !pending_up.is_empty() {
+            match conn.writer().write(&pending_up) {
+                Ok(0) => {}
+                Ok(k) => {
+                    pending_up.drain(..k);
+                    sent += k as u64;
+                    if let Some(a) = &activity {
+                        a.to_upstream(k as u64);
                     }
+                    moved = true;
+                    payload = true;
+                    awaiting = true;
                 }
                 Err(e) if crate::proxy::would_block(&e) => {}
                 Err(_) => {
-                    conn.send_close_notify();
+                    pending_up.clear();
+                    client_fin_pending = false;
                     client_eof = true;
-                    _why = End::Client;
+                    upstream_eof = true;
+                    why = PumpEnd::Upstream;
+                    io_err.get_or_insert_with(|| "upstream_write".to_string());
+                }
+            }
+        }
+        if client_fin_pending && pending_up.is_empty() {
+            conn.send_close_notify();
+            client_fin_pending = false;
+        }
+        if !client_eof && pending_up.is_empty() && !conn.wants_write() {
+            match client.read(&mut buf) {
+                Ok(0) => {
+                    client_eof = true;
+                    why = PumpEnd::Client;
+                    if pending_up.is_empty() {
+                        conn.send_close_notify();
+                    } else {
+                        client_fin_pending = true;
+                    }
+                }
+                Ok(n) => {
+                    match conn.writer().write(&buf[..n]) {
+                        Ok(k) => {
+                            if k > 0 {
+                                sent += k as u64;
+                                if let Some(a) = &activity {
+                                    a.to_upstream(k as u64);
+                                }
+                                moved = true;
+                                payload = true;
+                                awaiting = true;
+                            }
+                            if k < n {
+                                pending_up.extend_from_slice(&buf[k..n]);
+                            }
+                        }
+                        Err(e) if crate::proxy::would_block(&e) => {
+                            pending_up.extend_from_slice(&buf[..n]);
+                        }
+                        Err(_) => {
+                            pending_up.clear();
+                            client_fin_pending = false;
+                            client_eof = true;
+                            upstream_eof = true;
+                            why = PumpEnd::Upstream;
+                            io_err.get_or_insert_with(|| "upstream_write".to_string());
+                        }
+                    }
+                }
+                Err(e) if crate::proxy::would_block(&e) => {}
+                Err(e) => {
+                    client_eof = true;
+                    why = PumpEnd::Client;
+                    if pending_up.is_empty() {
+                        conn.send_close_notify();
+                    } else {
+                        client_fin_pending = true;
+                    }
+                    io_err.get_or_insert_with(|| format!("client_read:{}", e.kind() as u32));
                 }
             }
         }
         while conn.wants_write() {
             match conn.write_tls(&mut upstream_sock) {
-                Ok(_) => moved = true,
+                Ok(0) => break,
+                Ok(_) => {
+                    moved = true;
+                    payload = true;
+                }
                 Err(e) if crate::proxy::would_block(&e) => break,
-                Err(_) => {
+                Err(e) => {
+                    pending_up.clear();
+                    client_fin_pending = false;
                     client_eof = true;
                     upstream_eof = true;
-                    _why = End::Upstream;
+                    why = PumpEnd::Upstream;
+                    io_err.get_or_insert_with(|| format!("upstream_tls_write:{}", e.kind() as u32));
                     break;
                 }
             }
@@ -864,7 +962,11 @@ fn tls_pump(
         idle += backoff;
         backoff = (backoff * 2).min(crate::proxy::PUMP_MAX_SLEEP);
         if idle_expired(idle, awaiting) {
-            _why = if awaiting { End::NoAnswer } else { End::Idle };
+            why = if awaiting {
+                PumpEnd::NoAnswer
+            } else {
+                PumpEnd::Idle
+            };
             break;
         }
     }
@@ -889,10 +991,18 @@ fn tls_pump(
             Err(_) => break,
         }
     }
+
+    PumpOutcome {
+        why,
+        to_client: delivered,
+        to_upstream: sent,
+        duration: started.elapsed(),
+        io_err,
+    }
 }
 
 pub fn tunnel(mut client: TcpStream, host: &str, _port: u16) -> Result<(), TcpStream> {
-    if !available() {
+    if crate::paid::enabled() || !available() {
         return Err(client);
     }
 
@@ -917,7 +1027,7 @@ pub fn tunnel(mut client: TcpStream, host: &str, _port: u16) -> Result<(), TcpSt
                         host
                     ));
 
-                    tls_pump(client, tls, sock, leftover);
+                    tls_pump(client, tls, sock, leftover, || true);
                     return Ok(());
                 }
                 Err(why) => {
@@ -941,6 +1051,9 @@ pub fn tunnel(mut client: TcpStream, host: &str, _port: u16) -> Result<(), TcpSt
 }
 
 pub fn probe_health() {
+    if crate::paid::enabled() {
+        return;
+    }
     let key = match get_active_key() {
         Some(k) => k,
         None => return,

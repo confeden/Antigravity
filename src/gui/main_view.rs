@@ -1,4 +1,4 @@
-//! Native navigation and pages shown after the licence gate.
+//! Navigation and pages for the main window.
 
 use eframe::egui;
 use std::time::{Duration, Instant};
@@ -113,6 +113,7 @@ pub fn view(app: &mut App, ui: &mut egui::Ui) {
     let colors = theme::palette(ui);
     footer_panel(colors).show(ui, |ui| footer(app, ui));
 
+    #[cfg(not(windows))]
     if app.update.is_some() {
         egui::Panel::top("main-update")
             .frame(strip_frame(colors))
@@ -138,14 +139,14 @@ pub fn view(app: &mut App, ui: &mut egui::Ui) {
                     .show(ui, |ui| page_content(app, ui));
                 return;
             }
-            egui::ScrollArea::vertical()
-                .id_salt(("main-page", app.main_view.page))
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    egui::Frame::new()
-                        .inner_margin(egui::Margin::symmetric(24, 20))
-                        .show(ui, |ui| page_content(app, ui));
-                });
+                egui::ScrollArea::vertical()
+                    .id_salt(("main-page", app.main_view.page))
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        egui::Frame::new()
+                            .inner_margin(egui::Margin::symmetric(24, 14))
+                            .show(ui, |ui| page_content(app, ui));
+                    });
         });
     deactivation_dialog(app, ui.ctx());
 }
@@ -213,6 +214,11 @@ fn page_content(app: &mut App, ui: &mut egui::Ui) {
     match app.main_view.page {
         Page::Overview => {
             title(app, ui, Page::Overview.label());
+            license(app, ui);
+            #[cfg(debug_assertions)]
+            if let Some(activation) = &mut app.store_test {
+                activation.view(ui);
+            }
             overview(app, ui);
         }
         Page::Integration => {
@@ -227,11 +233,158 @@ fn page_content(app: &mut App, ui: &mut egui::Ui) {
     }
 }
 
+fn license(app: &mut App, ui: &mut egui::Ui) {
+    let paid = crate::paid::enabled();
+    let colors = theme::palette(ui);
+    let group = app.status.as_ref().map(|status| status.group_proxy.clone());
+    let saved = proxy_configured(app, Cap::GroupProxy);
+    let found_paid: Vec<crate::paid::PaidApp> = app
+        .status
+        .as_ref()
+        .map(|status| {
+            status
+                .paid_apps
+                .iter()
+                .filter(|row| row.found && row.app.paid_implemented())
+                .map(|row| row.app)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    egui::Frame::new()
+        .fill(colors.card)
+        .corner_radius(egui::CornerRadius::same(theme::RADIUS))
+        .inner_margin(egui::Margin::symmetric(14, 7))
+        .stroke(egui::Stroke::new(1.0, colors.line))
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.strong("Лицензия AI Unlocker:");
+                if paid {
+                    widgets::badge(ui, "PAID", colors.soft, colors.accent_text);
+                } else {
+                    widgets::badge(ui, "FREE", colors.chrome, colors.muted);
+                }
+                if paid {
+                    #[cfg(windows)]
+                    let (color, msg) =
+                        if app.paid_activation.checked_once() && !app.paid_activation.eligible() {
+                            (
+                                colors.bad,
+                                app.paid_activation
+                                    .reason()
+                                    .and_then(crate::paid::LicenseReason::user_message)
+                                    .unwrap_or("Лицензия PAID неактивна или отозвана — отключите PAID")
+                                    .to_string(),
+                            )
+                        } else if let Some(until) = app.paid_activation.expires_at() {
+                            (
+                                colors.ok,
+                                format!(
+                                    "Лицензия действует до {}",
+                                    crate::paid::format_moscow_expiry(until)
+                                ),
+                            )
+                        } else if app.paid_activation.license_started() {
+                            (colors.ok, "Лицензия действует".to_string())
+                        } else {
+                            (colors.ok, "Маршрутизация PAID включена".to_string())
+                        };
+                    #[cfg(not(windows))]
+                    let (color, msg) = (colors.ok, "Маршрутизация PAID включена".to_string());
+                    ui.add(egui::Label::new(egui::RichText::new(msg).color(color)).wrap());
+                } else {
+                    #[cfg(windows)]
+                    let paid_eligible = app.paid_activation.eligible();
+                    #[cfg(not(windows))]
+                    let paid_eligible = false;
+                    #[cfg(windows)]
+                    let has_device = app.paid_activation.has_device();
+                    #[cfg(not(windows))]
+                    let has_device = false;
+                    #[cfg(windows)]
+                    let paid_reason = app
+                        .paid_activation
+                        .reason()
+                        .and_then(crate::paid::LicenseReason::user_message);
+                    #[cfg(not(windows))]
+                    let paid_reason: Option<&str> = None;
+
+                    if paid_eligible {
+                        #[cfg(windows)]
+                        let msg = if let Some(until) = app.paid_activation.expires_at() {
+                            format!(
+                                "Лицензия PAID выдана, не включена · до {}",
+                                crate::paid::format_moscow_expiry(until)
+                            )
+                        } else {
+                            "Лицензия PAID выдана, не включена".into()
+                        };
+                        #[cfg(not(windows))]
+                        let msg = "Лицензия PAID выдана, не включена".to_string();
+                        ui.colored_label(colors.ok, msg);
+                    } else if let Some(msg) = paid_reason {
+                        ui.add(egui::Label::new(egui::RichText::new(msg).color(colors.bad)).wrap());
+                    } else if saved {
+                        match group {
+                            Some(State::Partial(_)) => {
+                                ui.colored_label(colors.bad, "Код FREE отклонён");
+                            }
+                            Some(state) if state.is_on() => {
+                                ui.colored_label(colors.ok, "Бессрочный код активен");
+                            }
+                            _ => {
+                                ui.label(
+                                    egui::RichText::new("Код FREE сохранён")
+                                        .color(colors.muted),
+                                );
+                            }
+                        }
+                    } else if has_device {
+                        ui.label(
+                            egui::RichText::new("Ожидается выдача PAID")
+                                .color(colors.muted),
+                        );
+                    }
+                }
+            });
+
+            #[cfg(windows)]
+            {
+                ui.add_space(4.0);
+                app.paid_activation.view_compact(ui, &found_paid);
+            }
+        });
+    ui.add_space(6.0);
+}
+
+#[cfg(windows)]
+fn elevate_button(app: &mut App, ui: &mut egui::Ui) {
+    if !app.status.as_ref().is_some_and(|s| !s.admin) {
+        return;
+    }
+    if widgets::command(
+        ui,
+        widgets::KEY,
+        "Перезапустить от имени администратора",
+        false,
+        !app.is_busy(),
+    )
+    .clicked()
+    {
+        app.request_elevation();
+    }
+}
+
 fn title(app: &mut App, ui: &mut egui::Ui, text: &str) {
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new(text).size(24.0).strong());
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             theme_toggle(app, ui);
+            #[cfg(windows)]
+            super::windows_controls::update_button(app, ui);
+            #[cfg(windows)]
+            elevate_button(app, ui);
         });
     });
     ui.add_space(8.0);
@@ -313,7 +466,7 @@ fn status_card(app: &mut App, ui: &mut egui::Ui) {
     };
     // Ages on the card count up on their own; without a repaint «минуту назад»
     // would stay «минуту назад» until the mouse moved.
-    if f.refusal.is_some() || f.answer.is_some() || f.verify.is_some() {
+    if f.refusal.is_some() || f.answer.is_some() || f.dropped.is_some() || f.verify.is_some() {
         ui.ctx().request_repaint_after(Duration::from_secs(1));
     }
 
@@ -342,10 +495,7 @@ fn status_card(app: &mut App, ui: &mut egui::Ui) {
                     });
                     if let Some(route) = f.route.as_deref().filter(|r| !r.is_empty()) {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.vertical(|ui| {
-                                ui.label(egui::RichText::new("Маршрут").size(12.0).color(colors.muted));
-                                ui.label(egui::RichText::new(route).size(13.5));
-                            });
+                            route_badge_box(ui, route, colors);
                         });
                     }
                 } else {
@@ -462,6 +612,46 @@ fn status_card(app: &mut App, ui: &mut egui::Ui) {
     }
 }
 
+fn route_badge_box(ui: &mut egui::Ui, route: &str, colors: &theme::Palette) -> egui::Rect {
+    let title = egui::RichText::new("Маршрут").size(11.5).color(colors.muted);
+    let value = egui::RichText::new(route).size(13.5).strong();
+    let title_galley = egui::WidgetText::from(title).into_galley(
+        ui,
+        Some(egui::TextWrapMode::Extend),
+        f32::INFINITY,
+        egui::TextStyle::Small,
+    );
+    let value_galley = egui::WidgetText::from(value).into_galley(
+        ui,
+        Some(egui::TextWrapMode::Extend),
+        f32::INFINITY,
+        egui::TextStyle::Body,
+    );
+    let title_size = title_galley.size();
+    let value_size = value_galley.size();
+    let inner_w = title_size.x.max(value_size.x);
+    let line_gap = 2.0;
+    let inner_h = title_size.y + line_gap + value_size.y;
+    egui::Frame::new()
+        .fill(colors.bg)
+        .stroke(egui::Stroke::new(1.0, colors.line))
+        .corner_radius(egui::CornerRadius::same(theme::RADIUS_SMALL))
+        .inner_margin(egui::Margin::symmetric(12, 6))
+        .show(ui, |ui| {
+            let (rect, _) =
+                ui.allocate_exact_size(egui::vec2(inner_w, inner_h), egui::Sense::hover());
+            let painter = ui.painter();
+            painter.galley(rect.min, title_galley, colors.muted);
+            painter.galley(
+                egui::pos2(rect.left(), rect.top() + title_size.y + line_gap),
+                value_galley,
+                colors.text,
+            );
+        })
+        .response
+        .rect
+}
+
 /// How long the card goes on saying where the report was saved. Four seconds
 /// was right for «скопировано»; this one is an instruction to go and find a
 /// file and attach it, and the user is in another window by then.
@@ -473,7 +663,7 @@ const REPORT_SHOWN_FOR: Duration = Duration::from_secs(30);
 
 fn overview(app: &mut App, ui: &mut egui::Ui) {
     status_card(app, ui);
-    ui.add_space(12.0);
+    ui.add_space(8.0);
     if ui.available_width() >= 620.0 {
         ui.scope(|ui| {
             ui.spacing_mut().item_spacing.x = 24.0;
@@ -508,11 +698,16 @@ fn account_controls(app: &mut App, ui: &mut egui::Ui) {
     bypass_master(app, ui);
     ui.separator();
     cap_row(app, ui, Cap::Watchdog);
+    #[cfg(windows)]
+    {
+        ui.separator();
+        app.startup.view(ui);
+    }
 }
 
 fn network_controls(app: &mut App, ui: &mut egui::Ui) {
     section_title(ui, "Сеть и прокси");
-    let caps = [Cap::Dns, Cap::LocalProxy, Cap::OwnProxy, Cap::GroupProxy];
+    let caps = [Cap::Dns, Cap::LocalProxy, Cap::OwnProxy];
     for (index, cap) in caps.into_iter().enumerate() {
         if index > 0 {
             ui.separator();
@@ -532,15 +727,27 @@ fn control_label(ui: &mut egui::Ui, icon: &str, title: &str, hint: &str) {
 }
 
 fn bypass_master(app: &mut App, ui: &mut egui::Ui) {
-    let mut on = app.status.as_ref().is_some_and(|s| s.bypass_on());
-    let enabled = app.status.is_some() && !app.is_busy();
+    let ag_paid = crate::paid::antigravity_enabled();
+    let mut on = !ag_paid && app.status.as_ref().is_some_and(|s| s.bypass_on());
+    let enabled = !ag_paid && app.status.is_some() && !app.is_busy();
     let flipped = widgets::switch_row(ui, &mut on, enabled, "Обход ошибки 400", |ui| {
         control_label(
             ui,
             widgets::ROUTE,
             "Обход ошибки 400",
-            status::BYPASS_TEXT.1,
+            if ag_paid {
+                "Отключено, пока для Antigravity включён режим PAID."
+            } else {
+                status::BYPASS_TEXT.1
+            },
         );
+        if ag_paid {
+            ui.label(
+                egui::RichText::new("Отключено: активен Antigravity PAID")
+                    .size(12.0)
+                    .color(theme::palette(ui).muted),
+            );
+        }
     });
     if flipped {
         let group_configured = app
@@ -562,10 +769,117 @@ fn integration(app: &mut App, ui: &mut egui::Ui) {
         return;
     };
     let rows = status.installs.clone();
-    integration_group(app, ui, "Antigravity", &rows);
+    let paid_apps = status.paid_apps.clone();
+    let colors = theme::palette(ui);
+    let ag_paid = crate::paid::antigravity_enabled();
+    #[cfg(windows)]
+    let paid_eligible = app.paid_activation.eligible();
+    #[cfg(not(windows))]
+    let paid_eligible = false;
+    #[cfg(windows)]
+    let paid_busy = app.paid_activation.busy();
+    #[cfg(not(windows))]
+    let paid_busy = false;
+
+    egui::Frame::new()
+        .fill(colors.card)
+        .corner_radius(egui::CornerRadius::same(theme::RADIUS))
+        .inner_margin(egui::Margin::symmetric(12, 8))
+        .stroke(egui::Stroke::new(1.0, colors.line))
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            if ag_paid {
+                ui.colored_label(
+                    colors.ok,
+                    "Antigravity работает через PAID — FREE-маршрутизация отключена, чтобы трафик не шёл в оба назначения.",
+                );
+            } else if paid_eligible {
+                ui.colored_label(
+                    colors.ok,
+                    "Лицензия PAID готова — выберите нужные IDE переключателями ниже.",
+                );
+            } else {
+                widgets::hint(
+                    ui,
+                    "FREE поддерживается только для Antigravity. Для остальных IDE и платного маршрута активируйте PAID на вкладке «Обзор».",
+                );
+            }
+            #[cfg(windows)]
+            if let Some(msg) = app.paid_activation.status_message() {
+                ui.label(egui::RichText::new(msg).size(12.5).color(colors.muted));
+            }
+        });
+    ui.add_space(10.0);
+
+    let mut toggle_app: Option<(crate::paid::PaidApp, bool)> = None;
+    integration_group(
+        app,
+        ui,
+        "Antigravity",
+        &rows,
+        &paid_apps,
+        paid_eligible,
+        paid_busy,
+        &mut toggle_app,
+    );
+    ui.add_space(12.0);
+    paid_group_section(
+        ui,
+        "Claude",
+        crate::paid::PaidGroup::Claude,
+        &paid_apps,
+        !app.is_busy() && !paid_busy,
+        paid_eligible,
+        &mut toggle_app,
+    );
+    ui.add_space(12.0);
+    paid_group_section(
+        ui,
+        "Codex / ChatGPT",
+        crate::paid::PaidGroup::Codex,
+        &paid_apps,
+        !app.is_busy() && !paid_busy,
+        paid_eligible,
+        &mut toggle_app,
+    );
+
+    #[cfg(windows)]
+    if let Some((toggled, turn_on)) = toggle_app {
+        let mut next = crate::paid::active_apps();
+        if turn_on {
+            if !next.contains(&toggled) {
+                next.push(toggled);
+            }
+        } else {
+            next.retain(|item| *item != toggled);
+        }
+        app.paid_activation.request_apps(next, ui.ctx());
+    }
+    #[cfg(not(windows))]
+    let _ = toggle_app;
 }
 
-fn integration_group(app: &mut App, ui: &mut egui::Ui, name: &str, rows: &[InstallRow]) {
+fn paid_app_for_label(label: &str) -> Option<crate::paid::PaidApp> {
+    match label {
+        "Antigravity 2.0" => Some(crate::paid::PaidApp::AntigravityDesktop),
+        "Antigravity IDE" => Some(crate::paid::PaidApp::AntigravityIde),
+        "Antigravity CLI" => Some(crate::paid::PaidApp::AntigravityCli),
+        "Antigravity для VS Code" => Some(crate::paid::PaidApp::AntigravityVscode),
+        _ => None,
+    }
+}
+
+fn integration_group(
+    app: &mut App,
+    ui: &mut egui::Ui,
+    name: &str,
+    rows: &[InstallRow],
+    paid_apps: &[crate::paid::PaidAppStatus],
+    paid_eligible: bool,
+    paid_busy: bool,
+    toggle_app: &mut Option<(crate::paid::PaidApp, bool)>,
+) {
+    let colors = theme::palette(ui);
     let group_icon = if name == "Antigravity" {
         Some(
             app.main_view
@@ -590,12 +904,14 @@ fn integration_group(app: &mut App, ui: &mut egui::Ui, name: &str, rows: &[Insta
             ui.add(egui::Image::new((tex.id(), egui::vec2(20.0, 20.0))));
         }
         section_title(ui, name);
+        widgets::badge(ui, "FREE", colors.chrome, colors.muted);
+        widgets::badge(ui, "PAID", colors.soft, colors.accent_text);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let found = rows.iter().filter(|row| row.path.is_some()).count();
             ui.label(
                 egui::RichText::new(format!("Найдено {found} из {}", rows.len()))
                     .size(12.5)
-                    .color(theme::palette(ui).muted),
+                    .color(colors.muted),
             );
         });
     });
@@ -604,11 +920,31 @@ fn integration_group(app: &mut App, ui: &mut egui::Ui, name: &str, rows: &[Insta
         if index > 0 {
             ui.separator();
         }
-        ui.push_id(index, |ui| integration_row(app, ui, row));
+        let paid_status = paid_app_for_label(row.label)
+            .and_then(|kind| paid_apps.iter().find(|item| item.app == kind));
+        ui.push_id(index, |ui| {
+            integration_row(
+                app,
+                ui,
+                row,
+                paid_status,
+                paid_eligible,
+                paid_busy,
+                toggle_app,
+            )
+        });
     }
 }
 
-fn integration_row(app: &mut App, ui: &mut egui::Ui, row: &InstallRow) {
+fn integration_row(
+    app: &mut App,
+    ui: &mut egui::Ui,
+    row: &InstallRow,
+    paid_status: Option<&crate::paid::PaidAppStatus>,
+    paid_eligible: bool,
+    paid_busy: bool,
+    toggle_app: &mut Option<(crate::paid::PaidApp, bool)>,
+) {
     let colors = theme::palette(ui);
     let enabled = !app.is_busy();
     ui.horizontal(|ui| {
@@ -616,7 +952,45 @@ fn integration_row(app: &mut App, ui: &mut egui::Ui, row: &InstallRow) {
         if let Some(path) = &row.path {
             label.on_hover_text(path.display().to_string());
         }
+        widgets::badge(ui, "FREE", colors.chrome, colors.muted);
+        widgets::badge(ui, "PAID", colors.soft, colors.accent_text);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if let Some(status) = paid_status {
+                let mut paid_on = status.active;
+                let can_toggle = cfg!(windows)
+                    && !app.is_busy()
+                    && !paid_busy
+                    && row.path.is_some()
+                    && status.app.paid_implemented()
+                    && (paid_eligible || paid_on);
+                let switch_resp = widgets::switch(
+                    ui,
+                    &mut paid_on,
+                    can_toggle,
+                    &format!("PAID {}", row.label),
+                );
+                let tip = if row.path.is_none() {
+                    "Приложение не найдено"
+                } else if !paid_eligible && !status.active {
+                    "Нужна выданная лицензия PAID"
+                } else if status.active {
+                    "Отключить PAID для этого приложения"
+                } else {
+                    "Включить PAID для этого приложения"
+                };
+                if switch_resp.on_hover_text(tip).changed() {
+                    *toggle_app = Some((status.app, paid_on));
+                }
+                ui.label(
+                    egui::RichText::new("PAID")
+                        .size(11.5)
+                        .color(if status.active {
+                            colors.accent_text
+                        } else {
+                            colors.muted
+                        }),
+                );
+            }
             let edit = ui.add_enabled(
                 enabled,
                 egui::Button::new(widgets::icon_text(widgets::FOLDER, "", colors.muted))
@@ -654,6 +1028,91 @@ fn integration_row(app: &mut App, ui: &mut egui::Ui, row: &InstallRow) {
             ui.label(widgets::icon_text(icon, text, color));
         });
     });
+}
+
+fn paid_group_section(
+    ui: &mut egui::Ui,
+    title: &str,
+    group: crate::paid::PaidGroup,
+    paid_apps: &[crate::paid::PaidAppStatus],
+    idle: bool,
+    paid_eligible: bool,
+    toggle_app: &mut Option<(crate::paid::PaidApp, bool)>,
+) {
+    let colors = theme::palette(ui);
+    let items: Vec<&crate::paid::PaidAppStatus> = paid_apps
+        .iter()
+        .filter(|item| item.app.group() == group)
+        .collect();
+    if items.is_empty() {
+        return;
+    }
+    let found = items.iter().filter(|item| item.found).count();
+    ui.horizontal(|ui| {
+        section_title(ui, title);
+        widgets::badge(ui, "PAID", colors.soft, colors.accent_text);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(
+                egui::RichText::new(format!("Найдено {found} из {}", items.len()))
+                    .size(12.5)
+                    .color(colors.muted),
+            );
+        });
+    });
+    ui.separator();
+    for (index, item) in items.iter().enumerate() {
+        if index > 0 {
+            ui.separator();
+        }
+        ui.push_id((title, index), |ui| {
+            ui.horizontal(|ui| {
+                let label = ui.label(item.app.label());
+                if let Some(hint) = &item.path_hint {
+                    label.on_hover_text(hint);
+                }
+                widgets::badge(ui, "PAID", colors.soft, colors.accent_text);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let mut on = item.active;
+                    let implemented = item.app.paid_implemented();
+                    let can_toggle = cfg!(windows)
+                        && idle
+                        && item.found
+                        && implemented
+                        && (paid_eligible || on);
+                    let resp = widgets::switch(
+                        ui,
+                        &mut on,
+                        can_toggle,
+                        &format!("PAID {}", item.app.label()),
+                    );
+                    let tip = if let Some(reason) = item.app.unavailable_reason() {
+                        reason
+                    } else if !item.found {
+                        "Приложение не найдено"
+                    } else if !paid_eligible && !item.active {
+                        "Нужна выданная лицензия PAID"
+                    } else if item.active {
+                        "Отключить PAID для этого приложения"
+                    } else {
+                        "Включить PAID для этого приложения"
+                    };
+                    if resp.on_hover_text(tip).changed() {
+                        *toggle_app = Some((item.app, on));
+                    }
+                    let (text, color) = if !item.found {
+                        ("Не найден", colors.muted)
+                    } else if let Some(reason) = item.app.unavailable_reason() {
+                        (reason, colors.muted)
+                    } else if item.active {
+                        ("PAID включён", colors.ok)
+                    } else {
+                        ("Найден", colors.text)
+                    };
+                    ui.label(egui::RichText::new(text).size(13.0).color(color));
+                });
+            });
+        });
+    }
 }
 
 /// Debug builds can unfold network diagnostics on start.
@@ -939,18 +1398,6 @@ fn settings(app: &mut App, ui: &mut egui::Ui) {
     proxy_field(app, ui, Cap::OwnProxy);
     ui.add_space(4.0);
     ui.separator();
-    proxy_heading(app, ui, Cap::GroupProxy);
-    group_proxy_actions(app, ui);
-    proxy_field(app, ui, Cap::GroupProxy);
-    if crate::group::key_rejected() {
-        ui.label(
-            egui::RichText::new(crate::group::KEY_DEAD_NOTE)
-                .size(12.0)
-                .color(theme::palette(ui).bad),
-        );
-    }
-    ui.add_space(4.0);
-    ui.separator();
     custom_dns_field(app, ui);
     ui.add_space(4.0);
     ui.separator();
@@ -983,48 +1430,6 @@ fn proxy_heading(app: &App, ui: &mut egui::Ui, cap: Cap) {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.label(egui::RichText::new(text).size(12.0).color(color));
         });
-    });
-}
-
-fn group_proxy_actions(app: &mut App, ui: &mut egui::Ui) {
-    ui.horizontal_wrapped(|ui| {
-        let copy = widgets::command(
-            ui,
-            widgets::COPY,
-            "Скопировать команду",
-            app.main_view.setup == Some(Setup::GroupCopy),
-            true,
-        )
-        .on_hover_text("Команда для получения кода в группе Nova");
-        app.main_view.focus(Setup::GroupCopy, &copy);
-        if copy.clicked() {
-            let command = format!("/ag+{}", crate::hwid::pc_code());
-            if crate::utils::set_clipboard_text(&command) {
-                app.main_view.proxy_saved = None;
-                if app.main_view.is_setting_up(Cap::GroupProxy) {
-                    app.main_view.highlight(Setup::GroupTelegram);
-                }
-            } else {
-                app.main_view.proxy_saved = Some((
-                    Cap::GroupProxy,
-                    Err("Не удалось скопировать команду.".into()),
-                ));
-            }
-        }
-        let telegram = widgets::command(
-            ui,
-            widgets::SEND,
-            "Открыть Telegram",
-            app.main_view.setup == Some(Setup::GroupTelegram),
-            true,
-        );
-        app.main_view.focus(Setup::GroupTelegram, &telegram);
-        if telegram.clicked() {
-            crate::utils::open_url_as_user(super::TELEGRAM_KEYS_URL);
-            if app.main_view.is_setting_up(Cap::GroupProxy) {
-                app.main_view.highlight(Setup::GroupCode);
-            }
-        }
     });
 }
 
@@ -1088,10 +1493,7 @@ fn proxy_field(app: &mut App, ui: &mut egui::Ui, cap: Cap) {
                 enable: enabling,
             }
         } else {
-            Cmd::SetGroupKey {
-                text,
-                enable: enabling,
-            }
+            Cmd::SetGroupKey { text, enable: true }
         });
     }
     if let Some((saved_cap, result)) = &app.main_view.proxy_saved {
@@ -1139,7 +1541,7 @@ fn cap_row(app: &mut App, ui: &mut egui::Ui, cap: Cap) {
         Cap::Dns => ("Обход через DNS-AI", widgets::DNS, None),
         Cap::LocalProxy => ("Локальный прокси", widgets::SERVER, None),
         Cap::OwnProxy => ("Свой HTTP-прокси", widgets::PROXY, Some(Setup::OwnAddress)),
-        Cap::GroupProxy => ("Прокси из группы", widgets::GROUP, Some(Setup::GroupCopy)),
+        Cap::GroupProxy => ("Лицензия FREE", widgets::GROUP, Some(Setup::GroupCopy)),
         Cap::DnsRotation => (status::switch_text(cap).0, widgets::REFRESH, None),
     };
     let (_, hint) = status::switch_text(cap);
@@ -1150,25 +1552,51 @@ fn cap_row(app: &mut App, ui: &mut egui::Ui, cap: Cap) {
         .unwrap_or(&State::Off);
     let mut on = state.is_on();
     let blocked = matches!(state, State::Blocked(_));
-    let enabled = app.status.is_some() && !app.is_busy() && !blocked;
+    let needs_admin_now = cap.needs_admin() && app.status.as_ref().is_some_and(|s| !s.admin);
+    let enabled = app.status.is_some() && !app.is_busy() && !blocked && !needs_admin_now;
     let new_setup = setup.filter(|_| !on && !proxy_configured(app, cap));
     let colors = theme::palette(ui);
+    let mut want_elevate = false;
 
     let flipped = widgets::switch_row(ui, &mut on, enabled, title, |ui| {
         control_label(ui, icon, title, hint);
-        let note = state.note().or(if new_setup.is_some() {
-            Some("Не настроен")
+        if needs_admin_now {
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(state.note().unwrap_or("Нужны права администратора"))
+                        .size(12.0)
+                        .color(colors.warn),
+                );
+                if ui
+                    .link(
+                        egui::RichText::new("Перезапустить")
+                            .size(12.0)
+                            .color(colors.accent_text),
+                    )
+                    .on_hover_text("Перезапустить от имени администратора")
+                    .clicked()
+                {
+                    want_elevate = true;
+                }
+            });
         } else {
-            None
-        });
-        if let Some(note) = note {
-            ui.label(egui::RichText::new(note).size(12.0).color(if blocked {
-                colors.warn
+            let note = state.note().or(if new_setup.is_some() {
+                Some("Не настроен")
             } else {
-                colors.muted
-            }));
+                None
+            });
+            if let Some(note) = note {
+                ui.label(egui::RichText::new(note).size(12.0).color(if blocked {
+                    colors.warn
+                } else {
+                    colors.muted
+                }));
+            }
         }
     });
+    if want_elevate {
+        app.request_elevation();
+    }
     if flipped {
         if let Some(step) = new_setup {
             app.main_view.begin_setup(step);
@@ -1202,6 +1630,10 @@ fn journal(app: &mut App, ui: &mut egui::Ui) {
         ui.label(egui::RichText::new(Page::Log.label()).size(24.0).strong());
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             theme_toggle(app, ui);
+            #[cfg(windows)]
+            super::windows_controls::update_button(app, ui);
+            #[cfg(windows)]
+            elevate_button(app, ui);
             if widgets::command(
                 ui,
                 widgets::COPY,
@@ -1637,5 +2069,453 @@ mod panel_tests {
             );
         }
         assert_eq!(mode, crate::settings::ThemeMode::System);
+    }
+
+    #[test]
+    fn route_badge_sits_on_the_right_and_is_separated_from_headline() {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let size = egui::vec2(720.0, 120.0);
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+            ..Default::default()
+        };
+        let out = ctx.run_ui(input, |root| {
+            let colors = theme::palette(root);
+            egui::CentralPanel::default().show(root, |ui| {
+                let row_right = ui.available_rect_before_wrap().right();
+                let mut headline_rect = egui::Rect::NOTHING;
+                let mut badge_rect = egui::Rect::NOTHING;
+                egui::Frame::new()
+                    .fill(colors.soft)
+                    .inner_margin(egui::Margin::same(16))
+                    .show(ui, |ui| {
+                        ui.set_min_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            headline_rect = ui
+                                .vertical(|ui| {
+                                    ui.label(
+                                        egui::RichText::new("Модель ответила")
+                                            .size(22.0)
+                                            .strong(),
+                                    );
+                                    ui.label("Последний ответ только что");
+                                })
+                                .response
+                                .rect;
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    badge_rect = route_badge_box(ui, "прокси из группы", colors);
+                                },
+                            );
+                        });
+                    });
+                assert!(
+                    badge_rect.left() > headline_rect.right() + 40.0,
+                    "route badge {:?} should sit separately from headline {:?}",
+                    badge_rect,
+                    headline_rect
+                );
+                assert!(
+                    badge_rect.right() >= row_right - 24.0,
+                    "route badge {:?} should hug the right edge ({row_right})",
+                    badge_rect
+                );
+            });
+        });
+        out.drop_without_applying_deltas();
+    }
+
+    #[test]
+    fn compact_overview_fits_window_height_without_scrolling() {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let size = egui::vec2(940.0, 650.0);
+        let (worker, _worker_rx) = crate::ops::test_worker();
+        let status_snapshot = crate::ops::Status {
+            admin: true,
+            installs: Vec::new(),
+            client_patch: State::On,
+            watchdog: State::On,
+            dns: State::On,
+            local_proxy: State::On,
+            own_proxy: State::Off,
+            group_proxy: State::On,
+            own_proxy_configured: false,
+            group_proxy_configured: true,
+            dns_rotation: State::On,
+            vpn: None,
+            own_proxy_text: String::new(),
+            custom_dns_text: String::new(),
+            relay_outdated: false,
+            relay_running: true,
+            rules: true,
+            providers: Vec::new(),
+            paid_apps: Vec::new(),
+            relay_egress: None,
+        };
+        let mut app = App {
+            screen: super::super::Screen::Main,
+            #[cfg(windows)]
+            paid_activation: super::super::paid_activation::PaidActivation::default(),
+            #[cfg(debug_assertions)]
+            store_test: None,
+            update: None,
+            update_rx: std::sync::mpsc::channel().1,
+            #[cfg(windows)]
+            windows_update: super::super::windows_controls::Update::default(),
+            #[cfg(windows)]
+            startup: super::super::windows_controls::Startup::default(),
+            worker,
+            events: std::sync::mpsc::channel().1,
+            status: Some(status_snapshot.clone()),
+            gate: crate::gate::View {
+                answered: Some(crate::ls_log::Sighting {
+                    ago: Duration::from_secs(5),
+                    count: 1,
+                }),
+                ..Default::default()
+            },
+            gate_at: Instant::now(),
+            gate_rx: std::sync::mpsc::channel().1,
+            log: Vec::new(),
+            log_all_selected: false,
+            busy: None,
+            main_view: ViewState::default(),
+            own_proxy_input: String::new(),
+            custom_dns_input: String::new(),
+            group_key_input: String::new(),
+            providers_local: Vec::new(),
+            providers_reordering: false,
+            vpn_path_copied: None,
+            path_dialog: None,
+            path_dialog_error: None,
+            report_saved: None,
+            report_clipboard_at: None,
+            frames: 4,
+            theme: crate::settings::ThemeMode::System,
+        };
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+            ..Default::default()
+        };
+        let mut content_bottom = 0.0f32;
+        let mut panel_bottom = 0.0f32;
+        let out = ctx.run_ui(input, |root| {
+            let colors = theme::palette(root);
+            footer_panel(colors).show(root, |ui| footer(&mut app, ui));
+            egui::Panel::left("main-nav-test")
+                .exact_size(172.0)
+                .show(root, |ui| navigation(&mut app, ui));
+            egui::CentralPanel::default().show(root, |ui| {
+                panel_bottom = ui.available_rect_before_wrap().bottom();
+                content_bottom = egui::Frame::new()
+                    .inner_margin(egui::Margin::symmetric(24, 14))
+                    .show(ui, |ui| page_content(&mut app, ui))
+                    .response
+                    .rect
+                    .bottom();
+            });
+        });
+        out.drop_without_applying_deltas();
+        assert!(
+            content_bottom <= panel_bottom,
+            "Overview content ({content_bottom}) must fit within panel ({panel_bottom}) without scrolling"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn non_admin_overview_shows_elevate_button_and_fits_window_height() {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let size = egui::vec2(940.0, 650.0);
+        let (worker, _worker_rx) = crate::ops::test_worker();
+        let status_snapshot = crate::ops::Status {
+            admin: false,
+            installs: Vec::new(),
+            client_patch: State::On,
+            watchdog: State::Blocked("нужны права администратора".into()),
+            dns: State::Blocked("нужны права администратора".into()),
+            local_proxy: State::On,
+            own_proxy: State::Off,
+            group_proxy: State::On,
+            own_proxy_configured: false,
+            group_proxy_configured: true,
+            dns_rotation: State::On,
+            vpn: None,
+            own_proxy_text: String::new(),
+            custom_dns_text: String::new(),
+            relay_outdated: false,
+            relay_running: true,
+            rules: false,
+            providers: Vec::new(),
+            paid_apps: Vec::new(),
+            relay_egress: None,
+        };
+        let mut app = App {
+            screen: super::super::Screen::Main,
+            paid_activation: super::super::paid_activation::PaidActivation::default(),
+            #[cfg(debug_assertions)]
+            store_test: None,
+            update: None,
+            update_rx: std::sync::mpsc::channel().1,
+            windows_update: super::super::windows_controls::Update::default(),
+            startup: super::super::windows_controls::Startup::default(),
+            worker,
+            events: std::sync::mpsc::channel().1,
+            status: Some(status_snapshot),
+            gate: crate::gate::View {
+                answered: Some(crate::ls_log::Sighting {
+                    ago: Duration::from_secs(5),
+                    count: 1,
+                }),
+                ..Default::default()
+            },
+            gate_at: Instant::now(),
+            gate_rx: std::sync::mpsc::channel().1,
+            log: Vec::new(),
+            log_all_selected: false,
+            busy: None,
+            main_view: ViewState::default(),
+            own_proxy_input: String::new(),
+            custom_dns_input: String::new(),
+            group_key_input: String::new(),
+            providers_local: Vec::new(),
+            providers_reordering: false,
+            vpn_path_copied: None,
+            path_dialog: None,
+            path_dialog_error: None,
+            report_saved: None,
+            report_clipboard_at: None,
+            frames: 4,
+            theme: crate::settings::ThemeMode::System,
+        };
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+            ..Default::default()
+        };
+        let mut content_bottom = 0.0f32;
+        let mut panel_bottom = 0.0f32;
+        let out = ctx.run_ui(input, |root| {
+            let colors = theme::palette(root);
+            footer_panel(colors).show(root, |ui| footer(&mut app, ui));
+            egui::Panel::left("main-nav-nonadmin-test")
+                .exact_size(172.0)
+                .show(root, |ui| navigation(&mut app, ui));
+            egui::CentralPanel::default().show(root, |ui| {
+                panel_bottom = ui.available_rect_before_wrap().bottom();
+                content_bottom = egui::Frame::new()
+                    .inner_margin(egui::Margin::symmetric(24, 14))
+                    .show(ui, |ui| page_content(&mut app, ui))
+                    .response
+                    .rect
+                    .bottom();
+            });
+        });
+        let has_elevate_button = out.shapes.iter().any(|s| match &s.shape {
+            egui::epaint::Shape::Text(text) => text
+                .galley
+                .text()
+                .contains("Перезапустить от имени администратора"),
+            _ => false,
+        });
+        out.drop_without_applying_deltas();
+        assert!(
+            has_elevate_button,
+            "header should render 'Перезапустить от имени администратора' when admin == false"
+        );
+        assert!(
+            content_bottom <= panel_bottom,
+            "Overview content ({content_bottom}) must fit within panel ({panel_bottom}) without scrolling"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn paid_and_free_license_card_states_match_requirements() {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let size = egui::vec2(940.0, 650.0);
+        let (worker, _worker_rx) = crate::ops::test_worker();
+        let status_snapshot = crate::ops::Status {
+            admin: true,
+            installs: Vec::new(),
+            client_patch: State::On,
+            watchdog: State::On,
+            dns: State::On,
+            local_proxy: State::On,
+            own_proxy: State::Off,
+            group_proxy: State::On,
+            own_proxy_configured: false,
+            group_proxy_configured: true,
+            dns_rotation: State::On,
+            vpn: None,
+            own_proxy_text: String::new(),
+            custom_dns_text: String::new(),
+            relay_outdated: false,
+            relay_running: true,
+            rules: true,
+            providers: Vec::new(),
+            paid_apps: Vec::new(),
+            relay_egress: None,
+        };
+        let mut paid_activation = super::super::paid_activation::PaidActivation::default();
+        paid_activation.set_test_license(crate::paid::License {
+            eligible: true,
+            started: true,
+            expires_at: Some(1_798_313_247),
+            reason: None,
+        });
+        let mut app = App {
+            screen: super::super::Screen::Main,
+            paid_activation,
+            #[cfg(debug_assertions)]
+            store_test: None,
+            update: None,
+            update_rx: std::sync::mpsc::channel().1,
+            windows_update: super::super::windows_controls::Update::default(),
+            startup: super::super::windows_controls::Startup::default(),
+            worker,
+            events: std::sync::mpsc::channel().1,
+            status: Some(status_snapshot),
+            gate: crate::gate::View::default(),
+            gate_at: Instant::now(),
+            gate_rx: std::sync::mpsc::channel().1,
+            log: Vec::new(),
+            log_all_selected: false,
+            busy: None,
+            main_view: ViewState::default(),
+            own_proxy_input: String::new(),
+            custom_dns_input: String::new(),
+            group_key_input: "agk1.test".into(),
+            providers_local: Vec::new(),
+            providers_reordering: false,
+            vpn_path_copied: None,
+            path_dialog: None,
+            path_dialog_error: None,
+            report_saved: None,
+            report_clipboard_at: None,
+            frames: 4,
+            theme: crate::settings::ThemeMode::System,
+        };
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+            ..Default::default()
+        };
+        let out = ctx.run_ui(input, |root| {
+            let colors = theme::palette(root);
+            footer_panel(colors).show(root, |ui| footer(&mut app, ui));
+            egui::Panel::left("main-nav-paid-card-test")
+                .exact_size(172.0)
+                .show(root, |ui| navigation(&mut app, ui));
+            egui::CentralPanel::default().show(root, |ui| {
+                egui::Frame::new()
+                    .inner_margin(egui::Margin::symmetric(24, 14))
+                    .show(ui, |ui| page_content(&mut app, ui));
+            });
+        });
+        let texts: Vec<String> = out
+            .shapes
+            .iter()
+            .filter_map(|s| match &s.shape {
+                egui::epaint::Shape::Text(t) => Some(t.galley.text().to_string()),
+                _ => None,
+            })
+            .collect();
+        out.drop_without_applying_deltas();
+        let joined = texts.join("\n");
+        assert!(
+            joined.contains("Лицензия PAID выдана, не включена"),
+            "{joined}"
+        );
+        assert!(joined.contains("Включить PAID"), "{joined}");
+        assert!(joined.contains("Открыть Витрину"), "{joined}");
+        assert!(!joined.contains("Скопировать код PAID"), "{joined}");
+        assert!(!joined.contains("Код FREE"), "{joined}");
+        assert!(joined.contains("МСК"), "{joined}");
+
+        app.status.as_mut().unwrap().group_proxy = State::Off;
+        app.status.as_mut().unwrap().group_proxy_configured = false;
+        let out_no_free = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                ..Default::default()
+            },
+            |root| {
+                egui::CentralPanel::default().show(root, |ui| {
+                    page_content(&mut app, ui);
+                });
+            },
+        );
+        let texts_no_free: Vec<String> = out_no_free
+            .shapes
+            .iter()
+            .filter_map(|s| match &s.shape {
+                egui::epaint::Shape::Text(t) => Some(t.galley.text().to_string()),
+                _ => None,
+            })
+            .collect();
+        out_no_free.drop_without_applying_deltas();
+        let joined_no_free = texts_no_free.join("\n");
+        assert!(!joined_no_free.contains("Код FREE"), "{joined_no_free}");
+
+        for (reason, expected) in [
+            (
+                crate::paid::LicenseReason::DeviceLimit,
+                "Превышено число устройств по вашей лицензии. Вы можете расширить лицензию, чтобы использовать PAID на дополнительном устройстве",
+            ),
+            (
+                crate::paid::LicenseReason::Expired,
+                "Срок действия вашей лицензии PAID закончился. Вы можете продлить её действие на любое число устройств.",
+            ),
+        ] {
+            app.paid_activation.set_test_license(crate::paid::License {
+                eligible: false,
+                started: true,
+                expires_at: Some(1_798_313_247),
+                reason: Some(reason),
+            });
+            let mut content_bottom = 0.0f32;
+            let mut panel_bottom = 0.0f32;
+            let out_reason = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                    ..Default::default()
+                },
+                |root| {
+                    let colors = theme::palette(root);
+                    footer_panel(colors).show(root, |ui| footer(&mut app, ui));
+                    egui::Panel::left("main-nav-reason-test")
+                        .exact_size(172.0)
+                        .show(root, |ui| navigation(&mut app, ui));
+                    egui::CentralPanel::default().show(root, |ui| {
+                        panel_bottom = ui.available_rect_before_wrap().bottom();
+                        content_bottom = egui::Frame::new()
+                            .inner_margin(egui::Margin::symmetric(24, 14))
+                            .show(ui, |ui| page_content(&mut app, ui))
+                            .response
+                            .rect
+                            .bottom();
+                    });
+                },
+            );
+            let joined_reason: String = out_reason
+                .shapes
+                .iter()
+                .filter_map(|s| match &s.shape {
+                    egui::epaint::Shape::Text(t) => Some(t.galley.text().to_string()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            out_reason.drop_without_applying_deltas();
+            assert!(joined_reason.contains(expected), "{joined_reason}");
+            assert!(
+                content_bottom <= panel_bottom,
+                "Reason card ({content_bottom}) must fit within panel ({panel_bottom})"
+            );
+        }
     }
 }

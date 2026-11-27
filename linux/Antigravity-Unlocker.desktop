@@ -1,7 +1,7 @@
 [Desktop Entry]
 Type=Application
 Version=1.0
-Name=Antigravity Unlocker
+Name=AI Unlocker
 Comment=Разблокировать Antigravity 2.0 / IDE / CLI
 # Self-resolving: %k is this .desktop file's own location, so the launcher next to
 # it is found wherever the folder is unpacked. Only the %k field code is used (no

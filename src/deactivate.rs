@@ -23,6 +23,12 @@ pub fn run(manual: &[PathBuf]) -> Vec<String> {
     if !errors.is_empty() {
         return errors;
     }
+    #[cfg(windows)]
+    if crate::paid::enabled() {
+        if let Err(error) = crate::paid_windows::clean() {
+            return vec![error];
+        }
+    }
     std::thread::scope(|scope| {
         let mut jobs = vec![scope.spawn(remove_network), scope.spawn(remove_environment)];
         for target in &targets {
@@ -61,7 +67,8 @@ fn ps(script: &str) -> Result<(), String> {
 
 #[cfg(windows)]
 fn stop_services() -> Result<(), String> {
-    // Do not delete the helper while an IFEO filter may still point at it.
+    // Restore the shortcut and clear legacy IFEO filters before removing helpers.
+    crate::launch_guard::restore_shortcut()?;
     crate::launch_guard::uninstall()?;
     ps(r#"
 foreach ($root in @('HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\Antigravity.exe',

@@ -76,7 +76,7 @@ impl Cap {
             Cap::Dns => "Обход через DNS",
             Cap::LocalProxy => "Локальный прокси",
             Cap::OwnProxy => "Свой HTTP-прокси",
-            Cap::GroupProxy => "Прокси из группы",
+            Cap::GroupProxy => "Лицензия FREE",
             Cap::DnsRotation => "Ротация DNS-серверов",
         }
     }
@@ -215,6 +215,7 @@ pub struct Status {
     /// queries ever reach, and the status card has to be able to say so.
     pub rules: bool,
     pub providers: Vec<ProviderRow>,
+    pub paid_apps: Vec<crate::paid::PaidAppStatus>,
     /// Where **our own** service's connections leave. `None` when there was
     /// nothing to read, or no tunnel to read it against.
     ///
@@ -289,12 +290,6 @@ pub enum Event {
 
 /// UI → worker.
 pub enum Cmd {
-    /// The key was accepted and the main screen is up. Auto-patch may act from
-    /// here on, never before: the first scan runs under the licence screen, and
-    /// patching from there would hand the patch to anyone without a key.
-    Unlocked,
-    /// Store the licence key just accepted, so the next start skips the screen.
-    RememberLicense(String),
     /// Persist the user's UI theme preference.
     SetTheme(crate::settings::ThemeMode),
     /// Ask the system again where the client's traffic leaves.
@@ -321,6 +316,8 @@ pub enum Cmd {
     /// means reading every Language Server binary end to end.
     #[allow(dead_code)]
     DeepRefresh,
+    /// Re-read system state cheaply without re-scanning full Language Server binaries.
+    RefreshSystem,
     Set(Cap, bool),
     AddPath(PathBuf),
     ForgetPath(PathBuf),
@@ -346,6 +343,12 @@ pub enum Cmd {
 
 pub struct Worker {
     tx: Sender<Cmd>,
+}
+
+#[cfg(test)]
+pub(crate) fn test_worker() -> (Worker, Receiver<Cmd>) {
+    let (tx, rx) = mpsc::channel();
+    (Worker { tx }, rx)
 }
 
 impl Worker {
@@ -472,35 +475,21 @@ fn run_worker(
     settle_decline(&mut ctx);
     startup_housekeeping(&mut ctx);
 
-    // The first snapshot is deep: the window opens on the licence screen, so
-    // reading the binaries costs the user nothing here and the main screen is
-    // already truthful when it appears.
     push_status(&mut ctx, Scan::Deep);
+    if auto_patch_found(&mut ctx) {
+        push_status(&mut ctx, Scan::Deep);
+    } else {
+        push_status(&mut ctx, Scan::System);
+    }
 
     while let Ok(cmd) = rx.recv() {
         match cmd {
             Cmd::Stop => return,
-            Cmd::RememberLicense(key) => {
-                if ctx.settings.license_key != key {
-                    ctx.settings.license_key = key;
-                    ctx.settings.save();
-                }
-            }
             Cmd::SetTheme(mode) => {
                 if ctx.settings.theme != mode {
                     ctx.settings.theme = mode;
                     ctx.settings.save();
                 }
-            }
-            Cmd::Unlocked => {
-                // The first snapshot was taken while the licence screen was up;
-                // a fresh one either way, deep when auto-patch just wrote.
-                if auto_patch_found(&mut ctx) {
-                    push_status(&mut ctx, Scan::Deep);
-                } else {
-                    push_status(&mut ctx, Scan::System);
-                }
-                ctx.busy(None);
             }
             // Off the queue, not on it. The measurement drives PowerShell and
             // takes seconds; on the queue, a user flipping a switch in the
@@ -554,6 +543,9 @@ fn run_worker(
                 ctx.busy(Some("Проверка установок"));
                 push_status(&mut ctx, Scan::Deep);
                 ctx.busy(None);
+            }
+            Cmd::RefreshSystem => {
+                push_status(&mut ctx, Scan::System);
             }
             Cmd::Set(cap, on) => {
                 ctx.busy(Some(cap.title()));
@@ -652,7 +644,11 @@ fn run_worker(
                     ctx.busy(None);
                     continue;
                 }
-                let errors = crate::deactivate::run(&ctx.settings.manual_paths);
+                let mut errors = crate::deactivate::run(&ctx.settings.manual_paths);
+                #[cfg(windows)]
+                if let Err(error) = crate::windows_shell::startup(Some(false)) {
+                    errors.push(format!("Автозапуск AI Unlocker: {error}"));
+                }
                 if errors.is_empty() {
                     let _ = ctx.events.send(Event::Deactivated);
                     (ctx.wake)();
@@ -745,10 +741,18 @@ fn startup_housekeeping(ctx: &mut Ctx) {
         return;
     }
     #[cfg(windows)]
-    match crate::sidecar::reap_orphans() {
-        Ok(n) if n > 0 => ctx.log(Level::Info, format!("Закрыто осиротевших процессов Antigravity: {n}")),
-        Ok(_) => {},
-        Err(e) => ctx.log(Level::Warn, format!("Не удалось убрать фоновые процессы: {e}")),
+    if matches!(crate::launch_guard::updater_busy(&crate::watchdog::updater_dirs()), Ok(false)) {
+        if ctx.settings.auto_patch_wanted()
+            && background::relay_is_outdated()
+            && background::is_watchdog_enabled()
+        {
+            set_watchdog(ctx, true);
+        }
+        match crate::sidecar::reap_orphans() {
+            Ok(n) if n > 0 => ctx.log(Level::Info, format!("Закрыто осиротевших процессов Antigravity: {n}")),
+            Ok(_) => {},
+            Err(e) => ctx.log(Level::Warn, format!("Не удалось убрать фоновые процессы: {e}")),
+        }
     }
     let before = dns::is_nrpt_applied();
     dns::refresh_pinned_hosts();
@@ -890,11 +894,22 @@ impl Status {
         // changed): said on the switch itself, where the user looks.
         self.own_proxy_configured = self.own_proxy.is_on() || upstream::parse(&s.own_proxy).is_ok();
         self.group_proxy_configured = s.group_proxy_configured();
-        self.group_proxy = if s.group_proxy_wanted() && crate::group::key_rejected() {
-            State::Partial(crate::group::KEY_DEAD_NOTE.into())
+        let active_paid = crate::paid::active_apps();
+        for row in &mut self.paid_apps {
+            row.active = active_paid.contains(&row.app);
+        }
+        let ag_paid = active_paid.iter().any(|app| app.is_antigravity());
+        if ag_paid {
+            self.dns = State::Blocked("Активен Antigravity PAID".into());
+            self.local_proxy = State::Blocked("Активен Antigravity PAID".into());
+            self.group_proxy = State::OffNote("Отключён: активен Antigravity PAID".into());
         } else {
-            on_off(s.group_proxy_wanted())
-        };
+            self.group_proxy = if s.group_proxy_wanted() && crate::group::key_rejected() {
+                State::Partial(crate::group::KEY_DEAD_NOTE.into())
+            } else {
+                on_off(s.group_proxy_wanted())
+            };
+        }
         self.custom_dns_text = s.custom_dns.clone();
         self.dns_rotation = if s.rotate_providers {
             State::On
@@ -975,6 +990,11 @@ fn read_status(ctx: &mut Ctx, deep: bool) -> Status {
         State::Off
     };
 
+    #[cfg(windows)]
+    let paid_apps = crate::paid_windows::discover_apps(&installs);
+    #[cfg(not(windows))]
+    let paid_apps = Vec::new();
+
     Status {
         admin,
         client_patch,
@@ -1001,6 +1021,7 @@ fn read_status(ctx: &mut Ctx, deep: bool) -> Status {
         rules: dns_probe.0,
         relay_egress: ctx.relay_egress,
         providers: Vec::new(),
+        paid_apps,
         installs,
     }
     .with_settings_switches(&ctx.settings)
@@ -1131,7 +1152,13 @@ fn dns_state(
         // is not a half-installed DNS layer: the DNS switch is off, and drawing
         // it as `Partial` - which reads as on - made it impossible to switch off
         // while any route kept the service up.
-        (false, true) if !wanted => State::Off,
+        (false, true) if !wanted => {
+            if !admin && cfg!(target_os = "windows") {
+                State::Blocked("нужны права администратора".into())
+            } else {
+                State::Off
+            }
+        }
         (false, true) => State::Partial("служба работает, правил нет".into()),
         (false, false) => {
             if !admin && cfg!(target_os = "windows") {
@@ -1209,6 +1236,10 @@ const INSTALL_KINDS: [&str; 4] = [
     "Antigravity CLI",
     "Antigravity для VS Code",
 ];
+
+pub fn collect_install_rows_fast() -> Vec<InstallRow> {
+    collect_installs(&Settings::load(), false, &HashMap::new())
+}
 
 fn collect_installs(
     settings: &Settings,
@@ -1438,6 +1469,16 @@ fn enable_all(ctx: &mut Ctx) {
     // must not have.
     if !patch_is_on(ctx) {
         apply(ctx, Cap::ClientPatch, true);
+    }
+    if crate::paid::antigravity_enabled() {
+        if watchdog_allowed(admin) && !background::is_watchdog_enabled() {
+            apply(ctx, Cap::Watchdog, true);
+        }
+        ctx.log(
+            Level::Ok,
+            "Готово. Для Antigravity активен платный режим PAID.",
+        );
+        return;
     }
     // Nothing but a line in settings.json, so it needs nobody's permission.
     // The service they ride on is brought up below, with DNS.
@@ -2062,7 +2103,7 @@ fn stop_relay(ctx: &mut Ctx) {
 /// Whether something other than the DNS rules needs the relay running: the
 /// proxy listener and every route it serves live inside it.
 fn routes_want_relay(s: &Settings) -> bool {
-    s.local_proxy || routes_want_relay_without_proxy_var(s)
+    s.local_proxy || routes_want_relay_without_proxy_var(s) || crate::paid::enabled()
 }
 
 /// A route that was switched on by itself has to have something to ride on.
@@ -2101,7 +2142,10 @@ fn ensure_route_carrier(ctx: &mut Ctx) {
 /// The counterpart: a route went off, and if nothing else wants the service it
 /// goes too. Not while DNS is on - then it is the DNS layer's.
 fn release_route_carrier(ctx: &mut Ctx) {
-    if ctx.settings.dns || routes_want_relay_without_proxy_var(&ctx.settings) {
+    if ctx.settings.dns
+        || routes_want_relay_without_proxy_var(&ctx.settings)
+        || crate::paid::enabled()
+    {
         return;
     }
     if cfg!(target_os = "windows") && !is_admin() {
@@ -2562,6 +2606,16 @@ mod tests {
         assert!(broken.is_on());
     }
 
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn dns_without_admin_is_blocked_even_when_relay_runs_for_routes() {
+        assert_eq!(
+            dns_state(false, false, true, None, true, false),
+            State::Blocked("нужны права администратора".into())
+        );
+        assert_eq!(dns_state(true, false, true, None, true, false), State::Off);
+    }
+
     #[test]
     fn the_service_is_wanted_while_any_route_is() {
         let mut s = Settings::default();
@@ -2634,6 +2688,7 @@ mod tests {
             relay_running: false,
             rules: false,
             providers: Vec::new(),
+            paid_apps: Vec::new(),
             relay_egress: None,
         }
     }

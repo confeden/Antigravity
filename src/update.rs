@@ -43,6 +43,8 @@ pub struct ReleaseAsset {
     pub browser_download_url: String,
     #[serde(default)]
     pub size: u64,
+    #[serde(default)]
+    pub digest: Option<String>,
 }
 
 /// Details of the latest release fetched from the GitHub API.
@@ -325,8 +327,7 @@ pub fn check_update_cached(force: bool) -> Result<Option<ReleaseInfo>, String> {
 
 /// Watches for a newer release for as long as the receiver lives.
 ///
-/// Checked once immediately — the banner has to be up before the licence screen
-/// is even answered — and then every `CHECK_INTERVAL` for a window that stays
+/// Checked at startup and then every `CHECK_INTERVAL` while the window stays
 /// open. Only the first pass may answer from the on-disk cache: after that the
 /// thread has already waited the full interval, so re-reading a cache it wrote
 /// itself would just double the wait.

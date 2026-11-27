@@ -593,13 +593,30 @@ pub fn order(usable: impl Fn(Kind) -> bool) -> Vec<Kind> {
     }
     let s = snapshot();
     let mut ordered = order_with(&s, usable);
-    if let Some(leader) = s.leader.filter(|k| is_streaming(*k)) {
-        if let Some(pos) = ordered.iter().position(|k| *k == leader) {
-            ordered.remove(pos);
-            ordered.insert(0, leader);
-        }
-    }
+    promote_streaming_leader(&mut ordered, &s.pinned, s.leader, is_streaming);
     ordered
+}
+
+fn promote_streaming_leader(
+    ordered: &mut Vec<Kind>,
+    pinned: &[Kind; 2],
+    leader: Option<Kind>,
+    streaming: impl Fn(Kind) -> bool,
+) {
+    let Some(leader) = leader.filter(|k| streaming(*k)) else {
+        return;
+    };
+    let Some(pos) = ordered.iter().position(|k| *k == leader) else {
+        return;
+    };
+    // A FREE group proxy or the user's own proxy always outranks DNS when
+    // eligible; an active DNS stream must not jump ahead of them for new
+    // connections.
+    let pinned_first = ordered.first().is_some_and(|first| pinned.contains(first));
+    if !pinned_first || pinned.contains(&leader) {
+        ordered.remove(pos);
+        ordered.insert(0, leader);
+    }
 }
 
 /// The route a diagnostic run pinned in `settings.json` (`debug_route`).
@@ -1082,11 +1099,150 @@ pub fn note_used(kind: Kind) {
     }
 }
 
+pub const PAID_LABEL: &str = "платный шлюз (PAID)";
+
+struct PaidTunnel {
+    id: u64,
+    host: String,
+    conn_id: String,
+    opened: Instant,
+    closed: Option<Instant>,
+    answered_at: Option<Instant>,
+}
+
+static PAID_TUNNELS: Mutex<Vec<PaidTunnel>> = Mutex::new(Vec::new());
+
+struct ServingPaid {
+    host: String,
+    conn_id: String,
+    tunnel: Option<u64>,
+    activity: Option<Arc<Activity>>,
+}
+
+thread_local! {
+    static SERVING_PAID: RefCell<Option<ServingPaid>> = const { RefCell::new(None) };
+}
+
+/// Begins tracking a PAID gate connection on the current thread until dropped.
+#[must_use]
+pub fn begin_paid_gate_connection(host: &str, conn_id: &str) -> PaidGateConnection {
+    SERVING_PAID.with(|s| {
+        *s.borrow_mut() = Some(ServingPaid {
+            host: host.trim_end_matches('.').to_ascii_lowercase(),
+            conn_id: conn_id.to_string(),
+            tunnel: None,
+            activity: None,
+        });
+    });
+    PaidGateConnection { _private: () }
+}
+
+/// Ends the current thread's PAID gate-connection record when dropped.
+pub struct PaidGateConnection {
+    _private: (),
+}
+
+impl Drop for PaidGateConnection {
+    fn drop(&mut self) {
+        let tunnel = SERVING_PAID.with(|s| s.borrow_mut().take().and_then(|s| s.tunnel));
+        let Some(id) = tunnel else { return };
+        if let Ok(mut list) = PAID_TUNNELS.lock() {
+            if let Some(t) = list.iter_mut().find(|t| t.id == id) {
+                t.closed = Some(Instant::now());
+            }
+            prune_paid(&mut list);
+        }
+    }
+}
+
+/// Notes that a PAID gate tunnel opened (HTTP 200 Connection Established received).
+pub fn note_paid_used() {
+    let now = Instant::now();
+    let id = NEXT_TUNNEL.fetch_add(1, Ordering::Relaxed);
+    let activity = Arc::new(Activity::default());
+    let entry = SERVING_PAID.with(|s| {
+        let mut s = s.borrow_mut();
+        let serving = s.as_mut()?;
+        serving.tunnel = Some(id);
+        serving.activity = Some(Arc::clone(&activity));
+        Some((serving.host.clone(), serving.conn_id.clone()))
+    });
+    let Some((host, conn_id)) = entry else { return };
+    if let Ok(mut list) = PAID_TUNNELS.lock() {
+        list.push(PaidTunnel {
+            id,
+            host,
+            conn_id,
+            opened: now,
+            closed: None,
+            answered_at: None,
+        });
+        prune_paid(&mut list);
+    }
+}
+
+fn prune_paid(list: &mut Vec<PaidTunnel>) {
+    list.retain(|t| t.closed.is_none_or(|c| c.elapsed() < TUNNEL_MEMORY));
+    while list.len() > MAX_TUNNEL_RECORDS {
+        match list.iter().position(|t| t.closed.is_some()) {
+            Some(i) => {
+                list.remove(i);
+            }
+            None => break,
+        }
+    }
+}
+
+/// The route that carried an event across both FREE and PAID gate tunnels.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Attributed {
+    Free(Kind, u64),
+    Paid(u64, String),
+}
+
+/// Finds the most recently opened tunnel (FREE or PAID) open around `at` for `host`.
+pub fn attribute_any(at: Instant, host: Option<&str>) -> Option<Attributed> {
+    let host = host.map(|h| h.trim_end_matches('.').to_ascii_lowercase());
+    let free_hit = TUNNELS.lock().ok().and_then(|list| {
+        list.iter()
+            .filter(|t| host.as_ref().is_none_or(|h| *h == t.host))
+            .filter(|t| t.opened <= at + ATTRIBUTION_SLACK)
+            .filter(|t| t.closed.is_none_or(|c| c + ATTRIBUTION_SLACK >= at))
+            .max_by_key(|t| t.opened)
+            .map(|t| (t.opened, Attributed::Free(t.kind, t.id)))
+    });
+    let paid_hit = PAID_TUNNELS.lock().ok().and_then(|list| {
+        list.iter()
+            .filter(|t| host.as_ref().is_none_or(|h| *h == t.host))
+            .filter(|t| t.opened <= at + ATTRIBUTION_SLACK)
+            .filter(|t| t.closed.is_none_or(|c| c + ATTRIBUTION_SLACK >= at))
+            .max_by_key(|t| t.opened)
+            .map(|t| (t.opened, Attributed::Paid(t.id, t.conn_id.clone())))
+    });
+    match (free_hit, paid_hit) {
+        (Some((fo, f)), Some((po, p))) => Some(if po >= fo { p } else { f }),
+        (Some((_, f)), None) => Some(f),
+        (None, Some((_, p))) => Some(p),
+        (None, None) => None,
+    }
+}
+
+/// Marks a PAID gate tunnel as having carried a model answer.
+pub fn credit_paid_tunnel(id: u64) {
+    if let Ok(mut list) = PAID_TUNNELS.lock() {
+        if let Some(t) = list.iter_mut().find(|t| t.id == id) {
+            t.answered_at = Some(Instant::now());
+        }
+    }
+}
+
 /// The activity stamp of the gate tunnel this thread is serving, for its pump
 /// to mark as bytes move. `None` outside a gate connection, or before the
 /// route committed one: `splice` carries every non-gate tunnel too.
 pub fn serving_activity() -> Option<Arc<Activity>> {
-    SERVING.with(|s| s.borrow().as_ref().and_then(|s| s.activity.clone()))
+    SERVING
+        .with(|s| s.borrow().as_ref().and_then(|s| s.activity.clone()))
+        .or_else(|| SERVING_PAID.with(|s| s.borrow().as_ref().and_then(|s| s.activity.clone())))
 }
 
 fn prune(list: &mut Vec<Tunnel>) {
@@ -1472,6 +1628,35 @@ mod tests {
             order[2..],
             [Kind::Relay, Kind::Exits, Kind::Direct, Kind::Vpn]
         );
+    }
+
+    #[test]
+    fn free_license_prefers_group_and_own_before_dns_even_when_dns_is_faster_or_streaming() {
+        let mut s = blank();
+        s.samples[Kind::Direct.index()] = sample(20);
+        s.samples[Kind::Group.index()] = sample(400);
+        s.samples[Kind::Own.index()] = sample(600);
+        s.ok_at[Kind::Direct.index()] = Some(Instant::now());
+        s.leader = Some(Kind::Direct);
+        let usable = |k: Kind| matches!(k, Kind::Group | Kind::Own | Kind::Direct);
+        let mut ordered = order_with(&s, usable);
+        promote_streaming_leader(&mut ordered, &s.pinned, s.leader, |k| k == Kind::Direct);
+        assert_eq!(ordered, vec![Kind::Group, Kind::Own, Kind::Direct]);
+    }
+
+    #[test]
+    fn without_free_license_prefers_own_proxy_then_dns() {
+        let mut s = blank();
+        s.samples[Kind::Direct.index()] = sample(25);
+        s.samples[Kind::Own.index()] = sample(500);
+        s.ok_at[Kind::Direct.index()] = Some(Instant::now());
+        s.leader = Some(Kind::Direct);
+        let usable = |k: Kind| matches!(k, Kind::Own | Kind::Direct);
+        let mut ordered = order_with(&s, usable);
+        promote_streaming_leader(&mut ordered, &s.pinned, s.leader, |k| k == Kind::Direct);
+        assert_eq!(ordered, vec![Kind::Own, Kind::Direct]);
+        let dns_only = order_with(&s, |k| k == Kind::Direct);
+        assert_eq!(dns_only, vec![Kind::Direct]);
     }
 
     #[test]
@@ -2070,7 +2255,7 @@ mod tests {
         let addr = listener.local_addr().expect("addr");
 
         // Two gate tunnels on one route, the way a client's pool makes them.
-        let mut open_one = |host: &'static str| {
+        let open_one = |host: &'static str| {
             let far = TcpStream::connect(addr).expect("connected");
             let (near, _) = listener.accept().expect("accepted");
             let (tx, rx) = std::sync::mpsc::channel();
@@ -2146,5 +2331,20 @@ mod tests {
         assert!(a.idle().is_some_and(|d| d < Duration::from_secs(1)));
         a.to_client(4_253);
         assert_eq!(a.bytes(), (4_253, 116_225));
+    }
+
+    #[test]
+    fn paid_gate_tunnel_is_attributed_and_closed_on_drop() {
+        let _turn = turn();
+        let guard = begin_paid_gate_connection("daily-cloudcode-pa.googleapis.com", "cid-paid-1");
+        note_paid_used();
+        assert!(serving_activity().is_some());
+        let found = attribute_any(Instant::now(), Some("daily-cloudcode-pa.googleapis.com"));
+        assert!(matches!(found, Some(Attributed::Paid(_, ref c)) if c == "cid-paid-1"));
+        if let Some(Attributed::Paid(id, _)) = found {
+            credit_paid_tunnel(id);
+        }
+        drop(guard);
+        assert!(serving_activity().is_none());
     }
 }

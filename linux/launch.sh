@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Antigravity Unlocker - Linux launcher.
+# AI Unlocker - Linux launcher.
 #
 # Runs as the normal user - NO sudo. The phase-2 region route is entirely
 # unprivileged: the language server that carries the gate lives in
@@ -35,7 +35,7 @@ say_error() {
     printf '%s\n' "$1" >&2
     if [ ! -t 2 ]; then
         if command -v zenity >/dev/null 2>&1; then
-            zenity --error --no-markup --title="Antigravity Unlocker" --text="$1" 2>/dev/null
+            zenity --error --no-markup --title="AI Unlocker" --text="$1" 2>/dev/null
         elif command -v kdialog >/dev/null 2>&1; then
             kdialog --error "$1" 2>/dev/null
         elif command -v xmessage >/dev/null 2>&1; then

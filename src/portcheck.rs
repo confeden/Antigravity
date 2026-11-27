@@ -146,6 +146,42 @@ fn tcp_listener_pid(addr: SocketAddr) -> Option<u32> {
         SocketAddr::V4(a) => (a.port(), *a.ip()),
         SocketAddr::V6(_) => return None,
     };
+    const TCP_TABLE_OWNER_PID_LISTENER: u32 = 3;
+    tcp_owner_pid(TCP_TABLE_OWNER_PID_LISTENER, |row| {
+        let local = Ipv4Addr::from(row[1].to_ne_bytes());
+        tcp_port(row[2]) == port && (local == want || local.is_unspecified())
+    })
+}
+
+/// Resolve the client side of a connected loopback socket to its process image.
+#[cfg(windows)]
+pub fn client_image(stream: &std::net::TcpStream) -> Option<std::path::PathBuf> {
+    let SocketAddr::V4(peer) = stream.peer_addr().ok()? else {
+        return None;
+    };
+    let SocketAddr::V4(listener) = stream.local_addr().ok()? else {
+        return None;
+    };
+    const TCP_TABLE_OWNER_PID_CONNECTIONS: u32 = 4;
+    const MIB_TCP_STATE_ESTAB: u32 = 5;
+    let pid = tcp_owner_pid(TCP_TABLE_OWNER_PID_CONNECTIONS, |row| {
+        row[0] == MIB_TCP_STATE_ESTAB
+            && Ipv4Addr::from(row[1].to_ne_bytes()) == *peer.ip()
+            && tcp_port(row[2]) == peer.port()
+            && Ipv4Addr::from(row[3].to_ne_bytes()) == *listener.ip()
+            && tcp_port(row[4]) == listener.port()
+    })?;
+    process_image(pid)
+}
+
+#[cfg(windows)]
+fn tcp_port(value: u32) -> u16 {
+    // MIB_TCPROW_OWNER_PID stores the port in the low 16 bits in network order.
+    u16::from_be((value & 0xFFFF) as u16)
+}
+
+#[cfg(windows)]
+fn tcp_owner_pid(class: u32, matches: impl Fn(&[u32]) -> bool) -> Option<u32> {
     use std::ffi::c_void;
     #[link(name = "iphlpapi")]
     extern "system" {
@@ -159,7 +195,6 @@ fn tcp_listener_pid(addr: SocketAddr) -> Option<u32> {
         ) -> u32;
     }
     const AF_INET: u32 = 2;
-    const TCP_TABLE_OWNER_PID_LISTENER: u32 = 3;
     const NO_ERROR: u32 = 0;
     // MIB_TCPROW_OWNER_PID: state, local addr, local port, remote addr, remote
     // port, pid - six u32s, after the table's one-u32 count.
@@ -172,7 +207,7 @@ fn tcp_listener_pid(addr: SocketAddr) -> Option<u32> {
             &mut size,
             0,
             AF_INET,
-            TCP_TABLE_OWNER_PID_LISTENER,
+            class,
             0,
         );
     }
@@ -185,7 +220,7 @@ fn tcp_listener_pid(addr: SocketAddr) -> Option<u32> {
             &mut size,
             0,
             AF_INET,
-            TCP_TABLE_OWNER_PID_LISTENER,
+            class,
             0,
         )
     };
@@ -195,11 +230,7 @@ fn tcp_listener_pid(addr: SocketAddr) -> Option<u32> {
     let count = (buf[0] as usize).min((buf.len() - 1) / ROW);
     (0..count).find_map(|i| {
         let row = &buf[1 + i * ROW..1 + (i + 1) * ROW];
-        // The port sits in the low 16 bits, in network byte order; the address
-        // is an `in_addr`, i.e. its bytes are already in network order.
-        let local_port = u16::from_be((row[2] & 0xFFFF) as u16);
-        let local = Ipv4Addr::from(row[1].to_ne_bytes());
-        (local_port == port && (local == want || local.is_unspecified())).then_some(row[5])
+        matches(row).then_some(row[5])
     })
 }
 
@@ -268,42 +299,38 @@ fn udp_listener_pid(addr: SocketAddr) -> Option<u32> {
     })
 }
 
-/// The image name of `pid`: the kernel's answer when this process may open the
-/// other one, `tasklist`'s otherwise (it reads names across sessions and
-/// privilege levels without elevation).
+#[cfg(windows)]
+fn process_image(pid: u32) -> Option<std::path::PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h.is_null() {
+            return None;
+        }
+        let mut buf = [0u16; 1024];
+        let mut len = buf.len() as u32;
+        let ok = QueryFullProcessImageNameW(h, 0, buf.as_mut_ptr(), &mut len) != 0;
+        CloseHandle(h);
+        ok.then(|| std::ffi::OsString::from_wide(&buf[..len as usize]).into())
+    }
+}
+
+/// The image name of `pid`, with a tasklist fallback for inaccessible processes.
 #[cfg(windows)]
 fn process_name(pid: u32) -> Option<String> {
-    use std::ffi::c_void;
-    #[link(name = "kernel32")]
-    extern "system" {
-        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut c_void;
-        fn QueryFullProcessImageNameW(
-            process: *mut c_void,
-            flags: u32,
-            name: *mut u16,
-            size: *mut u32,
-        ) -> i32;
-        fn CloseHandle(handle: *mut c_void) -> i32;
-    }
-    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
-
     // PID 4 is the kernel: a listener it owns is HTTP.sys, i.e. IIS or a
     // service that registered a URL with it. Its name would say nothing.
     if pid == 4 {
         return Some("служба Windows HTTP (IIS или похожая)".to_string());
     }
-    unsafe {
-        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-        if !h.is_null() {
-            let mut buf = [0u16; 1024];
-            let mut len = buf.len() as u32;
-            let ok = QueryFullProcessImageNameW(h, 0, buf.as_mut_ptr(), &mut len) != 0;
-            CloseHandle(h);
-            if ok {
-                let full = String::from_utf16_lossy(&buf[..len as usize]);
-                return full.rsplit('\\').next().map(str::to_string);
-            }
-        }
+    if let Some(path) = process_image(pid) {
+        return path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned());
     }
     let mut cmd = std::process::Command::new("tasklist");
     cmd.args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"]);
@@ -410,6 +437,18 @@ mod tests {
         // The same port on another loopback address is not in its way.
         let elsewhere = SocketAddr::from(([127, 65, 71, 9], here.port()));
         assert_eq!(listener_pid(elsewhere, Proto::Tcp), None);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn an_accepted_socket_identifies_its_client() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let _client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (accepted, _) = listener.accept().unwrap();
+        assert_eq!(
+            client_image(&accepted).expect("loopback client image"),
+            process_image(std::process::id()).expect("test image")
+        );
     }
 
     #[test]

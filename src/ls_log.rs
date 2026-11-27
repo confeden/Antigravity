@@ -64,9 +64,10 @@ const ANSWER_ID: &str = "responseid:";
 /// language server on every retry of the turn. Not the gate and not the route -
 /// the request got past both - so the only thing that helps is another model.
 const OVERLOAD_503: &str = "unavailable (code 503)";
-/// The same condition under the other names Google gives it: a quota-style 429
-/// and the text the client shows the user (`Our servers are experiencing high
-/// traffic`). Either way the request got past the gate and the route.
+/// The account ran out of tokens or credits: `RESOURCE_EXHAUSTED (code 429)`.
+/// Like 503, the request got past the gate and the route, so the card must not
+/// blame the bypass, and must name token/credit limit exhaustion rather than
+/// server overload.
 const OVERLOAD_429: &str = "resource_exhausted (code 429)";
 const OVERLOAD_TRAFFIC: &str = "experiencing high traffic";
 /// Google's own fault, not a capacity one: `INTERNAL (code 500)`. Counted for
@@ -556,6 +557,8 @@ pub struct History {
     pub refused: Option<Sighting>,
     /// The newest model answer inside `horizon`, and how many.
     pub answered: Option<Sighting>,
+    /// Model generation requests whose connections closed inside `horizon`.
+    pub dropped: Option<Sighting>,
     /// The newest account-verification demand inside `horizon`.
     pub verify: Option<Verification>,
     /// Google out of capacity for the chosen model (503) inside `recent`.
@@ -568,20 +571,34 @@ pub struct History {
     pub server_errors: Option<Sighting>,
 }
 
-/// The newest 503 "no capacity" a client log carries, and for which model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverloadKind {
+    Capacity,
+    Quota,
+}
+
+/// The newest 503 "no capacity" or 429 token/credit exhaustion a client log carries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Overload {
     pub ago: Duration,
     pub count: usize,
+    pub kind: OverloadKind,
     /// The model named in the newest line; empty when the line names none.
     pub model: String,
 }
 
-/// A line that says Google had no room for the request.
-fn is_overload(line: &[u8]) -> bool {
-    [OVERLOAD_503, OVERLOAD_429, OVERLOAD_TRAFFIC]
+/// Classifies a line where Google rejected the request due to capacity or quota.
+fn overload_kind(line: &[u8]) -> Option<OverloadKind> {
+    if [OVERLOAD_503, OVERLOAD_TRAFFIC]
         .iter()
         .any(|n| contains_ci(line, n.as_bytes()))
+    {
+        Some(OverloadKind::Capacity)
+    } else if contains_ci(line, OVERLOAD_429.as_bytes()) {
+        Some(OverloadKind::Quota)
+    } else {
+        None
+    }
 }
 
 /// The model a 503 line names (`… for model <name> on the server`).
@@ -622,10 +639,12 @@ pub fn history(paths: &[PathBuf], recent: Duration, horizon: Duration) -> Histor
         for line in text.lines() {
             let refusals = count_refusals(line.as_bytes());
             let answered = is_answer(line.as_bytes());
-            let overloaded = is_overload(line.as_bytes());
-            let server_error = overloaded || contains_ci(line.as_bytes(), SERVER_500.as_bytes());
+            let dropped = is_stream_drop(line.as_bytes());
+            let overload = overload_kind(line.as_bytes());
+            let server_error =
+                overload.is_some() || contains_ci(line.as_bytes(), SERVER_500.as_bytes());
             let unauthorized = contains_ci(line.as_bytes(), UNAUTH_401.as_bytes());
-            if refusals == 0 && !answered && !server_error && !unauthorized {
+            if refusals == 0 && !answered && !dropped && !server_error && !unauthorized {
                 continue;
             }
             let Some(ago) = parse_stamp(line).and_then(|at| age_secs(at, now)) else {
@@ -638,19 +657,24 @@ pub fn history(paths: &[PathBuf], recent: Duration, horizon: Duration) -> Histor
             if server_error {
                 bump(&mut out.server_errors, ago, 1);
             }
-            if overloaded && ago <= recent {
-                let newest = out.overloaded.as_ref().is_none_or(|o| ago <= o.ago);
-                let o = out.overloaded.get_or_insert(Overload {
-                    ago,
-                    count: 0,
-                    model: String::new(),
-                });
-                o.count += 1;
-                if newest {
-                    o.ago = ago;
-                    let model = overload_model(line.as_bytes());
-                    if !model.is_empty() {
-                        o.model = model;
+            if let Some(kind) = overload {
+                if ago <= recent {
+                    let newest = out.overloaded.as_ref().is_none_or(|o| ago <= o.ago);
+                    let o = out.overloaded.get_or_insert(Overload {
+                        ago,
+                        count: 0,
+                        kind,
+                        model: String::new(),
+                    });
+                    o.count += 1;
+                    if newest {
+                        let kind_changed = o.kind != kind;
+                        o.ago = ago;
+                        o.kind = kind;
+                        let model = overload_model(line.as_bytes());
+                        if kind_changed || !model.is_empty() {
+                            o.model = model;
+                        }
                     }
                 }
             }
@@ -665,6 +689,9 @@ pub fn history(paths: &[PathBuf], recent: Duration, horizon: Duration) -> Histor
             }
             if answered {
                 bump(&mut out.answered, ago, 1);
+            }
+            if dropped {
+                bump(&mut out.dropped, ago, 1);
             }
         }
         if let Some(v) = newest_verification(&text, now, horizon) {
@@ -1565,10 +1592,10 @@ API Error: {Reason:UNSUPPORTED_LOCATION}
         assert_eq!(verify_in(old), None);
     }
 
-    /// A 503 and a 401 are read out with the newest 503's model, and only
-    /// inside the recent window.
+    /// Capacity and authentication errors use the recent window, while a
+    /// generation drop can supersede an answer over the full history window.
     #[test]
-    fn history_reads_overload_and_unauthorized() {
+    fn history_reads_overload_unauthorized_and_generation_drops() {
         let Some(now) = crate::utils::local_clock() else {
             return;
         };
@@ -1613,6 +1640,13 @@ API Error: {Reason:UNSUPPORTED_LOCATION}
                 stamp(40)
             ),
         );
+        append(
+            &path,
+            &format!(
+                "{}Run: attempt 1 failed (request failed: Post \"https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse\": EOF), retrying in 4s\n",
+                stamp(1200)
+            ),
+        );
 
         let h = history(
             std::slice::from_ref(&path),
@@ -1621,10 +1655,14 @@ API Error: {Reason:UNSUPPORTED_LOCATION}
         );
         let o = h.overloaded.expect("two 503s inside the window");
         assert_eq!(o.count, 2, "the 25-minute-old one is outside it");
+        assert_eq!(o.kind, OverloadKind::Capacity);
         assert_eq!(o.model, "gemini-3.8-flash-high");
         assert!((95..=115).contains(&o.ago.as_secs()), "{:?}", o.ago);
         let u = h.unauthorized.expect("two 401s");
         assert_eq!(u.count, 2);
+        let d = h.dropped.expect("generation drop inside history window");
+        assert_eq!(d.count, 1);
+        assert!(d.ago > Duration::from_secs(600));
         assert!(h.refused.is_none() && h.answered.is_none());
         let _ = fs::remove_file(&path);
     }
@@ -1652,15 +1690,22 @@ API Error: {Reason:UNSUPPORTED_LOCATION}
 
     #[test]
     fn overload_names_and_server_errors() {
-        assert!(is_overload(
-            b"Run: attempt 2 failed (RESOURCE_EXHAUSTED (code 429): quota)"
-        ));
-        assert!(is_overload(
-            b"Error Our servers are experiencing high traffic right now"
-        ));
-        assert!(!is_overload(
-            b"Run: attempt 1 failed (INTERNAL (code 500): Internal error encountered.)"
-        ));
+        assert_eq!(
+            overload_kind(b"Run: attempt 2 failed (RESOURCE_EXHAUSTED (code 429): quota)"),
+            Some(OverloadKind::Quota)
+        );
+        assert_eq!(
+            overload_kind(b"Run: attempt 1 failed (UNAVAILABLE (code 503): No capacity)"),
+            Some(OverloadKind::Capacity)
+        );
+        assert_eq!(
+            overload_kind(b"Error Our servers are experiencing high traffic right now"),
+            Some(OverloadKind::Capacity)
+        );
+        assert_eq!(
+            overload_kind(b"Run: attempt 1 failed (INTERNAL (code 500): Internal error encountered.)"),
+            None
+        );
         assert!(contains_ci(
             b"attempt 1 failed (INTERNAL (code 500): x",
             SERVER_500.as_bytes()

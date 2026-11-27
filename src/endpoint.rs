@@ -882,7 +882,10 @@ fn current_env_in(name: &str, scope: &str) -> Option<String> {
 /// remove, never a foreign proxy to stand aside for. "Is it ours *and still
 /// current*" is `is_our_proxy_value`.
 fn is_ours_on_any_port(value: &str, url: &str) -> bool {
-    is_our_proxy_value(value, url) || is_our_proxy_value(value, &crate::proxy::default_url())
+    is_our_proxy_value(value, url)
+        || crate::proxy::all_our_urls()
+            .iter()
+            .any(|candidate| is_our_proxy_value(value, candidate))
 }
 
 fn is_our_proxy_value(value: &str, url: &str) -> bool {
@@ -1029,7 +1032,26 @@ pub fn proxy_env_value() -> Option<String> {
 #[allow(dead_code)]
 pub fn proxy_env_is_ours() -> bool {
     let ours = crate::proxy::proxy_url();
-    proxy_env_value().is_some_and(|v| is_our_proxy_value(&v, &ours))
+    proxy_env_value().is_some_and(|v| is_ours_on_any_port(&v, &ours))
+}
+
+#[allow(dead_code)]
+pub fn proxy_env_is_paid() -> bool {
+    proxy_env_value().is_some_and(|v| {
+        crate::proxy::all_paid_urls()
+            .iter()
+            .any(|candidate| is_our_proxy_value(&v, candidate))
+    })
+}
+
+#[cfg(target_os = "windows")]
+#[allow(dead_code)]
+pub fn remove_paid_proxy_env() -> Result<bool, String> {
+    if !proxy_env_is_paid() {
+        return Ok(false);
+    }
+    set_env(PROXY_ENV_VAR, None)?;
+    Ok(true)
 }
 
 #[cfg(test)]

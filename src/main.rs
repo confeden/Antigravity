@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 mod asar;
+#[cfg(test)]
 mod auth;
 mod background;
 mod canary;
@@ -50,6 +51,9 @@ mod net;
 #[cfg(not(target_os = "windows"))]
 mod netif;
 mod ops;
+mod paid;
+#[cfg(windows)]
+mod paid_windows;
 mod patch_binary;
 mod patch_ide;
 mod portcheck;
@@ -63,10 +67,14 @@ mod update;
 mod upstream;
 mod utils;
 mod watchdog;
+#[cfg(windows)]
+mod windows_shell;
 
 use asar::extract_asar;
 use patch_binary::patch_all_binaries;
 use patch_ide::{is_new_desktop_architecture, patch_desktop, patch_extension_js, patch_ide};
+
+pub(crate) const APP_NAME: &str = "AI Unlocker";
 
 pub fn clean_input_path(input: &str) -> String {
     let mut s = input.trim();
@@ -622,9 +630,51 @@ pub fn install_label(install: &Path) -> &'static str {
 
 fn main() {
     #[cfg(windows)]
-    if env::args_os().nth(1).is_some_and(|a| a == launch_guard::FLAG) {
-        launch_guard::run();
-        return;
+    if let Some(mode) = env::args_os().nth(1) {
+        if mode == "--set-paid-mode" {
+            let result = match env::args().nth(2).as_deref() {
+                Some("on") => paid_windows::start(),
+                Some("off") => paid_windows::disable(),
+                _ => Err("Неизвестный режим платной маршрутизации".into()),
+            };
+            if let Err(error) = result {
+                dns_forwarder::log_proxy(&error);
+                std::process::exit(1);
+            }
+            return;
+        }
+        if mode == "--set-paid-apps" {
+            let raw = env::args().nth(2).unwrap_or_default();
+            let err_file = env::args_os().nth(3).map(PathBuf::from);
+            let result = if raw.trim().eq_ignore_ascii_case("none") || raw.trim().is_empty() {
+                paid_windows::apply_apps(&[])
+            } else {
+                let apps: Vec<_> = raw
+                    .split(',')
+                    .filter_map(crate::paid::PaidApp::from_id)
+                    .collect();
+                paid_windows::apply_apps(&apps)
+            };
+            if let Err(error) = result {
+                dns_forwarder::log_proxy(&error);
+                if let Some(path) = err_file {
+                    let _ = fs::write(path, &error);
+                }
+                std::process::exit(1);
+            }
+            return;
+        }
+        if mode == "--clear-paid-mode" {
+            std::process::exit(if paid_windows::disable().is_ok() { 0 } else { 1 });
+        }
+        if mode == launch_guard::SHORTCUT_FLAG {
+            launch_guard::run_shortcut();
+            return;
+        }
+        if mode == launch_guard::FLAG {
+            launch_guard::run();
+            return;
+        }
     }
     if env::args().skip(1).any(|a| {
         matches!(
@@ -703,7 +753,7 @@ fn main() {
             if std::io::stdin().is_terminal() {
                 run_tui(Some(note));
             } else {
-                utils::message_box("Antigravity Unlocker", &e);
+                utils::message_box(APP_NAME, &e);
                 std::process::exit(1);
             }
         }
@@ -712,7 +762,7 @@ fn main() {
 
 fn run_tui(note: Option<String>) {
     if let Err(e) = tui::run(note) {
-        utils::message_box("Antigravity Unlocker", &e);
+        utils::message_box(APP_NAME, &e);
         std::process::exit(1);
     }
 }

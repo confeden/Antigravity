@@ -235,7 +235,7 @@ fn launch_in_user_session(app: &Path) -> std::io::Result<()> {
               -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew \
               -ExecutionTimeLimit ([TimeSpan]::Zero); \
          Register-ScheduledTask -TaskName $n -Action $a -Principal $p -Settings $s \
-              -Description 'Antigravity Unlocker: reopen the app in the user session' \
+              -Description 'AI Unlocker: reopen the app in the user session' \
               -Force | Out-Null; \
          Start-ScheduledTask -TaskName $n; \
          for ($i=0; $i -lt 20; $i++) {{ \
@@ -584,14 +584,16 @@ pub(crate) fn repatch_before_launch(bin_path: &Path) -> RepatchOutcome {
 
 fn repatch_with(bin_path: &Path, kill_locked: bool) -> RepatchOutcome {
     #[cfg(windows)]
-    if crate::watchdog::updater_busy(&crate::watchdog::updater_dirs()) {
-        return RepatchOutcome::Deferred("Antigravity update is still running".into());
-    }
-    #[cfg(windows)]
     let _transaction = match PatchLock::acquire(bin_path) {
         Ok(lock) => lock,
         Err(e) => return RepatchOutcome::Failed(e),
     };
+    #[cfg(windows)]
+    let updater_dirs = crate::watchdog::updater_dirs();
+    #[cfg(windows)]
+    if let Some(outcome) = defer_for_updater(&updater_dirs) {
+        return outcome;
+    }
     let (from, to) = field_signatures();
     let proxy_from = proxy_var_original();
     let mut data = match fs::read(bin_path) {
@@ -603,6 +605,12 @@ fn repatch_with(bin_path: &Path, kill_locked: bool) -> RepatchOutcome {
     // once, and a machine upgrading from a build that only knew the first one
     // gets the second here without a second pass over 150 MB.
     let proxy = replace_all(&mut data, &proxy_from, PROXY_VAR_NEW.as_bytes());
+    #[cfg(windows)]
+    if replaced > 0 || proxy > 0 {
+        if let Some(outcome) = defer_for_updater(&updater_dirs) {
+            return outcome;
+        }
+    }
     if replaced == 0 {
         if count_occurrences(&data, &to) == 0 {
             return RepatchOutcome::SignatureMissing;
@@ -632,6 +640,16 @@ fn repatch_with(bin_path: &Path, kill_locked: bool) -> RepatchOutcome {
         Ok(()) => RepatchOutcome::Repatched(replaced),
         Err(e) => RepatchOutcome::Failed(e),
     }
+}
+
+#[cfg(windows)]
+fn defer_for_updater(dirs: &[PathBuf]) -> Option<RepatchOutcome> {
+    let reason = match crate::launch_guard::updater_busy(dirs) {
+        Ok(false) => return None,
+        Ok(true) => "Antigravity update is still running".into(),
+        Err(e) => format!("could not check Antigravity updater: {e}"),
+    };
+    Some(RepatchOutcome::Deferred(reason))
 }
 
 /// Native binaries that carry the eligibility check, for a given install root.

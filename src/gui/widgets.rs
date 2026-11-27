@@ -274,3 +274,14 @@ pub fn dot(ui: &mut egui::Ui, color: egui::Color32) {
         ui.painter().circle_filled(rect.center(), 4.0, color);
     }
 }
+
+/// Compact pill badge (e.g. FREE / PAID).
+pub fn badge(ui: &mut egui::Ui, text: &str, fill: egui::Color32, ink: egui::Color32) {
+    egui::Frame::new()
+        .fill(fill)
+        .corner_radius(CornerRadius::same(4))
+        .inner_margin(egui::Margin::symmetric(6, 1))
+        .show(ui, |ui| {
+            ui.label(egui::RichText::new(text).size(11.0).strong().color(ink));
+        });
+}

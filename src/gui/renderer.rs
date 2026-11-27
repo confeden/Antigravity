@@ -307,7 +307,7 @@ pub fn install() {
             }
         }
         crate::utils::message_box(
-            "Antigravity Unlocker",
+            crate::APP_NAME,
             &format!("Программа аварийно завершилась.\n\n{what}"),
         );
     }));

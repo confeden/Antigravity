@@ -23,6 +23,7 @@
 //! the window says nothing about the answer, never that there was none.
 
 use serde::{Deserialize, Serialize};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 use std::sync::Mutex;
@@ -67,6 +68,8 @@ pub struct Report {
     /// The last model answer the relay saw in a client log, and the route it
     /// credited with it.
     pub last_ok: Option<Proof>,
+    /// The newest PAID gateway refusal or post-CONNECT tunnel drop, without secrets.
+    pub last_paid_error: Option<PaidFailure>,
     /// Whether gate hosts are answered with the loopback listener's addresses
     /// (`loopback`), i.e. whether every gate connection on the machine is ours
     /// to route, env variable or not.
@@ -127,6 +130,19 @@ pub struct Proof {
     /// The route credited with it, by label. Empty when no gate tunnel of ours
     /// was open around it - the client reached Google some other way.
     pub route: String,
+}
+
+/// Safe diagnostic summary of a PAID gateway refusal or post-CONNECT drop.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PaidFailure {
+    pub at: u64,
+    pub conn_id: String,
+    pub host: String,
+    pub stage: String,
+    pub status: u16,
+    pub reason: String,
+    pub summary: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -196,6 +212,7 @@ impl Report {
             && self.stood_down == other.stood_down
             && self.last_400 == other.last_400
             && self.last_ok == other.last_ok
+            && self.last_paid_error == other.last_paid_error
             && self.loopback == other.loopback
             && self.tunnel == other.tunnel
             && self.vpn_exit == other.vpn_exit
@@ -367,6 +384,13 @@ pub fn record_answer(route: Option<&str>) {
     });
 }
 
+/// Records the newest safe PAID gateway refusal or post-CONNECT tunnel drop.
+pub fn record_paid_error(failure: PaidFailure) {
+    update(|r| {
+        r.last_paid_error = Some(failure);
+    });
+}
+
 // ---------------------------------------------------------------------------
 // The window's side
 // ---------------------------------------------------------------------------
@@ -392,6 +416,8 @@ pub struct View {
     pub seen: Option<crate::ls_log::Sighting>,
     /// The newest model answer in the client's log, the same way.
     pub answered: Option<crate::ls_log::Sighting>,
+    /// Generation connection drops over the same horizon as answers.
+    pub dropped: Option<crate::ls_log::Sighting>,
     /// The newest refusal over the same horizon as `answered`. `seen` stops at
     /// `RECENT`, and without this a refusal eleven minutes old that came *after*
     /// the last answer disappeared, and the answer before it turned the card
@@ -421,6 +447,109 @@ pub enum Signal {
     /// it colours must not be able to disagree with the decision the DNS layer
     /// made from the same call.
     MeasureVpn,
+    /// Diagnostic lines read from `forwarder.log` for the «Журнал» tab.
+    ProxyLog(Vec<(crate::ops::Level, String)>),
+}
+
+const FORWARDER_TAIL_BYTES: u64 = 16 * 1024;
+const FORWARDER_INITIAL_LINES: usize = 25;
+
+/// Classifies one `forwarder.log` line for the «Журнал» tab without leaking secrets.
+pub fn classify_forwarder_line(raw: &str) -> Option<(crate::ops::Level, String)> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.contains("↑ то же самое") {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if [
+        "proxy-authorization",
+        "x-aiu-gateway-key",
+        "\"proof\"",
+        "device ",
+        ":***@",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+    {
+        return None;
+    }
+    let level = if trimmed.contains("PAID отказ")
+        || trimmed.contains("PAID обрыв")
+        || trimmed.contains("Платный шлюз отклонил")
+        || trimmed.contains("Нет связи с платным шлюзом")
+        || trimmed.contains("обрыв соединения при ответе модели")
+        || trimmed.contains("not started:")
+    {
+        crate::ops::Level::Err
+    } else if trimmed.contains("region-400")
+        || trimmed.contains("отложен на")
+        || trimmed.contains("свой прокси:")
+        || trimmed.contains("через VPN не отвечает")
+        || trimmed.contains("Проверка срока лицензии PAID")
+        || trimmed.contains("PASSTHROUGH")
+        || trimmed.contains("мимо обхода")
+    {
+        crate::ops::Level::Warn
+    } else if trimmed.contains("модель ответила") {
+        crate::ops::Level::Ok
+    } else if trimmed.contains("маршрут гейт-хостов:") || trimmed.contains("PAID -> ") {
+        crate::ops::Level::Info
+    } else {
+        return None;
+    };
+    Some((level, trimmed.to_string()))
+}
+
+fn read_forwarder_delta(
+    path: &std::path::Path,
+    offset: &mut Option<u64>,
+) -> Vec<(crate::ops::Level, String)> {
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return Vec::new();
+    };
+    let Ok(len) = file.metadata().map(|m| m.len()) else {
+        return Vec::new();
+    };
+    let initial = offset.is_none();
+    let start = match *offset {
+        None => len.saturating_sub(FORWARDER_TAIL_BYTES),
+        Some(prev) if len < prev => 0,
+        Some(prev) if len == prev => return Vec::new(),
+        Some(prev) => prev,
+    };
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        return Vec::new();
+    }
+    let to_read = (len - start).min(256 * 1024) as usize;
+    let mut buf = vec![0u8; to_read];
+    let n = match file.read(&mut buf) {
+        Ok(n) => n,
+        Err(_) => return Vec::new(),
+    };
+    buf.truncate(n);
+    let complete_end = match buf.iter().rposition(|&b| b == b'\n') {
+        Some(pos) => pos + 1,
+        None => {
+            if initial {
+                buf.len()
+            } else {
+                return Vec::new();
+            }
+        }
+    };
+    *offset = Some(start + complete_end as u64);
+    let mut slice = &buf[..complete_end];
+    if initial && start > 0 {
+        if let Some(first_nl) = slice.iter().position(|&b| b == b'\n') {
+            slice = &slice[first_nl + 1..];
+        }
+    }
+    let text = String::from_utf8_lossy(slice);
+    let mut entries: Vec<_> = text.lines().filter_map(classify_forwarder_line).collect();
+    if initial && entries.len() > FORWARDER_INITIAL_LINES {
+        entries.drain(..entries.len() - FORWARDER_INITIAL_LINES);
+    }
+    entries
 }
 
 /// How often the two files are looked at. Both reads are a `metadata` and a
@@ -489,6 +618,7 @@ fn watch(tx: Sender<Signal>, wake: Box<dyn Fn() + Send>) {
     // forward without reading the file again.
     let mut found: Option<(crate::ls_log::Sighting, Instant)> = None;
     let mut answered: Option<(crate::ls_log::Sighting, Instant)> = None;
+    let mut dropped: Option<(crate::ls_log::Sighting, Instant)> = None;
     let mut refused_long: Option<(crate::ls_log::Sighting, Instant)> = None;
     let mut verify: Option<(crate::ls_log::Verification, Instant)> = None;
     let mut overloaded: Option<(crate::ls_log::Overload, Instant)> = None;
@@ -504,9 +634,19 @@ fn watch(tx: Sender<Signal>, wake: Box<dyn Fn() + Send>) {
     // when it has looked so.
     let mut net_ok: Option<(bool, Instant)> = None;
     let mut cut_since: Option<Instant> = None;
+    let forwarder_path = crate::dns_forwarder::log_path();
+    let mut forwarder_offset: Option<u64> = None;
 
     loop {
         std::thread::sleep(TICK);
+
+        let proxy_entries = read_forwarder_delta(&forwarder_path, &mut forwarder_offset);
+        if !proxy_entries.is_empty() {
+            if tx.send(Signal::ProxyLog(proxy_entries)).is_err() {
+                return;
+            }
+            wake();
+        }
 
         if listed.elapsed() >= RELIST_EVERY {
             logs = crate::ls_log::candidate_logs();
@@ -534,6 +674,7 @@ fn watch(tx: Sender<Signal>, wake: Box<dyn Fn() + Send>) {
             let at = Instant::now();
             found = h.refused_recent.map(|s| (s, at)).or(found);
             answered = h.answered.map(|s| (s, at)).or(answered);
+            dropped = h.dropped.map(|s| (s, at)).or(dropped);
             refused_long = h.refused.map(|s| (s, at)).or(refused_long);
             verify = h.verify.map(|v| (v, at)).or(verify);
             overloaded = h.overloaded.map(|o| (o, at)).or(overloaded);
@@ -551,6 +692,10 @@ fn watch(tx: Sender<Signal>, wake: Box<dyn Fn() + Send>) {
                 (ago <= RECENT).then_some(crate::ls_log::Sighting { ago, ..s })
             }),
             answered: answered.and_then(|(s, at)| {
+                let ago = s.ago + at.elapsed();
+                (ago <= ANSWER_RECENT).then_some(crate::ls_log::Sighting { ago, ..s })
+            }),
+            dropped: dropped.and_then(|(s, at)| {
                 let ago = s.ago + at.elapsed();
                 (ago <= ANSWER_RECENT).then_some(crate::ls_log::Sighting { ago, ..s })
             }),
@@ -649,11 +794,14 @@ fn worth_sending(fresh: &View, shown: &View) -> bool {
         (a, b) => a.is_some() != b.is_some(),
     };
     let overload_changed = match (&fresh.overloaded, &shown.overloaded) {
-        (Some(a), Some(b)) => a.count != b.count || a.ago < b.ago || a.model != b.model,
+        (Some(a), Some(b)) => {
+            a.count != b.count || a.ago < b.ago || a.kind != b.kind || a.model != b.model
+        }
         (a, b) => a.is_some() != b.is_some(),
     };
     newer(fresh.seen, shown.seen)
         || newer(fresh.answered, shown.answered)
+        || newer(fresh.dropped, shown.dropped)
         || newer(fresh.refused_long, shown.refused_long)
         || newer(fresh.unauthorized, shown.unauthorized)
         || verify_changed
@@ -679,6 +827,7 @@ mod tests {
         let shown = View {
             seen: seen(120, 2),
             answered: None,
+            dropped: None,
             refused_long: None,
             verify: None,
             overloaded: None,
@@ -785,6 +934,7 @@ mod tests {
         let shown = View {
             seen: None,
             answered: None,
+            dropped: None,
             refused_long: None,
             verify: None,
             overloaded: None,
@@ -883,5 +1033,46 @@ mod tests {
         }
         .cut_off());
         assert!(!Report { started_at: 0, ..r }.cut_off());
+    }
+
+    #[test]
+    fn forwarder_line_classification_and_delta_reader_skip_secrets() {
+        assert_eq!(
+            classify_forwarder_line("22:50:57 proxy        PAID отказ [conn=abc123] host=daily-cloudcode-pa.googleapis.com:443 via=eu1-aiu.nova-app.eu:443 stage=pre_connect_status status=503 reason=store_timeout — Сбой проверки лицензии на Витрине (503)").map(|(l, _)| l),
+            Some(crate::ops::Level::Err)
+        );
+        assert_eq!(
+            classify_forwarder_line("22:50:58 proxy        PAID обрыв после CONNECT [conn=abc123] host=daily-cloudcode-pa.googleapis.com:443 stage=tunnel reason=upstream_eof").map(|(l, _)| l),
+            Some(crate::ops::Level::Err)
+        );
+        assert_eq!(
+            classify_forwarder_line("23:07:31 proxy        модель ответила (x1) — маршрут «платный шлюз (PAID)»").map(|(l, _)| l),
+            Some(crate::ops::Level::Ok)
+        );
+        assert!(classify_forwarder_line("22:50:00 proxy        Proxy-Authorization: Device SECRET.PROOF").is_none());
+        assert!(classify_forwarder_line("22:50:01 proxy        ↑ то же самое ещё 2 раз").is_none());
+
+        let dir = std::env::temp_dir().join(format!("ag-gate-fwd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log_file = dir.join("forwarder.log");
+        std::fs::write(
+            &log_file,
+            "00:00:01 proxy        PAID -> daily-cloudcode-pa.googleapis.com:443 [conn=c1] via=eu1:443\n",
+        )
+        .unwrap();
+        let mut offset = None;
+        let first = read_forwarder_delta(&log_file, &mut offset);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].0, crate::ops::Level::Info);
+        assert!(read_forwarder_delta(&log_file, &mut offset).is_empty());
+
+        let mut f = std::fs::OpenOptions::new().append(true).open(&log_file).unwrap();
+        use std::io::Write;
+        writeln!(f, "00:00:02 proxy        PAID обрыв после CONNECT [conn=c1] stage=tunnel reason=upstream_eof").unwrap();
+        let second = read_forwarder_delta(&log_file, &mut offset);
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].0, crate::ops::Level::Err);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

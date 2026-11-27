@@ -362,7 +362,7 @@ pub fn set_clipboard_text(text: &str) -> bool {
 /// point is a file the user can find and attach without being told a path, and
 /// a Desktop collecting `отчёт (7).txt` is its own kind of mess. Pressing the
 /// button again replaces it.
-pub const REPORT_FILE: &str = "Antigravity Unlocker - отчёт.txt";
+pub const REPORT_FILE: &str = "AI Unlocker - отчёт.txt";
 
 /// The user's Desktop.
 ///

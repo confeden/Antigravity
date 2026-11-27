@@ -1,4 +1,4 @@
-# Antigravity Unlocker - terminal mode in one command (Windows 10/11):
+# AI Unlocker - terminal mode in one command (Windows 10/11):
 #
 #   PowerShell:  irm https://raw.githubusercontent.com/confeden/Antigravity/main/tui.ps1 | iex
 #   cmd:         powershell -NoProfile -c "irm https://raw.githubusercontent.com/confeden/Antigravity/main/tui.ps1 | iex"
@@ -43,20 +43,29 @@
         if (-not (Test-Path $exe)) { throw "Could not find the latest version on github.com/$repo." }
         Write-Host 'GitHub did not answer - starting the copy downloaded before.'
     } elseif (-not (Test-Path $exe) -or (Get-Content $stamp -ErrorAction SilentlyContinue) -ne $ver) {
-        Write-Host "Downloading Antigravity Unlocker $ver ..."
+        Write-Host "Downloading AI Unlocker $ver ..."
         New-Item -ItemType Directory -Force $dir | Out-Null
         # The tag spells a fourth number with a dot (v2.24.0.1), the asset with an
         # underscore (AG_2.24.0_1.exe): try both.
         $alt = $ver -replace '\.(\d+)$', '_$1'
         $got = $false
-        foreach ($cand in @($ver, $alt)) {
-            try {
-                Invoke-WebRequest -UseBasicParsing "https://github.com/$repo/releases/download/$tag/AG_$cand.exe" -OutFile "$exe.part"
-                $got = $true
-                break
-            } catch {}
+        $downloadError = $null
+        foreach ($suffix in @('_portable', '')) {
+            foreach ($cand in @($ver, $alt) | Select-Object -Unique) {
+                try {
+                    Invoke-WebRequest -UseBasicParsing "https://github.com/$repo/releases/download/$tag/AG_$cand$suffix.exe" -OutFile "$exe.part"
+                    $kind = ([string][Diagnostics.FileVersionInfo]::GetVersionInfo("$exe.part").FileDescription).Trim()
+                    if ($kind -eq 'AI Unlocker Setup') { throw "Windows portable asset is missing in release $tag." }
+                    $got = $true
+                    break
+                } catch {
+                    $downloadError = $_
+                    if (!$_.Exception.Response -or [int]$_.Exception.Response.StatusCode -ne 404) { throw }
+                }
+            }
+            if ($got) { break }
         }
-        if (-not $got) { throw "No AG_$ver.exe in release $tag." }
+        if (!$got) { throw "No Windows program in release $tag. $downloadError" }
         try {
             Move-Item -Force "$exe.part" $exe
             Set-Content -Path $stamp -Value $ver

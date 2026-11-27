@@ -196,8 +196,8 @@ fn main() {
     if env::var("CARGO_CFG_TARGET_OS").unwrap() == "windows" {
         let mut res = winres::WindowsResource::new();
         res.set_icon("icon.ico");
-        res.set("FileDescription", "Antigravity Configuration Tool");
-        res.set("ProductName", "Antigravity Configurator");
+        res.set("FileDescription", "AI Unlocker");
+        res.set("ProductName", "AI Unlocker");
         res.set("LegalCopyright", "Brent t.me/nova_txt");
         // Copyright management information in the version resource: survives
         // UPX (the resource directory stays readable on the packed file) and is

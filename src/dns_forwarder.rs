@@ -169,7 +169,13 @@ pub const LISTEN_PORT: u16 = 53;
 ///     one kills the server alone and the app gives up on it after three restarts.
 /// 49 = DNS-AI is the only built-in DNS provider; NRPT has only the local relay.
 /// 50 = Report observed VPN egress for the relay's open gate connections.
-pub const RELAY_VERSION: u32 = 50;
+/// 51 = Desktop patches before the installer-requested shortcut launch and
+///      the watchdog leaves a running Desktop alone.
+/// 54 = Dedicated PAID loopback proxy on port 53130 separated from FREE port 53129.
+/// 55 = Desktop per-process opt-out from shared PAID proxy port 53130 via Windows socket owner.
+/// 56 = PAID gateway diagnostics (conn ID, stage, reason), post-CONNECT drop logging, and PAID tunnel attribution.
+/// 57 = Backpressure-safe upload buffering in tls_pump_report (fixes >100 KB unexpected EOF) and clean TLS EOF handling.
+pub const RELAY_VERSION: u32 = 57;
 
 /// Written where an unelevated relay can write and an unelevated unlocker can
 /// read. Absent means a relay from before versioning, i.e. older than anything.
@@ -855,15 +861,37 @@ fn on_drops(count: usize, at: Instant, host: Option<&str>, answered_after: bool)
         return;
     }
     let streak = DROP_STREAK.fetch_add(count, Relaxed) + count;
-    let carried = routes::attribute_tunnel(at, host);
-    let label = carried.map_or("не наш", |(k, _)| k.label());
+    let carried = routes::attribute_any(at, host);
+    let label = match &carried {
+        Some(routes::Attributed::Free(kind, _)) => kind.label(),
+        Some(routes::Attributed::Paid(_, _)) => routes::PAID_LABEL,
+        None => "не наш",
+    };
+    if let Some(routes::Attributed::Paid(_, conn_id)) = &carried {
+        log_proxy(&format!(
+            "обрыв соединения при ответе модели (маршрут «{}», conn={}, подряд {})",
+            routes::PAID_LABEL,
+            conn_id,
+            streak
+        ));
+        gate::record_paid_error(gate::PaidFailure {
+            at: gate::now_unix(),
+            conn_id: conn_id.clone(),
+            host: host.unwrap_or("daily-cloudcode-pa.googleapis.com").to_string(),
+            stage: "tunnel".into(),
+            status: 200,
+            reason: "stream_eof".into(),
+            summary: "Запрос к модели через платный шлюз оборвался".into(),
+        });
+        return;
+    }
     if streak < DROP_BENCH_AT {
         log_proxy(&format!(
             "обрыв соединения при ответе модели (маршрут «{label}») — первый, повтор клиента идёт тем же путём"
         ));
         return;
     }
-    let Some((kind, _)) = carried else {
+    let Some(routes::Attributed::Free(kind, _)) = carried else {
         log_proxy(&format!(
             "обрыв соединения при ответе модели {streak} раз подряд, но не через наш маршрут — переключать нечего"
         ));
@@ -1068,23 +1096,29 @@ fn on_refusals(count: usize, at: Instant, host: Option<&str>) {
 
 fn on_answers(count: usize, at: Instant, host: Option<&str>) {
     DROP_STREAK.store(0, std::sync::atomic::Ordering::Relaxed);
-    let carried = routes::attribute_tunnel(at, host);
-    if let Some((kind, tunnel)) = carried {
-        routes::credit(kind);
-        // The tunnel as well as the route: while *it* is open the answer is
-        // still arriving, and nothing is allowed to bench or cut it (D32).
-        routes::credit_tunnel(tunnel);
-        if let Some((host, ip)) = routes::dns_endpoint(tunnel) {
-            crate::dns_route::feedback(&host, ip, true);
+    let carried = routes::attribute_any(at, host);
+    match &carried {
+        Some(routes::Attributed::Free(kind, tunnel)) => {
+            routes::credit(*kind);
+            // The tunnel as well as the route: while *it* is open the answer is
+            // still arriving, and nothing is allowed to bench or cut it (D32).
+            routes::credit_tunnel(*tunnel);
+            if let Some((host, ip)) = routes::dns_endpoint(*tunnel) {
+                crate::dns_route::feedback(&host, ip, true);
+            }
+            // A model answer is the one thing that settles whether the relay works,
+            // so it clears the relay's dud streak and lifts any bench: a client fans
+            // out several gate tunnels and the short ancillary ones the relay closes
+            // early otherwise read as an outage and park a working relay on the slow
+            // route (no-op in a build without the relay module).
+            if *kind == routes::Kind::Relay {
+                crate::proxy::note_relay_answer();
+            }
         }
-        // A model answer is the one thing that settles whether the relay works,
-        // so it clears the relay's dud streak and lifts any bench: a client fans
-        // out several gate tunnels and the short ancillary ones the relay closes
-        // early otherwise read as an outage and park a working relay on the slow
-        // route (no-op in a build without the relay module).
-        if kind == routes::Kind::Relay {
-            crate::proxy::note_relay_answer();
+        Some(routes::Attributed::Paid(id, _)) => {
+            routes::credit_paid_tunnel(*id);
         }
+        None => {}
     }
     // One line a minute at most: a user in a long session produces an answer
     // every few seconds, and the log is 64 KB. What is held back is *counted*,
@@ -1101,7 +1135,11 @@ fn on_answers(count: usize, at: Instant, host: Option<&str>) {
         held: 0,
         route: None,
     });
-    let label = carried.map_or("не наш", |(k, _)| k.label());
+    let label = match &carried {
+        Some(routes::Attributed::Free(kind, _)) => kind.label(),
+        Some(routes::Attributed::Paid(_, _)) => routes::PAID_LABEL,
+        None => "не наш",
+    };
     let mut lines: Vec<(usize, &'static str)> = Vec::new();
     if let Ok(mut g) = LAST_LINE.lock() {
         // A change of route ends the old line first: what was held back came
@@ -1126,7 +1164,12 @@ fn on_answers(count: usize, at: Instant, host: Option<&str>) {
             held, route
         ));
     }
-    gate::record_answer(carried.map(|(k, _)| k.label()));
+    let route_proof = match carried {
+        Some(routes::Attributed::Free(kind, _)) => Some(kind.label()),
+        Some(routes::Attributed::Paid(_, _)) => Some(routes::PAID_LABEL),
+        None => None,
+    };
+    gate::record_answer(route_proof);
 }
 
 /// How long one refusal through a tunnel the relay stood down for keeps
@@ -1195,6 +1238,11 @@ pub fn run() -> Result<(), String> {
             log_proxy(&format!("not started: {}", e));
         }
     });
+    thread::spawn(|| {
+        if let Err(e) = proxy::run_paid() {
+            log_proxy(&format!("paid proxy not started: {}", e));
+        }
+    });
     // The gate hosts' own door (`loopback`). If it cannot be bound the relay
     // keeps answering with substituted addresses, exactly as before.
     thread::spawn(|| {
@@ -1220,6 +1268,11 @@ pub fn run_proxy_service() -> Result<(), String> {
     crate::dns_route::start();
     thread::spawn(watch_client_logs);
     spawn_proxy_env_maintainer();
+    thread::spawn(|| {
+        if let Err(e) = proxy::run_paid() {
+            log_proxy(&format!("paid proxy not started: {}", e));
+        }
+    });
     proxy::run(0)
 }
 
@@ -1239,6 +1292,42 @@ fn spawn_proxy_env_maintainer() {
         }
         let mut waiting_said = false;
         loop {
+            if crate::paid::antigravity_env_paid() {
+                let Some(port) = proxy::wait_for_our_paid_listener(PROXY_START_BUDGET) else {
+                    if !waiting_said {
+                        log_proxy(&format!(
+                            "{} не выставлена: платный прокси не поднялся",
+                            var
+                        ));
+                        waiting_said = true;
+                    }
+                    continue;
+                };
+                waiting_said = false;
+                let url = proxy::url_at(port);
+                match crate::endpoint::ensure_proxy_env(&url) {
+                    Ok(crate::endpoint::Outcome::Applied) => {
+                        log_proxy(&format!("{} указывает на платный прокси", var))
+                    }
+                    Ok(crate::endpoint::Outcome::AlreadySet) => {}
+                    Err(e) => log_proxy(&format!("{} не выставлена: {}", var, e)),
+                }
+                thread::sleep(proxy::REBIND_EVERY);
+                continue;
+            }
+            if crate::paid::antigravity_enabled() {
+                if crate::endpoint::proxy_env_is_ours() {
+                    match crate::endpoint::remove_proxy(&proxy::proxy_url(), "") {
+                        Ok(()) => log_proxy(&format!(
+                            "{} снята: для Antigravity IDE используется встроенный PAID-прокси",
+                            var
+                        )),
+                        Err(e) => log_proxy(&format!("{} не снята: {}", var, e)),
+                    }
+                }
+                thread::sleep(proxy::REBIND_EVERY);
+                continue;
+            }
             // The port that answered is the one named: the proxy may have moved
             // while this waited (P26), and only our own listener counts - not a
             // program of someone else's answering on the default port.

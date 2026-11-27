@@ -107,10 +107,13 @@ pub struct Facts {
     pub refusal: Option<(Duration, usize)>,
     /// The newest model answer in a client log, how long ago.
     pub answer: Option<Duration>,
+    /// The newest model generation connection drop, how long ago.
+    pub dropped: Option<Duration>,
+    /// The newest PAID gateway refusal or post-CONNECT drop, without secrets.
+    pub paid_error: Option<(Duration, crate::gate::PaidFailure)>,
     /// The relay's answer to that refusal, when it wrote one after it.
     pub answered: Option<Answered>,
-    /// The route the relay credited with the last answer, or the one it would
-    /// use now.
+    /// The route the relay credited with the last answer.
     pub route: Option<String>,
     /// What keeps the local proxy from listening, as the relay diagnosed it.
     pub proxy_blocked: Option<crate::gate::Blocker>,
@@ -131,9 +134,9 @@ pub struct Facts {
     /// The newest time Google asked for the account to be verified: how long
     /// ago, and the page it gave. `headline` decides whether it still stands.
     pub verify: Option<(Duration, String)>,
-    /// The newest 503 "no capacity" in the last ten minutes: how long ago, and
-    /// the model it named (empty if none).
-    pub overloaded: Option<(Duration, String)>,
+    /// The newest 503 "no capacity" or 429 token/credit exhaustion in the last ten minutes:
+    /// how long ago, kind, and the model it named (empty if none).
+    pub overloaded: Option<(Duration, crate::ls_log::OverloadKind, String)>,
     /// The newest 401 in the last ten minutes: how long ago, and how many.
     pub unauthorized: Option<(Duration, usize)>,
 }
@@ -199,25 +202,25 @@ impl Facts {
                     bypassed: e.bypassed,
                 })
         });
-        // The path of the last answer when the relay saw one recently - and then
-        // exactly that, empty included: an answer no tunnel of ours carried went
-        // around us, and naming the route we would have used instead would be a
-        // claim about traffic that never touched it. Otherwise the route in force.
-        let route = relay.and_then(|r| {
-            let recent_ok = r.last_ok.as_ref().filter(|ok| {
-                crate::gate::now_unix().saturating_sub(ok.at)
-                    <= crate::gate::ANSWER_RECENT.as_secs()
-            });
-            match recent_ok {
-                Some(ok) => (!ok.route.is_empty()).then(|| ok.route.clone()),
-                None => (!r.route.is_empty()).then(|| r.route.clone()),
-            }
+        let paid_antigravity = crate::paid::antigravity_enabled();
+        let paid_error = relay.and_then(|r| r.last_paid_error.as_ref()).and_then(|err| {
+            let now = crate::gate::now_unix();
+            let err_ago = Duration::from_secs(now.saturating_sub(err.at));
+            (err_ago <= crate::gate::RECENT).then(|| (err_ago, err.clone()))
+        });
+        let route = answer.and_then(|ago| {
+            let answer_at = crate::gate::now_unix().saturating_sub(ago.as_secs());
+            let proof = relay?.last_ok.as_ref()?;
+            (proof.at.saturating_add(EPISODE_SLACK) >= answer_at
+                && proof.at <= answer_at.saturating_add(10)
+                && !proof.route.is_empty())
+            .then(|| proof.route.clone())
         });
         Facts {
             admin: s.admin || !cfg!(target_os = "windows"),
             installs_found: s.installs.iter().any(|r| r.path.is_some()),
             patch_on: s.client_patch.is_on(),
-            bypass_on: s.bypass_on(),
+            bypass_on: paid_antigravity || s.bypass_on(),
             relay_running: s.relay_running,
             relay_uses_vpn: s.relay_running
                 && (relay.is_some_and(|r| r.vpn_traffic)
@@ -228,10 +231,12 @@ impl Facts {
             relay_outdated: s.relay_outdated,
             // Rules are only owed while the DNS switch is on: a route running alone
             // (own proxy, group, exits) has none by design.
-            rules: s.rules || !s.dns.is_on() || !cfg!(target_os = "windows"),
+            rules: paid_antigravity || s.rules || !s.dns.is_on() || !cfg!(target_os = "windows"),
             relay_reporting: relay.is_some(),
             refusal,
             answer,
+            dropped: gate.dropped.map(|s| aged(s.ago)),
+            paid_error,
             answered,
             route,
             proxy_blocked: blocker(relay, "proxy"),
@@ -244,7 +249,7 @@ impl Facts {
             overloaded: gate
                 .overloaded
                 .as_ref()
-                .map(|o| (aged(o.ago), o.model.clone())),
+                .map(|o| (aged(o.ago), o.kind, o.model.clone())),
             unauthorized: gate.unauthorized.map(|u| (aged(u.ago), u.count)),
         }
     }
@@ -303,7 +308,7 @@ pub fn switch_text(cap: Cap) -> (&'static str, &'static str) {
              сам. Содержимое не расшифровывается — посредник только передаёт байты.",
         ),
         Cap::GroupProxy => (
-            "Прокси из группы",
+            "Лицензия FREE",
             "Выделенный сервер группы: через него идут только запросы к моделям.",
         ),
         Cap::OwnProxy => (
@@ -488,26 +493,42 @@ pub fn headline(f: &Facts) -> Headline {
             action: None,
         };
     }
-    // A refusal newer than the 503 is the news; the 503 was an earlier turn.
-    let overloaded = f.overloaded.as_ref().filter(|(ago, _)| {
-        *ago <= crate::gate::RECENT && unanswered(*ago) && f.refusal.is_none_or(|(r, _)| r > *ago)
+    // A refusal newer than the 503/429 is the news; the 503/429 was an earlier turn.
+    let overloaded = f.overloaded.as_ref().filter(|(ago, _, _)| {
+        *ago <= crate::gate::RECENT
+            && unanswered(*ago)
+            && f.refusal.is_none_or(|(r, _)| r > *ago)
+            && f.dropped.is_none_or(|d| d > *ago)
     });
-    if let Some((ago, model)) = overloaded {
+    if let Some((ago, kind, model)) = overloaded {
         let which = if model.is_empty() {
             String::new()
         } else {
             format!(" для модели «{model}»")
         };
-        return Headline {
-            tone: Tone::Action,
-            title: "Серверы Google перегружены".into(),
-            detail: format!(
-                "Google отвечает ошибкой 503 — {}: нет свободных мощностей{which}. Обход тут ни \
-                 при чём — запрос до Google дошёл. Рекомендуется выбрать в Antigravity другую \
-                 модель или повторить позже.",
-                ago_text(*ago)
-            ),
-            action: None,
+        return match kind {
+            crate::ls_log::OverloadKind::Capacity => Headline {
+                tone: Tone::Action,
+                title: "Серверы Google перегружены".into(),
+                detail: format!(
+                    "Google отвечает ошибкой 503 — {}: нет свободных мощностей{which}. Обход тут ни \
+                     при чём — запрос до Google дошёл. Рекомендуется выбрать в Antigravity другую \
+                     модель или повторить позже.",
+                    ago_text(*ago)
+                ),
+                action: None,
+            },
+            crate::ls_log::OverloadKind::Quota => Headline {
+                tone: Tone::Action,
+                title: "Закончился лимит токенов".into(),
+                detail: format!(
+                    "Google отвечает ошибкой 429 — {}: исчерпан лимит токенов или кредитов \
+                     аккаунта{which}. Обход тут ни при чём — запрос до Google дошёл. Выберите в \
+                     Antigravity другую модель, смените аккаунт или дождитесь обновления лимита.",
+                    ago_text(*ago)
+                ),
+                action: None,
+            },
         };
     }
 
@@ -601,6 +622,51 @@ pub fn headline(f: &Facts) -> Headline {
             }
             None => {}
         }
+    }
+
+    if let Some(ago) = f
+        .dropped
+        .filter(|ago| unanswered(*ago) && f.refusal.is_none_or(|(r, _)| r > *ago))
+    {
+        let extra = f
+            .paid_error
+            .as_ref()
+            .filter(|(err_ago, _)| unanswered(*err_ago))
+            .map(|(_, err)| {
+                format!(
+                    " {} ({}, ID {}). Подробности — во вкладке «Журнал».",
+                    err.summary, err.host, err.conn_id
+                )
+            })
+            .unwrap_or_default();
+        return Headline {
+            tone: Tone::Action,
+            title: "Запрос к модели оборвался".into(),
+            detail: format!(
+                "Antigravity потерял соединение {}.{extra} Отправьте сообщение ещё раз, чтобы проверить подключение.",
+                ago_text(ago)
+            ),
+            action: None,
+        };
+    }
+
+    if let Some((err_ago, err)) = f
+        .paid_error
+        .as_ref()
+        .filter(|(ago, _)| unanswered(*ago) && f.refusal.is_none_or(|(r, _)| r > *ago))
+    {
+        return Headline {
+            tone: Tone::Action,
+            title: "Сбой платного шлюза".into(),
+            detail: format!(
+                "{} ({}, ID {}) — {}. Подробности — во вкладке «Журнал».",
+                err.summary,
+                err.host,
+                err.conn_id,
+                ago_text(*err_ago)
+            ),
+            action: None,
+        };
     }
 
     // A refusal newer than the newest answer is the live problem.
@@ -1131,7 +1197,11 @@ mod tests {
     #[test]
     fn a_503_asks_for_another_model_until_an_answer_follows() {
         let busy = Facts {
-            overloaded: Some((secs(60), "gemini-3.8-flash-high".into())),
+            overloaded: Some((
+                secs(60),
+                crate::ls_log::OverloadKind::Capacity,
+                "gemini-3.8-flash-high".into(),
+            )),
             answer: Some(secs(900)),
             ..working()
         };
@@ -1141,18 +1211,63 @@ mod tests {
         assert!(h.detail.contains("другую"), "{}", h.detail);
 
         let answered = Facts {
-            overloaded: Some((secs(60), String::new())),
+            overloaded: Some((
+                secs(60),
+                crate::ls_log::OverloadKind::Capacity,
+                String::new(),
+            )),
             answer: Some(secs(10)),
             ..working()
         };
         assert_ne!(headline(&answered).title, "Серверы Google перегружены");
 
         let refused_after = Facts {
-            overloaded: Some((secs(300), String::new())),
+            overloaded: Some((
+                secs(300),
+                crate::ls_log::OverloadKind::Capacity,
+                String::new(),
+            )),
             refusal: Some((secs(30), 4)),
             ..working()
         };
         assert_ne!(headline(&refused_after).title, "Серверы Google перегружены");
+    }
+
+    #[test]
+    fn a_429_reports_token_limit_exhausted() {
+        let quota = Facts {
+            overloaded: Some((secs(45), crate::ls_log::OverloadKind::Quota, String::new())),
+            answer: Some(secs(900)),
+            ..working()
+        };
+        let h = headline(&quota);
+        assert_eq!(h.title, "Закончился лимит токенов");
+        assert!(h.detail.contains("429"), "{}", h.detail);
+        assert!(h.detail.contains("лимит токенов"), "{}", h.detail);
+
+        let answered = Facts {
+            answer: Some(secs(10)),
+            ..quota.clone()
+        };
+        assert_ne!(headline(&answered).title, "Закончился лимит токенов");
+
+        let refused_after = Facts {
+            refusal: Some((secs(20), 4)),
+            ..quota
+        };
+        assert_ne!(headline(&refused_after).title, "Закончился лимит токенов");
+    }
+
+    #[test]
+    fn a_dropped_generation_supersedes_an_old_answer() {
+        let mut f = Facts {
+            answer: Some(secs(2100)),
+            dropped: Some(secs(30)),
+            ..working()
+        };
+        assert_eq!(headline(&f).title, "Запрос к модели оборвался");
+        f.answer = Some(secs(5));
+        assert_eq!(headline(&f).tone, Tone::Ok);
     }
 
     /// A 401 that keeps coming is a credential Google no longer accepts: the
@@ -1179,5 +1294,113 @@ mod tests {
             ..working()
         };
         assert_ne!(headline(&answered).title, h.title);
+    }
+
+    #[test]
+    fn paid_error_and_dropped_with_cause_surface_conn_id_and_summary() {
+        let err = crate::gate::PaidFailure {
+            at: crate::gate::now_unix().saturating_sub(15),
+            conn_id: "c778899".into(),
+            host: "daily-cloudcode-pa.googleapis.com:443".into(),
+            stage: "pre_connect_status".into(),
+            status: 503,
+            reason: "store_timeout".into(),
+            summary: "Сбой проверки лицензии на Витрине (503)".into(),
+        };
+        let f_only = Facts {
+            paid_error: Some((secs(15), err.clone())),
+            answer: Some(secs(600)),
+            ..working()
+        };
+        let h_only = headline(&f_only);
+        assert_eq!(h_only.tone, Tone::Action);
+        assert_eq!(h_only.title, "Сбой платного шлюза");
+        assert!(h_only.detail.contains("c778899"), "{}", h_only.detail);
+        assert!(h_only.detail.contains("Витрине (503)"), "{}", h_only.detail);
+
+        let f_drop = Facts {
+            dropped: Some(secs(10)),
+            paid_error: Some((secs(12), err)),
+            answer: Some(secs(600)),
+            ..working()
+        };
+        let h_drop = headline(&f_drop);
+        assert_eq!(h_drop.title, "Запрос к модели оборвался");
+        assert!(h_drop.detail.contains("c778899"), "{}", h_drop.detail);
+        assert!(h_drop.detail.contains("Журнал"), "{}", h_drop.detail);
+
+        let recovered = Facts {
+            answer: Some(secs(2)),
+            ..f_drop
+        };
+        assert_eq!(headline(&recovered).tone, Tone::Ok);
+    }
+
+    #[test]
+    fn facts_read_requires_relay_last_ok_proof_for_route_badge() {
+        let mut s = Status {
+            admin: true,
+            installs: Vec::new(),
+            client_patch: crate::ops::State::On,
+            watchdog: crate::ops::State::On,
+            dns: crate::ops::State::On,
+            local_proxy: crate::ops::State::On,
+            own_proxy: crate::ops::State::Off,
+            group_proxy: crate::ops::State::Off,
+            own_proxy_configured: false,
+            group_proxy_configured: false,
+            dns_rotation: crate::ops::State::Off,
+            vpn: None,
+            own_proxy_text: String::new(),
+            custom_dns_text: String::new(),
+            relay_outdated: false,
+            relay_running: true,
+            rules: true,
+            providers: Vec::new(),
+            paid_apps: Vec::new(),
+            relay_egress: None,
+        };
+        s.installs.push(crate::ops::InstallRow {
+            label: "Antigravity 2.0",
+            path: Some("C:\\AG".into()),
+            patched: Some(true),
+            manual: false,
+        });
+        let now = crate::gate::now_unix();
+        let no_proof_view = View {
+            answered: Some(crate::ls_log::Sighting {
+                ago: secs(10),
+                count: 1,
+            }),
+            relay: Some(crate::gate::Report {
+                at: now,
+                last_ok: None,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let facts_no_proof = Facts::read(&s, &no_proof_view, Duration::ZERO);
+        assert_eq!(facts_no_proof.route, None);
+
+        let paid_proof_view = View {
+            answered: Some(crate::ls_log::Sighting {
+                ago: secs(2),
+                count: 1,
+            }),
+            relay: Some(crate::gate::Report {
+                at: now,
+                last_ok: Some(crate::gate::Proof {
+                    at: now.saturating_sub(2),
+                    route: crate::routes::PAID_LABEL.into(),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let facts_paid_proof = Facts::read(&s, &paid_proof_view, Duration::ZERO);
+        assert_eq!(
+            facts_paid_proof.route.as_deref(),
+            Some(crate::routes::PAID_LABEL)
+        );
     }
 }

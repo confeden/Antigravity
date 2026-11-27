@@ -1,8 +1,8 @@
 [package]
 name = "ag_unlocker"
-version = "2.35.0"
+version = "2.35.2"
 edition = "2021"
-description = "Antigravity Configuration Tool"
+description = "AI Unlocker"
 authors = ["Brent t.me/nova_txt"]
 
 [dependencies]
@@ -17,11 +17,8 @@ webpki-roots = "1"
 # Decrypts the relay credential baked in by build.rs (owner build only; the
 # private src/relay.rs is the only user).
 aes-gcm = "0.10"
-# Reading the clipboard (right-click on the licence field pastes into it). Not a
-# new dependency in any real sense: eframe's own clipboard support is arboard, so
-# the crate is already linked in - this only asks it a question egui does not
-# expose. `default-features = false` because the image half is eframe's business,
-# not ours; features unify, so the build is unchanged either way.
+# Clipboard access shared by the GUI and TUI. eframe already links arboard.
+# The app only needs text, so image features are left to eframe.
 arboard = { version = "3.6", default-features = false }
 # The one socket `TcpStream` cannot build: IP_UNICAST_IF has to be set before
 # `connect`, and std creates and connects in one call. Pins the relay's own
@@ -45,7 +42,7 @@ ratatui = { version = "0.30", default-features = false, features = ["crossterm"]
 # window ever opened, whichever adapter would have been chosen. D3D12 and its
 # software rasteriser WARP ship with every Windows 10, so nothing else is needed.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Threading", "Win32_System_RemoteDesktop", "Win32_System_Diagnostics_Debug"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Threading", "Win32_System_RemoteDesktop", "Win32_System_Diagnostics_Debug", "Win32_System_Diagnostics_ToolHelp"] }
 eframe = { version = "0.36", default-features = false, features = ["accesskit", "default_fonts", "links", "wgpu_no_default_features", "glow"] }
 wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "wgsl", "dx12"] }
 

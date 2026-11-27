@@ -79,7 +79,10 @@ pub fn answer_for(host: &str) -> Option<Ipv4Addr> {
 /// asked for Antigravity not to go through it, and this is the same proxy by a
 /// different door.
 pub fn active() -> bool {
-    BOUND.load(Ordering::Relaxed) && crate::proxy::bound() && crate::settings::local_proxy_wanted()
+    !crate::paid::antigravity_enabled()
+        && BOUND.load(Ordering::Relaxed)
+        && crate::proxy::bound()
+        && crate::settings::local_proxy_wanted()
 }
 
 /// Binds every listener, then serves them until the process ends. While they

@@ -1,15 +1,272 @@
-//! A Desktop launch barrier cleanup. IFEO is retired: intercepting Chromium
-//! child processes breaks Mojo IPC and Sandbox (N38, G94).
-use std::ffi::OsStr;
-use std::os::windows::ffi::OsStrExt;
+//! The NSIS installer opens the preserved Start Menu shortcut after installing.
+//! Only that shortcut uses the helper. IFEO remains retired (N38, G94).
+use std::ffi::{OsStr, OsString};
+use std::io;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::ptr;
+use std::time::{Duration, Instant};
 
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, ERROR_INVALID_PARAMETER, ERROR_NO_MORE_FILES, HANDLE, INVALID_HANDLE_VALUE,
+    WAIT_OBJECT_0,
+};
+use windows_sys::Win32::System::Diagnostics::ToolHelp::*;
 use windows_sys::Win32::System::Threading::*;
 
 pub const FLAG: &str = "--desktop-launch";
+pub const SHORTCUT_FLAG: &str = "--desktop-shortcut";
 const OWNER: &str = "AGUnlocker";
+
+pub fn shortcut_helper() -> PathBuf {
+    crate::dns_forwarder::log_dir().join("ag_launch.exe")
+}
+
+// The Desktop NSIS install owns a per-user Antigravity.lnk and sets KeepShortcuts.
+// Only opt in an uncustomized target and keep the link's icon and other metadata.
+const SHORTCUT_SCRIPT: &str = r#"
+function Get-LauncherDigest($file) {
+    $stream = [IO.File]::OpenRead($file)
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { [Convert]::ToBase64String($sha.ComputeHash($stream)) }
+    finally { $stream.Dispose(); $sha.Dispose() }
+}
+if (!(Test-Path -LiteralPath $path -PathType Leaf)) { return }
+$link = (New-Object -ComObject WScript.Shell).CreateShortcut($path)
+if (!$enable) {
+    if ($link.TargetPath -ne $helper) { return }
+    if ($link.Arguments -notmatch ('^' + [regex]::Escape($flag) + ' "([^"]+)"$')) {
+        throw 'Unexpected arguments on the Unlocker launch shortcut'
+    }
+    $link.TargetPath = $Matches[1]
+    $link.Arguments = ''
+    $link.Save()
+    return
+}
+if ($link.TargetPath -eq $helper -and $link.Arguments -ne ($flag + ' "' + $app + '"')) {
+    throw 'Unexpected arguments on the Unlocker launch shortcut'
+}
+if ($link.TargetPath -ne $helper -and ($link.TargetPath -ne $app -or $link.Arguments)) { return }
+if (!(Test-Path -LiteralPath $helper -PathType Leaf) -or
+    (Get-LauncherDigest $helper) -cne (Get-LauncherDigest $source)) {
+    [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($helper))
+    $temp = $helper + '.' + $PID + '.tmp'
+    try {
+        [IO.File]::Copy($source, $temp)
+        if ([IO.File]::Exists($helper)) { [IO.File]::Replace($temp, $helper, [NullString]::Value) }
+        else { [IO.File]::Move($temp, $helper) }
+    } finally {
+        if ([IO.File]::Exists($temp)) { [IO.File]::Delete($temp) }
+    }
+}
+if ($link.TargetPath -eq $helper) { return }
+if ($link.IconLocation -eq ',0') { $link.IconLocation = $app + ',0' }
+$link.TargetPath = $helper
+$link.Arguments = $flag + ' "' + $app + '"'
+$link.Save()
+"#;
+
+pub fn arm_shortcut() -> Result<(), String> {
+    if updater_busy(&crate::watchdog::updater_dirs()).map_err(|e| e.to_string())? {
+        return Ok(());
+    }
+    configure_shortcut(true)
+}
+
+pub fn restore_shortcut() -> Result<(), String> {
+    configure_shortcut(false)
+}
+
+fn configure_shortcut(enable: bool) -> Result<(), String> {
+    let quote = |p: &Path| p.to_string_lossy().replace('\'', "''");
+    let enable = if enable { "$true" } else { "$false" };
+    let script = format!(
+        r#"$ErrorActionPreference='Stop'; $enable={enable}; $flag='{SHORTCUT_FLAG}';
+$helper='{helper}'; $source='{source}';
+$path=Join-Path ([Environment]::GetFolderPath('Programs')) 'Antigravity.lnk';
+if ($enable) {{
+    $key = 'HKCU:\Software\121a0be4-63bd-531e-acf8-fc3924c7e984';
+    if (!(Test-Path -LiteralPath $key)) {{ return }}
+    $install = Get-ItemProperty -LiteralPath $key;
+    if ($install.KeepShortcuts -ne 'true' -or $install.ShortcutName -ne 'Antigravity' -or
+        $install.MenuDirectory -or !$install.InstallLocation) {{ return }}
+    $app = Join-Path $install.InstallLocation 'Antigravity.exe';
+    if (!(Test-Path -LiteralPath $app -PathType Leaf)) {{ return }}
+}}
+{SHORTCUT_SCRIPT}"#,
+        helper = quote(&shortcut_helper()),
+        source = quote(&crate::background::installed_exe()),
+    );
+    let output = crate::utils::powershell_within(&script, Duration::from_secs(8))
+        .ok_or("Desktop shortcut: PowerShell timed out")?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Desktop shortcut: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
+pub fn run_shortcut() {
+    let mut args = std::env::args_os().skip(2);
+    let Some(app) = args.next().map(PathBuf::from).filter(|p| is_desktop_exe(p)) else {
+        report_launch_error("Unexpected Desktop path");
+        return;
+    };
+    let args: Vec<_> = args.collect();
+    if args.iter().any(|a| a == "--updated") && crate::settings::auto_patch_wanted() {
+        let server = app
+            .with_file_name("resources")
+            .join("bin")
+            .join("language_server.exe");
+        if let Err(e) = patch_after_update(&server, &crate::watchdog::updater_dirs()) {
+            crate::watchdog::log(&format!("Desktop update patch skipped: {e}"));
+        }
+    }
+    if let Err(e) = Command::new(&app).args(args).spawn() {
+        report_launch_error(&e.to_string());
+    }
+}
+
+fn is_desktop_exe(path: &Path) -> bool {
+    path.is_absolute()
+        && path
+            .file_name()
+            .is_some_and(|name| name.eq_ignore_ascii_case("Antigravity.exe"))
+}
+
+fn patch_after_update(server: &Path, dirs: &[PathBuf]) -> Result<(), String> {
+    use crate::patch_binary::{self, RepatchOutcome::*};
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while updater_busy(dirs).map_err(|e| format!("could not check installer: {e}"))? {
+        if Instant::now() >= deadline {
+            return Err("installer is still running".into());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    match patch_binary::repatch_before_launch(server) {
+        Repatched(n) => {
+            crate::watchdog::log(&format!("Desktop launch after update: patched ({n})"));
+            Ok(())
+        }
+        AlreadyPatched => Ok(()),
+        SignatureMissing => Err("language server signature not recognized".into()),
+        Deferred(e) | Failed(e) => Err(e),
+    }
+}
+
+fn report_launch_error(error: &str) {
+    crate::watchdog::log(&format!("Desktop launch failed: {error}"));
+    crate::utils::message_box(crate::APP_NAME, error);
+    std::process::exit(1);
+}
+
+/// Check the staged NSIS image and electron-updater's fallback installer by
+/// process image path. The observer never opens the installer file for writing.
+pub(crate) fn updater_busy(dirs: &[PathBuf]) -> io::Result<bool> {
+    let mut installers = Vec::new();
+    for dir in dirs {
+        let cached = dir.with_file_name("installer.exe");
+        if cached.try_exists()? {
+            installers.push(cached);
+        }
+        match std::fs::read_dir(dir) {
+            Ok(entries) => {
+                for entry in entries {
+                    let path = entry?.path();
+                    if path
+                        .extension()
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
+                    {
+                        installers.push(path);
+                    }
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    if installers.is_empty() {
+        return Ok(false);
+    }
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    let snapshot = Handle(snapshot);
+    let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+    entry.dwSize = std::mem::size_of_val(&entry) as u32;
+    if unsafe { Process32FirstW(snapshot.0, &mut entry) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    loop {
+        let name = OsString::from_wide(
+            entry
+                .szExeFile
+                .split(|c| *c == 0)
+                .next()
+                .unwrap_or_default(),
+        );
+        if installers.iter().any(|path| {
+            path.file_name()
+                .is_some_and(|n| n.eq_ignore_ascii_case(&name))
+        }) {
+            match process_image(entry.th32ProcessID) {
+                Ok(Some(image))
+                    if installers
+                        .iter()
+                        .any(|path| path.as_os_str().eq_ignore_ascii_case(&image)) =>
+                {
+                    return Ok(true)
+                }
+                Ok(_) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        if unsafe { Process32NextW(snapshot.0, &mut entry) } == 0 {
+            let error = io::Error::last_os_error();
+            return if error.raw_os_error() == Some(ERROR_NO_MORE_FILES as i32) {
+                Ok(false)
+            } else {
+                Err(error)
+            };
+        }
+    }
+}
+
+fn process_image(pid: u32) -> io::Result<Option<OsString>> {
+    let process = unsafe {
+        OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+            0,
+            pid,
+        )
+    };
+    if process.is_null() {
+        let error = io::Error::last_os_error();
+        return if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) {
+            Ok(None)
+        } else {
+            Err(error)
+        };
+    }
+    let process = Handle(process);
+    let mut path = vec![0; 32_768];
+    let mut size = path.len() as u32;
+    if unsafe { QueryFullProcessImageNameW(process.0, 0, path.as_mut_ptr(), &mut size) } == 0 {
+        let error = io::Error::last_os_error();
+        // Windows can unmap the image while the process is still exiting.
+        return if unsafe { WaitForSingleObject(process.0, 50) } == WAIT_OBJECT_0 {
+            Ok(None)
+        } else {
+            Err(error)
+        };
+    }
+    Ok(Some(OsString::from_wide(&path[..size as usize])))
+}
 
 fn registry(script: &str) -> Result<(), String> {
     let script = format!("$ErrorActionPreference='Continue'; {script}");
@@ -157,11 +414,7 @@ pub fn run() {
     let result = (|| {
         let args: Vec<_> = std::env::args_os().collect();
         let exe = PathBuf::from(args.get(2).ok_or("Desktop path is missing")?);
-        if !exe.is_absolute()
-            || !exe
-                .file_name()
-                .is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case("Antigravity.exe"))
-        {
+        if !is_desktop_exe(&exe) {
             return Err("Unexpected Desktop path".to_string());
         }
         // Remove lingering IFEO filter and bad compat flags so that child
@@ -184,7 +437,7 @@ pub fn run() {
     })();
     if let Err(e) = result {
         crate::watchdog::log(&format!("Desktop launch stopped: {e}"));
-        crate::utils::message_box("Antigravity Unlocker", &e);
+        crate::utils::message_box(crate::APP_NAME, &e);
         std::process::exit(1);
     }
 }
@@ -192,6 +445,75 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shortcut_is_retargeted_and_restored() {
+        let dir = std::env::temp_dir().join(format!("agu-shortcut-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let script = format!(
+            r#"$ErrorActionPreference='Stop'; $dir='{}'; $flag='{SHORTCUT_FLAG}';
+$app=Join-Path $dir 'Antigravity.exe'; $helper=Join-Path $dir 'ag_launch.exe';
+$source=Join-Path $dir 'ag_dns.exe'; $path=Join-Path $dir 'Antigravity.lnk';
+[IO.File]::WriteAllText($app, 'fixture'); [IO.File]::WriteAllText($source, 'first');
+$shell=New-Object -ComObject WScript.Shell;
+$link=$shell.CreateShortcut($path);
+$link.TargetPath=$app; $link.WorkingDirectory=$dir; $link.Description='fixture'; $link.Save();
+$enable=$true;
+& {{ {SHORTCUT_SCRIPT} }}
+$link=$shell.CreateShortcut($path);
+if ($link.TargetPath -ne $helper -or $link.Arguments -ne ($flag + ' "' + $app + '"') -or
+    $link.WorkingDirectory -ne $dir -or $link.Description -ne 'fixture') {{ throw 'Link metadata' }}
+[IO.File]::WriteAllText($source, 'second');
+& {{ {SHORTCUT_SCRIPT} }}
+if ([IO.File]::ReadAllText($helper) -ne 'second') {{ throw 'Helper was not replaced' }}
+$enable=$false;
+& {{ {SHORTCUT_SCRIPT} }}
+$link=$shell.CreateShortcut($path);
+if ($link.TargetPath -ne $app -or $link.Arguments -or $link.WorkingDirectory -ne $dir) {{ throw 'Restore failed' }}
+"#,
+            dir.display().to_string().replace('\'', "''"),
+        );
+        let out = crate::utils::powershell_within(&script, Duration::from_secs(20)).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    fn post_update_patch_waits_for_the_running_installer_to_exit() {
+        use std::fs;
+        use std::process::Stdio;
+
+        let dir = std::env::temp_dir().join(format!("agu-update-{}", std::process::id()));
+        let pending = dir.join("pending");
+        fs::create_dir_all(&pending).unwrap();
+        let installer = pending.join("Antigravity-x64.exe");
+        let cmd = PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32/cmd.exe");
+        fs::copy(cmd, &installer).unwrap();
+        let server = dir.join("language_server.exe");
+        fs::write(&server, b"..ineligible..https_proxy..").unwrap();
+        let mut child = crate::utils::no_window(&mut Command::new(&installer))
+            .args(["/d", "/c", "set /p AG_FIXTURE="])
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        assert!(updater_busy(std::slice::from_ref(&pending)).unwrap());
+        std::thread::scope(|scope| {
+            let patch = scope.spawn(|| patch_after_update(&server, std::slice::from_ref(&pending)));
+            std::thread::sleep(Duration::from_millis(150));
+            let before_exit = fs::read(&server).unwrap();
+            drop(child.stdin.take());
+            child.wait().unwrap();
+            assert_eq!(before_exit, b"..ineligible..https_proxy..");
+            patch.join().unwrap().unwrap();
+        });
+        assert!(fs::read(&server).unwrap().starts_with(b"..inexigible.."));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn preserves_the_original_command_line() {
         let tail = r#""C:\App\Antigravity.exe" --file "D:\тест\a b" --value="a\\\"b""#;

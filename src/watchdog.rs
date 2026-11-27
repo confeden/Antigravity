@@ -35,10 +35,8 @@ use crate::utils::mask_path;
 // only hide it. `RepatchOutcome::SignatureMissing` is that case, and it is held
 // distinct from a transient `Failed` (a file locked mid-update, worth a retry).
 //
-// Enforcement of "no unpatched server keeps running" needs no separate kill:
-// `patch_binary::write_binary` already kills a process holding the binary open
-// and retries, so a running-but-reverted Language Server is replaced in the
-// same write - and the editor shell, which never holds that file, is untouched.
+// On Windows the Desktop shortcut gates the first post-update launch. A
+// running Desktop is left alone if it was opened directly.
 
 /// Cheap to run, because a real read only happens when a file's size or mtime
 /// actually changes. Two seconds is far inside the window an update leaves
@@ -104,6 +102,15 @@ pub fn run_forever() {
     run();
 }
 
+#[cfg(windows)]
+fn repair_paid_bootstrap(install: &Path) {
+    if crate::paid::is_app_active(crate::paid::PaidApp::AntigravityIde) {
+        if let Err(error) = crate::paid_windows::repair_bootstrap(install) {
+            log(&format!("Paid IDE startup settings: {error}"));
+        }
+    }
+}
+
 fn run() {
     log("start");
     let mut states: HashMap<PathBuf, FileState> = HashMap::new();
@@ -136,6 +143,8 @@ fn run() {
                     for target in targets(inst) {
                         inspect(&target, states.entry(target.clone()).or_default());
                     }
+                    #[cfg(windows)]
+                    repair_paid_bootstrap(inst);
                 }
             }
             thread::sleep(FAST_POLL);
@@ -152,7 +161,7 @@ fn run() {
             listener.check();
         }
         #[cfg(windows)]
-        if cycles % 15 == 0 {
+        if cycles % 15 == 0 && !updater_busy(&updaters) {
             match crate::sidecar::reap_orphans() {
                 Ok(n) if n > 0 => log(&format!("Removed {n} orphaned Antigravity sidecar(s)")),
                 Ok(_) => {}
@@ -175,6 +184,8 @@ fn run() {
                 for target in targets(inst) {
                     inspect(&target, states.entry(target.clone()).or_default());
                 }
+                #[cfg(windows)]
+                repair_paid_bootstrap(inst);
             }
         }
 
@@ -208,20 +219,18 @@ pub(crate) fn updater_dirs() -> Vec<PathBuf> {
         .collect()
 }
 
-/// True while a staged installer is in use: opening a running exe for writing
-/// fails with a sharing violation, a file that merely waits for the user opens
-/// fine (and is left untouched). Without this a downloaded update would keep
-/// the fast poll on for as long as it waits - days, if the user never quits.
-pub(crate) fn updater_busy(dirs: &[PathBuf]) -> bool {
-    dirs.iter().any(|d| {
-        let Ok(rd) = fs::read_dir(d) else {
-            return false;
-        };
-        rd.flatten()
-            .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|x| x == "exe"))
-            .any(|p| OpenOptions::new().append(true).open(&p).is_err())
-    })
+fn updater_busy(dirs: &[PathBuf]) -> bool {
+    #[cfg(windows)]
+    {
+        // Without a process listing, leave the files alone. The launch helper
+        // logs the error and allows the application to start in that case.
+        crate::launch_guard::updater_busy(dirs).unwrap_or(true)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = dirs;
+        false
+    }
 }
 
 /// How often the proxy listener is looked at, in polls. 15 x 2 s = 30 s.
@@ -358,10 +367,15 @@ fn inspect(target: &Path, st: &mut FileState) {
             reopen_app(st);
         }
         RepatchOutcome::Deferred(e) => {
-            log(&format!("additive patch deferred, LS left running: {} - {}", show(target), e));
+            log(&format!("patch deferred: {} - {}", show(target), e));
             st.deferred_until = Some((cur, Instant::now() + Duration::from_secs(30)));
         }
         RepatchOutcome::Failed(e) => {
+            if is_windows_desktop_image(target) {
+                log(&format!("Desktop patch deferred: {} - {}", show(target), e));
+                st.deferred_until = Some((cur, Instant::now() + Duration::from_secs(10)));
+                return;
+            }
             // The file is settled but the write did not land. Usually that is
             // Antigravity having been launched between the update finishing and
             // this patch: the image is locked, and left alone it stays locked
@@ -433,8 +447,21 @@ fn repatch(target: &Path) -> RepatchOutcome {
     if target.extension().and_then(|e| e.to_str()) == Some("js") {
         patch_ide::repatch_ide_js(target)
     } else {
+        #[cfg(windows)]
+        if is_windows_desktop_image(target) {
+            return patch_binary::repatch_before_launch(target);
+        }
         patch_binary::repatch_if_needed(target)
     }
+}
+
+fn is_windows_desktop_image(target: &Path) -> bool {
+    // The legacy kill matches by image name, so an IDE with the same server
+    // name must also take the non-disruptive path.
+    cfg!(windows)
+        && target
+            .file_name()
+            .is_some_and(|name| name.eq_ignore_ascii_case("language_server.exe"))
 }
 
 /// Every file this watcher keeps patched for one install: the native binaries,
@@ -456,9 +483,8 @@ fn targets(inst: &Path) -> Vec<PathBuf> {
 
 /// Patches every file of one install now, the way the watcher does once a file
 /// has settled: both renames in one write per native binary, the IDE's
-/// `main.js`, and a process holding a binary closed only if the write actually
-/// meets its lock (D22 - Desktop restarts its language server by itself and
-/// reloads the window). An already-patched file is read and left alone.
+/// `main.js`. An open Windows Desktop is left alone. Other native targets may
+/// need their process closed if it holds the binary (D22).
 ///
 /// The window's half of auto-patch (D27). The watcher runs inside the relay,
 /// which a user without admin rights never installed and which may still be an

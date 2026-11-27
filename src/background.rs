@@ -184,7 +184,7 @@ mod windows_impl {
                   -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew \
                   -ExecutionTimeLimit ([TimeSpan]::Zero) \
                   -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1); \
-             $d='Antigravity Unlocker: локальный DNS-релей'; \
+             $d='AI Unlocker: локальный DNS-релей'; \
              try {{ \
                $p=New-ScheduledTaskPrincipal -UserId \"$env:USERDOMAIN\\$env:USERNAME\" \
                     -LogonType S4U -RunLevel Limited; \
@@ -244,7 +244,7 @@ mod windows_impl {
                       -ExecutionTimeLimit ([TimeSpan]::Zero) \
                       -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1); \
                  Register-ScheduledTask -TaskName '{task}' -Action $a -Trigger $t \
-                      -Settings $s -Description 'Antigravity Unlocker: локальный DNS-релей' \
+                      -Settings $s -Description 'AI Unlocker: локальный DNS-релей' \
                       -Force -ErrorAction Stop | Out-Null; \
                  Start-ScheduledTask -TaskName '{task}'",
                 exe = dst.display(),
@@ -364,6 +364,9 @@ mod windows_impl {
         }
         enable()?;
         crate::launch_guard::uninstall()?;
+        if crate::settings::auto_patch_wanted() {
+            arm_desktop_shortcut();
+        }
         remove_watchdog_task()
     }
 
@@ -411,6 +414,7 @@ mod windows_impl {
         // The relay already owns a watchdog thread. A separate task is needed
         // only on a patch-only installation.
         if is_enabled() && is_running() && crate::gate::read().is_some_and(|r| !r.is_stale()) {
+            arm_desktop_shortcut();
             return remove_watchdog_task();
         }
         let exe = installed_exe();
@@ -426,7 +430,7 @@ mod windows_impl {
                   -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew \
                   -ExecutionTimeLimit ([TimeSpan]::Zero) \
                   -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1); \
-             $d='Antigravity Unlocker: сторож патча'; \
+             $d='AI Unlocker: сторож патча'; \
              try {{ \
                $p=New-ScheduledTaskPrincipal -UserId \"$env:USERDOMAIN\\$env:USERNAME\" \
                     -LogonType S4U -RunLevel Limited; \
@@ -442,9 +446,16 @@ mod windows_impl {
         );
         let out = powershell(&cmd).ok_or_else(|| "не удалось запустить PowerShell".to_string())?;
         if out.status.success() {
+            arm_desktop_shortcut();
             Ok(())
         } else {
             Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+        }
+    }
+
+    fn arm_desktop_shortcut() {
+        if let Err(e) = crate::launch_guard::arm_shortcut() {
+            crate::watchdog::log(&format!("Could not configure Desktop launch shortcut: {e}"));
         }
     }
 
@@ -464,6 +475,9 @@ mod windows_impl {
     }
 
     pub fn disable_watchdog() {
+        if let Err(e) = crate::launch_guard::restore_shortcut() {
+            crate::watchdog::log(&format!("Could not restore Desktop launch shortcut: {e}"));
+        }
         if let Err(e) = crate::launch_guard::uninstall() {
             crate::watchdog::log(&format!("Could not remove Desktop launch guard: {e}"));
         }
@@ -478,6 +492,7 @@ mod windows_impl {
     pub fn disable() -> Result<(), String> {
         // Never remove the executable while Windows still redirects launches
         // to it. A failed registry operation must leave the helper available.
+        crate::launch_guard::restore_shortcut()?;
         crate::launch_guard::uninstall()?;
         let cmd = format!(
             "Stop-ScheduledTask -TaskName '{task}' -ErrorAction SilentlyContinue; \
@@ -487,6 +502,11 @@ mod windows_impl {
         powershell(&cmd);
         stop_process();
         fs::remove_file(installed_exe()).ok();
+        match fs::remove_file(crate::launch_guard::shortcut_helper()) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("Не удалось удалить помощник запуска Desktop: {e}")),
+        }
         fs::remove_file(dns_forwarder::log_path()).ok();
         fs::remove_file(dns_forwarder::version_path()).ok();
         // Both only succeed while the directory is empty, which is what we want.
@@ -708,7 +728,7 @@ mod unix_impl {
         // the desktop session's value, and a service writing into a different
         // directory than the window reads leaves the card on «Служба запускается»
         // for good - so the unit is given the directory the window uses.
-        let unit = unit_text("Antigravity Unlocker local proxy", PROXY_FLAG);
+        let unit = unit_text("AI Unlocker local proxy", PROXY_FLAG);
         // A unit from an older build lacks the data-dir line; running on under
         // it keeps the service writing where the window does not look.
         let unit_changed = fs::read_to_string(&up).map_or(true, |old| old != unit);
@@ -824,7 +844,7 @@ mod unix_impl {
         if let Some(p) = up.parent() {
             fs::create_dir_all(p).map_err(|e| format!("не создать {}: {}", p.display(), e))?;
         }
-        let unit = unit_text("Antigravity Unlocker auto-patch", WATCHDOG_FLAG);
+        let unit = unit_text("AI Unlocker auto-patch", WATCHDOG_FLAG);
         let unit_changed = fs::read_to_string(&up).map_or(true, |old| old != unit);
         fs::write(&up, unit).map_err(|e| format!("не записать юнит: {}", e))?;
         systemctl(&["daemon-reload"]);
