@@ -175,7 +175,8 @@ pub const LISTEN_PORT: u16 = 53;
 /// 55 = Desktop per-process opt-out from shared PAID proxy port 53130 via Windows socket owner.
 /// 56 = PAID gateway diagnostics (conn ID, stage, reason), post-CONNECT drop logging, and PAID tunnel attribution.
 /// 57 = Backpressure-safe upload buffering in tls_pump_report (fixes >100 KB unexpected EOF) and clean TLS EOF handling.
-pub const RELAY_VERSION: u32 = 57;
+/// 58 = Updated DNS-AI default endpoints (removed retired spb3) and 24h auto-refresh from GitHub endpoints.json.
+pub const RELAY_VERSION: u32 = 58;
 
 /// Written where an unelevated relay can write and an unelevated unlocker can
 /// read. Absent means a relay from before versioning, i.e. older than anything.

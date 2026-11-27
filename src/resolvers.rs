@@ -1,14 +1,15 @@
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::io::{Read, Write};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc;
-use std::sync::Mutex;
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::dns_client;
 use rustls::pki_types::ServerName;
-use rustls::ClientConnection;
+use rustls::{ClientConfig, ClientConnection};
+use serde::{Deserialize, Serialize};
 
 // Choosing an unblock resolver at query time instead of trusting one forever.
 //
@@ -398,34 +399,464 @@ pub const PROVIDERS: &[Provider] = &[
 /// dead address failed safely and therefore failed *quietly*.
 ///
 /// Every entry below is live and was verified answering on `/dns-query` before
-/// being written here. The third, `185.251.90.181`, replaced `94.232.43.149`
-/// (msk1, nginx) on 2026-09-27 at the service's request - the old node is being
-/// withdrawn; the new one answered `/dns-query` over h2 the same day. The walk spreads queries
-/// evenly across all three - which is the point of listing a node at all (G43).
+/// being written here.
 /// 2026-10-20: `192.144.59.14` (timeout) and `186.246.49.127` (refused) were
-/// both dead, so two of every three walks paid the full `PER_ADDR_BUDGET` before
-/// an answer - the slow "400 bypass" start. Replaced by the service's current
-/// `194.87.196.13` and `45.151.102.219` (owner's list), both h2 with a valid
-/// `*.dns-ai.ru` certificate in 0.22-0.26 s over the ISP link. Its IPv6 pair
-/// (`2a00:b700:5::3:62`, `2a12:5940:d4ef::219`) is listed too, but unmeasured:
-/// the dev machine has no working IPv6. `doh.rs` decides at runtime - an address
-/// that fails sits out (30 s, doubling to 15 min) and is retried later, an IPv6
-/// one with a 1.2 s slice - so a line without IPv6 pays that once per bench, not
-/// per query (the G43 mistake), and a line with it uses it.
-/// When re-checking (P14), check the ADDRESSES too, not only whether the
-/// provider still substitutes: a hardcoded address is a measurement with an
-/// expiry date.
+/// replaced by `194.87.196.13` and the earlier second IPv4 node.
+/// 2026-11-27 (`endpoints.json` serial 9): replaced rotated node `45.151.102.219`
+/// / `2a12:5940:d4ef::219` with `45.15.184.29` / `2a12:5940:d4ef::2` (verified
+/// h2 with `*.dns-ai.ru` cert in ~0.15 s) and removed retired `185.251.90.181`
+/// (spb3; public `:443/:853` closed). Its IPv6 pair (`2a00:b700:5::3:62`,
+/// `2a12:5940:d4ef::2`) is listed too; `doh.rs` benches failing addresses (30 s,
+/// doubling to 15 min) so lines without IPv6 pay once per bench.
+/// At runtime, when `DNS_AI` is enabled and used, `maybe_refresh_dns_ai_endpoints`
+/// refreshes this address list from `DNS_AI_ENDPOINTS_URL` on startup and every
+/// 24 hours.
 pub static DNS_AI: crate::doh::Endpoint = crate::doh::Endpoint {
     host: "dns.dns-ai.ru",
     path: "/dns-query",
     addrs: &[
         "194.87.196.13",
-        "45.151.102.219",
-        "185.251.90.181",
+        "45.15.184.29",
         "2a00:b700:5::3:62",
-        "2a12:5940:d4ef::219",
+        "2a12:5940:d4ef::2",
     ],
 };
+
+const DNS_AI_ENDPOINTS_URL: &str =
+    "https://github.com/confeden/DNS-AI/raw/refs/heads/main/endpoints.json";
+const DNS_AI_BUILTIN_SERIAL: u64 = 9;
+const DNS_AI_REFRESH_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+const DNS_AI_RETRY_COOLDOWN: Duration = Duration::from_secs(10 * 60);
+const DNS_AI_CONNECT_TIMEOUT: Duration = Duration::from_secs(6);
+const DNS_AI_IO_TIMEOUT: Duration = Duration::from_secs(8);
+const DNS_AI_MAX_BODY: usize = 64 * 1024;
+const DNS_AI_MAX_ADDRS: usize = 16;
+
+#[derive(Debug, Deserialize)]
+struct EndpointsFeed {
+    v: u32,
+    serial: u64,
+    #[serde(default)]
+    updated: Option<String>,
+    #[serde(default)]
+    v4: Vec<String>,
+    #[serde(default)]
+    v6: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CachedEndpoints {
+    fetched_at_unix: u64,
+    serial: u64,
+    updated: Option<String>,
+    addrs: Vec<IpAddr>,
+}
+
+struct DnsAiDynamic {
+    loaded_disk: bool,
+    addrs: Vec<IpAddr>,
+    serial: u64,
+    in_flight: bool,
+    next_attempt_at: Option<Instant>,
+}
+
+impl DnsAiDynamic {
+    fn new() -> Self {
+        Self {
+            loaded_disk: false,
+            addrs: Vec::new(),
+            serial: DNS_AI_BUILTIN_SERIAL,
+            in_flight: false,
+            next_attempt_at: None,
+        }
+    }
+}
+
+static DNS_AI_STATE: OnceLock<Mutex<DnsAiDynamic>> = OnceLock::new();
+
+fn dns_ai_state() -> &'static Mutex<DnsAiDynamic> {
+    DNS_AI_STATE.get_or_init(|| Mutex::new(DnsAiDynamic::new()))
+}
+
+fn dns_ai_cache_path() -> std::path::PathBuf {
+    crate::dns_forwarder::log_dir().join("dns-ai-endpoints.json")
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn is_public_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            let cgnat = o[0] == 100 && (o[1] & 0xc0) == 64;
+            let reserved_hi = o[0] >= 240;
+            !v4.is_unspecified()
+                && !v4.is_loopback()
+                && !v4.is_private()
+                && !v4.is_link_local()
+                && !v4.is_broadcast()
+                && !v4.is_documentation()
+                && !v4.is_multicast()
+                && !cgnat
+                && o[0] != 0
+                && !reserved_hi
+        }
+        IpAddr::V6(v6) => {
+            let s0 = v6.segments()[0];
+            let unique_local = (s0 & 0xfe00) == 0xfc00;
+            let link_local = (s0 & 0xffc0) == 0xfe80;
+            !v6.is_unspecified()
+                && !v6.is_loopback()
+                && !v6.is_multicast()
+                && !unique_local
+                && !link_local
+                && v6.to_ipv4_mapped().is_none()
+        }
+    }
+}
+
+fn parse_dns_ai_endpoints(raw: &[u8]) -> Result<(u64, Option<String>, Vec<IpAddr>), String> {
+    let feed: EndpointsFeed =
+        serde_json::from_slice(raw).map_err(|e| format!("invalid JSON: {}", e))?;
+    if feed.v != 1 {
+        return Err(format!("unsupported endpoints schema v={}", feed.v));
+    }
+    if feed.serial < DNS_AI_BUILTIN_SERIAL {
+        return Err(format!(
+            "stale endpoints serial {} < builtin {}",
+            feed.serial, DNS_AI_BUILTIN_SERIAL
+        ));
+    }
+
+    let mut addrs: Vec<IpAddr> = Vec::new();
+    let mut v4_count = 0usize;
+    for raw_ip in &feed.v4 {
+        let Ok(ip) = raw_ip.trim().parse::<std::net::Ipv4Addr>() else {
+            continue;
+        };
+        let ip = IpAddr::V4(ip);
+        if is_public_ip(ip) && !addrs.contains(&ip) {
+            addrs.push(ip);
+            v4_count += 1;
+            if addrs.len() >= DNS_AI_MAX_ADDRS {
+                break;
+            }
+        }
+    }
+    for raw_ip in &feed.v6 {
+        if addrs.len() >= DNS_AI_MAX_ADDRS {
+            break;
+        }
+        let Ok(ip) = raw_ip.trim().parse::<std::net::Ipv6Addr>() else {
+            continue;
+        };
+        let ip = IpAddr::V6(ip);
+        if is_public_ip(ip) && !addrs.contains(&ip) {
+            addrs.push(ip);
+        }
+    }
+    if v4_count == 0 {
+        return Err("endpoints feed contains no valid public IPv4 addresses".to_string());
+    }
+    Ok((feed.serial, feed.updated, addrs))
+}
+
+fn parse_allowed_github_url(url: &str) -> Result<(String, String), String> {
+    let rest = url
+        .trim()
+        .strip_prefix("https://")
+        .ok_or_else(|| "only https:// URLs are allowed".to_string())?;
+    let (authority, path) = match rest.find('/') {
+        Some(idx) => (&rest[..idx], &rest[idx..]),
+        None => (rest, "/"),
+    };
+    if authority.contains('@') || authority.contains(':') {
+        return Err("disallowed userinfo or port in URL".to_string());
+    }
+    let host = authority.to_ascii_lowercase();
+    if host != "github.com" && host != "raw.githubusercontent.com" {
+        return Err(format!("disallowed redirect host: {}", host));
+    }
+    if path.is_empty() || !path.starts_with('/') {
+        return Err("invalid URL path".to_string());
+    }
+    Ok((host, path.to_string()))
+}
+
+fn endpoints_tls_config() -> Arc<ClientConfig> {
+    static CFG: OnceLock<Arc<ClientConfig>> = OnceLock::new();
+    CFG.get_or_init(|| {
+        let roots = rustls::RootCertStore {
+            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+        };
+        let mut cfg = ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+        Arc::new(cfg)
+    })
+    .clone()
+}
+
+fn decode_http_chunked(raw: &[u8]) -> Result<Vec<u8>, String> {
+    let mut out = Vec::new();
+    let mut cursor = 0;
+    while cursor < raw.len() {
+        let rem = &raw[cursor..];
+        let Some(pos) = rem.windows(2).position(|w| w == b"\r\n") else {
+            break;
+        };
+        let line = std::str::from_utf8(&rem[..pos])
+            .map_err(|e| format!("invalid chunk size encoding: {}", e))?
+            .trim();
+        let size_hex = line.split(';').next().unwrap_or("").trim();
+        let chunk_size = usize::from_str_radix(size_hex, 16)
+            .map_err(|e| format!("invalid chunk size hex '{}': {}", size_hex, e))?;
+        if chunk_size == 0 {
+            break;
+        }
+        let chunk_start = cursor + pos + 2;
+        let Some(chunk_end) = chunk_start.checked_add(chunk_size) else {
+            return Err("chunk size out of range".to_string());
+        };
+        if chunk_end > raw.len() {
+            return Err("truncated chunk data in HTTP response".to_string());
+        }
+        out.extend_from_slice(&raw[chunk_start..chunk_end]);
+        cursor = chunk_end + 2;
+    }
+    Ok(out)
+}
+
+fn fetch_https_json(start_url: &str) -> Result<Vec<u8>, String> {
+    let mut url = start_url.to_string();
+    for _ in 0..4 {
+        let (host, path) = parse_allowed_github_url(&url)?;
+        let addrs: Vec<_> = (host.as_str(), 443)
+            .to_socket_addrs()
+            .map_err(|e| format!("DNS resolution failed for {}: {}", host, e))?
+            .collect();
+        let mut sock = None;
+        let mut last_err = None;
+        for addr in addrs {
+            match TcpStream::connect_timeout(&addr, DNS_AI_CONNECT_TIMEOUT) {
+                Ok(s) => {
+                    s.set_read_timeout(Some(DNS_AI_IO_TIMEOUT)).ok();
+                    s.set_write_timeout(Some(DNS_AI_IO_TIMEOUT)).ok();
+                    sock = Some(s);
+                    break;
+                }
+                Err(e) => last_err = Some(e),
+            }
+        }
+        let mut sock = sock.ok_or_else(|| {
+            format!(
+                "connect {}:443 failed: {}",
+                host,
+                last_err.map_or_else(|| "no addresses".to_string(), |e| e.to_string())
+            )
+        })?;
+
+        let server_name = ServerName::try_from(host.clone())
+            .map_err(|e| format!("invalid TLS server name {}: {}", host, e))?;
+        let mut conn = ClientConnection::new(endpoints_tls_config(), server_name)
+            .map_err(|e| format!("TLS init failed: {}", e))?;
+        let mut stream = rustls::Stream::new(&mut conn, &mut sock);
+        let req = format!(
+            "GET {} HTTP/1.1\r\n\
+             Host: {}\r\n\
+             User-Agent: ag_unlocker/{}\r\n\
+             Accept: application/json\r\n\
+             Connection: close\r\n\r\n",
+            path,
+            host,
+            crate::update::current_version()
+        );
+        stream
+            .write_all(req.as_bytes())
+            .map_err(|e| format!("write request failed: {}", e))?;
+        stream.flush().map_err(|e| format!("flush failed: {}", e))?;
+
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            match stream.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    buf.extend_from_slice(&chunk[..n]);
+                    if buf.len() > DNS_AI_MAX_BODY {
+                        return Err("endpoints response exceeded size limit".to_string());
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(format!("read HTTPS response failed: {}", e)),
+            }
+        }
+
+        let header_end = buf
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .ok_or_else(|| "missing HTTP header delimiter".to_string())?;
+        let header_str = String::from_utf8_lossy(&buf[..header_end]);
+        let body = &buf[header_end + 4..];
+
+        let mut lines = header_str.lines();
+        let status_line = lines.next().unwrap_or("");
+        let status_code: u16 = status_line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .ok_or_else(|| format!("invalid HTTP status line: {}", status_line))?;
+
+        let mut location = None;
+        let mut is_chunked = false;
+        for line in lines {
+            if let Some((k, v)) = line.split_once(':') {
+                let k = k.trim();
+                let v = v.trim();
+                if k.eq_ignore_ascii_case("location") {
+                    location = Some(v.to_string());
+                } else if k.eq_ignore_ascii_case("transfer-encoding")
+                    && v.to_ascii_lowercase().contains("chunked")
+                {
+                    is_chunked = true;
+                }
+            }
+        }
+
+        if matches!(status_code, 301 | 302 | 303 | 307 | 308) {
+            let next = location.ok_or_else(|| "redirect missing Location header".to_string())?;
+            url = if next.starts_with('/') {
+                format!("https://{}{}", host, next)
+            } else {
+                next
+            };
+            continue;
+        }
+        if status_code != 200 {
+            return Err(format!("HTTP {} from {}", status_code, host));
+        }
+        return if is_chunked {
+            decode_http_chunked(body)
+        } else {
+            Ok(body.to_vec())
+        };
+    }
+    Err("too many HTTP redirects".to_string())
+}
+
+fn ensure_dns_ai_cache_loaded(state: &mut DnsAiDynamic) {
+    if state.loaded_disk {
+        return;
+    }
+    state.loaded_disk = true;
+    let Ok(raw) = std::fs::read(dns_ai_cache_path()) else {
+        return;
+    };
+    let Ok(cached) = serde_json::from_slice::<CachedEndpoints>(&raw) else {
+        return;
+    };
+    if cached.serial < DNS_AI_BUILTIN_SERIAL {
+        return;
+    }
+    let valid: Vec<IpAddr> = cached
+        .addrs
+        .into_iter()
+        .filter(|ip| is_public_ip(*ip))
+        .take(DNS_AI_MAX_ADDRS)
+        .collect();
+    if valid.iter().any(|ip| ip.is_ipv4()) {
+        state.addrs = valid;
+        state.serial = cached.serial;
+    }
+}
+
+fn save_dns_ai_cache(cached: &CachedEndpoints) {
+    let path = dns_ai_cache_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    if let Ok(bytes) = serde_json::to_vec_pretty(cached) {
+        let tmp = path.with_extension("json.tmp");
+        if std::fs::write(&tmp, &bytes).is_ok() {
+            std::fs::rename(&tmp, &path).ok();
+        }
+    }
+}
+
+fn dns_ai_addrs() -> Option<Vec<IpAddr>> {
+    let Ok(mut state) = dns_ai_state().lock() else {
+        return None;
+    };
+    ensure_dns_ai_cache_loaded(&mut state);
+    if state.addrs.is_empty() {
+        None
+    } else {
+        Some(state.addrs.clone())
+    }
+}
+
+fn maybe_refresh_dns_ai_endpoints() {
+    let now = Instant::now();
+    {
+        let Ok(mut state) = dns_ai_state().lock() else {
+            return;
+        };
+        ensure_dns_ai_cache_loaded(&mut state);
+        if state.in_flight {
+            return;
+        }
+        if let Some(next_at) = state.next_attempt_at {
+            if now < next_at {
+                return;
+            }
+        }
+        state.in_flight = true;
+    }
+
+    thread::spawn(|| {
+        let result = fetch_https_json(DNS_AI_ENDPOINTS_URL)
+            .and_then(|bytes| parse_dns_ai_endpoints(&bytes));
+        let Ok(mut state) = dns_ai_state().lock() else {
+            return;
+        };
+        state.in_flight = false;
+        match result {
+            Ok((serial, updated, addrs)) => {
+                state.next_attempt_at = Some(Instant::now() + DNS_AI_REFRESH_INTERVAL);
+                let changed = state.addrs != addrs || state.serial != serial;
+                state.addrs = addrs.clone();
+                state.serial = serial;
+                save_dns_ai_cache(&CachedEndpoints {
+                    fetched_at_unix: unix_now(),
+                    serial,
+                    updated: updated.clone(),
+                    addrs,
+                });
+                if changed {
+                    crate::dns_forwarder::log_proxy(&format!(
+                        "DNS-AI: обновлены адреса (serial={}, count={})",
+                        serial,
+                        state.addrs.len()
+                    ));
+                }
+            }
+            Err(why) => {
+                state.next_attempt_at = Some(Instant::now() + DNS_AI_RETRY_COOLDOWN);
+                crate::dns_forwarder::log_proxy(&format!(
+                    "DNS-AI: не удалось обновить список адресов ({})",
+                    why
+                ));
+            }
+        }
+    });
+}
 
 /// Resolvers used only to recognise an unsubstituted answer. They must be
 /// services with no geo-unblocking of their own - that is the whole point of
@@ -1357,7 +1788,21 @@ fn ask_provider(
             None
         }
         Transport::Doh(endpoint) => {
-            let mut reply = crate::doh::query(endpoint, query, timeout).ok()?;
+            let override_addrs = if std::ptr::eq(endpoint, &DNS_AI) {
+                if !provider_disabled(LEAD_PROVIDER) {
+                    maybe_refresh_dns_ai_endpoints();
+                }
+                dns_ai_addrs()
+            } else {
+                None
+            };
+            let result = match override_addrs.as_deref() {
+                Some(addrs) if !addrs.is_empty() => {
+                    crate::doh::query_at(endpoint, addrs, query, timeout)
+                }
+                _ => crate::doh::query(endpoint, query, timeout),
+            };
+            let mut reply = result.ok()?;
             // Re-stamp the transaction id. RFC 8484 tells a DoH client to send 0
             // and a server is free to answer with 0 whatever we asked with, but
             // the reply is handed to Windows over UDP:53, where an id that does
@@ -3109,5 +3554,73 @@ mod tests {
             dns_client::question_name(&queries[0]).as_deref(),
             Some("warm-unseen.example")
         );
+    }
+
+    #[test]
+    fn dns_ai_defaults_use_current_endpoints_without_retired_nodes() {
+        assert!(DNS_AI.addrs.contains(&"194.87.196.13"));
+        assert!(DNS_AI.addrs.contains(&"45.15.184.29"));
+        assert!(DNS_AI.addrs.contains(&"2a00:b700:5::3:62"));
+        assert!(DNS_AI.addrs.contains(&"2a12:5940:d4ef::2"));
+        assert!(!DNS_AI.addrs.contains(&"45.151.102.219"));
+        assert!(!DNS_AI.addrs.contains(&"2a12:5940:d4ef::219"));
+        assert!(!DNS_AI.addrs.contains(&"185.251.90.181"));
+    }
+
+    #[test]
+    fn parse_dns_ai_endpoints_validates_schema_serial_and_public_ips() {
+        let good = br#"{
+            "v": 1,
+            "serial": 9,
+            "updated": "2026-11-27",
+            "v4": ["194.87.196.13", "127.0.0.1", "45.15.184.29", "192.168.1.1"],
+            "v6": ["2a00:b700:5::3:62", "::1", "2a12:5940:d4ef::2"]
+        }"#;
+        let (serial, updated, addrs) = parse_dns_ai_endpoints(good).unwrap();
+        assert_eq!(serial, 9);
+        assert_eq!(updated.as_deref(), Some("2026-11-27"));
+        assert_eq!(
+            addrs,
+            vec![
+                "194.87.196.13".parse::<IpAddr>().unwrap(),
+                "45.15.184.29".parse::<IpAddr>().unwrap(),
+                "2a00:b700:5::3:62".parse::<IpAddr>().unwrap(),
+                "2a12:5940:d4ef::2".parse::<IpAddr>().unwrap(),
+            ]
+        );
+
+        let stale = br#"{"v":1,"serial":8,"v4":["194.87.196.13"],"v6":[]}"#;
+        assert!(parse_dns_ai_endpoints(stale).is_err());
+
+        let wrong_schema = br#"{"v":2,"serial":10,"v4":["194.87.196.13"],"v6":[]}"#;
+        assert!(parse_dns_ai_endpoints(wrong_schema).is_err());
+
+        let no_public_v4 = br#"{"v":1,"serial":10,"v4":["10.0.0.1"],"v6":["2a12:5940:d4ef::2"]}"#;
+        assert!(parse_dns_ai_endpoints(no_public_v4).is_err());
+    }
+
+    #[test]
+    fn parse_allowed_github_url_restricts_scheme_and_hosts() {
+        assert_eq!(
+            parse_allowed_github_url(DNS_AI_ENDPOINTS_URL).unwrap(),
+            (
+                "github.com".to_string(),
+                "/confeden/DNS-AI/raw/refs/heads/main/endpoints.json".to_string()
+            )
+        );
+        assert_eq!(
+            parse_allowed_github_url(
+                "https://raw.githubusercontent.com/confeden/DNS-AI/refs/heads/main/endpoints.json"
+            )
+            .unwrap(),
+            (
+                "raw.githubusercontent.com".to_string(),
+                "/confeden/DNS-AI/refs/heads/main/endpoints.json".to_string()
+            )
+        );
+        assert!(parse_allowed_github_url("http://github.com/a/b").is_err());
+        assert!(parse_allowed_github_url("https://evil.example/endpoints.json").is_err());
+        assert!(parse_allowed_github_url("https://github.com:8443/a/b").is_err());
+        assert!(parse_allowed_github_url("https://user@github.com/a/b").is_err());
     }
 }
