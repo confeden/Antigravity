@@ -130,6 +130,15 @@ fn write_binary(bin_path: &Path, data: &[u8]) -> Result<(), String> {
     res
 }
 
+/// Zero-I/O probe for whether a Windows process currently holds the image open.
+#[cfg(windows)]
+pub(crate) fn is_image_locked(path: &Path) -> bool {
+    match fs::OpenOptions::new().write(true).open(path) {
+        Ok(_) => false,
+        Err(e) => matches!(e.raw_os_error(), Some(5 | 32 | 33)),
+    }
+}
+
 /// Kills whatever process holds `bin_path` open so the write can be retried.
 /// Windows locks a running image; Linux does not (a rename-over succeeds while
 /// the old inode keeps running), so this is a belt-and-braces retry helper there.
@@ -1548,5 +1557,31 @@ mod owner_app_tests {
         assert_eq!(owner_app(&agy), None);
         fs::remove_dir_all(&root).ok();
         fs::remove_dir_all(&lone).ok();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn image_lock_probe_detects_held_files() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let dir = std::env::temp_dir().join(format!("ag_lock_probe_{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("language_server.exe");
+        fs::write(&file, b"payload").unwrap();
+
+        assert!(!is_image_locked(&file), "unlocked file must report false");
+        {
+            let _holder = fs::OpenOptions::new()
+                .read(true)
+                .share_mode(1)
+                .open(&file)
+                .unwrap();
+            assert!(is_image_locked(&file), "shared-read holder must lock write");
+        }
+        assert!(
+            !is_image_locked(&file),
+            "file must report unlocked once handle drops"
+        );
+        fs::remove_dir_all(&dir).ok();
     }
 }

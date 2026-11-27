@@ -42,6 +42,7 @@ use crate::utils::mask_path;
 /// actually changes. Two seconds is far inside the window an update leaves
 /// before the app talks to CloudCode again.
 const POLL: Duration = Duration::from_secs(2);
+const DESKTOP_UNLOCK_POLL: Duration = Duration::from_millis(500);
 
 /// Re-scan the standard install locations (and the user's own paths) this
 /// often, in polls: 5 x 2 s = 10 s. Uses only filesystem checks - never the
@@ -73,6 +74,7 @@ struct FileState {
     blocked: u32,
     blocked_for: Option<(u64, SystemTime)>,
     deferred_until: Option<((u64, SystemTime), Instant)>,
+    desktop_waiting_unlock: Option<(u64, SystemTime)>,
     /// The app this watcher closed to free a locked server; it is started again
     /// once the patch has landed (or has been given up on), so an update never
     /// leaves the user's window closed.
@@ -111,6 +113,33 @@ fn repair_paid_bootstrap(install: &Path) {
     }
 }
 
+#[cfg(windows)]
+fn sync_desktop_shortcut(
+    updater_active: bool,
+    wanted: bool,
+    armed: &mut bool,
+    retry_at: &mut Option<Instant>,
+) {
+    if updater_active || !wanted {
+        *armed = false;
+        *retry_at = None;
+        return;
+    }
+    if *armed || retry_at.is_some_and(|t| Instant::now() < t) {
+        return;
+    }
+    match crate::launch_guard::arm_shortcut() {
+        Ok(()) => {
+            *armed = true;
+            *retry_at = None;
+        }
+        Err(e) => {
+            log(&format!("Could not configure Desktop launch shortcut: {e}"));
+            *retry_at = Some(Instant::now() + Duration::from_secs(300));
+        }
+    }
+}
+
 fn run() {
     log("start");
     let mut states: HashMap<PathBuf, FileState> = HashMap::new();
@@ -120,6 +149,11 @@ fn run() {
     let mut updaters = updater_dirs();
     let mut fast_until: Option<Instant> = None;
     let mut fast_polls: u32 = 0;
+    let mut unlock_subticks: u32 = 0;
+    #[cfg(windows)]
+    let mut shortcut_armed = false;
+    #[cfg(windows)]
+    let mut shortcut_retry_at: Option<Instant> = None;
 
     loop {
         // An update being installed is the one moment a poll every two seconds
@@ -128,17 +162,26 @@ fn run() {
         // While a downloaded update is staged (and for a minute after it goes)
         // the files are looked at every 150 ms instead.
         let updater_active = updater_busy(&updaters);
+        let auto_patch_wanted = crate::settings::auto_patch_wanted();
+        #[cfg(windows)]
+        sync_desktop_shortcut(
+            updater_active,
+            auto_patch_wanted,
+            &mut shortcut_armed,
+            &mut shortcut_retry_at,
+        );
         if updater_active {
             fast_until = Some(Instant::now() + FAST_FOR);
         }
         let fast = fast_until.is_some_and(|t| Instant::now() < t);
         if fast {
+            unlock_subticks = 0;
             fast_polls = fast_polls.wrapping_add(1);
             if fast_polls % FAST_REDISCOVER_EVERY == 0 {
                 installs = discover();
                 updaters = updater_dirs();
             }
-            if !updater_active && crate::settings::auto_patch_wanted() {
+            if !updater_active && auto_patch_wanted {
                 for inst in &installs {
                     for target in targets(inst) {
                         inspect(&target, states.entry(target.clone()).or_default());
@@ -150,25 +193,27 @@ fn run() {
             thread::sleep(FAST_POLL);
             continue;
         }
-        if cycles % REDISCOVER_EVERY == 0 {
-            installs = discover();
-            updaters = updater_dirs();
-        }
-        // Not on the first poll: at logon this task and the relay's start
-        // together, and a miss before the relay has bound would start the count
-        // early - the log says ninety seconds and it should mean it.
-        if cycles > 0 && cycles % LISTENER_CHECK_EVERY == 0 {
-            listener.check();
-        }
-        #[cfg(windows)]
-        if cycles % 15 == 0 && !updater_busy(&updaters) {
-            match crate::sidecar::reap_orphans() {
-                Ok(n) if n > 0 => log(&format!("Removed {n} orphaned Antigravity sidecar(s)")),
-                Ok(_) => {}
-                Err(e) => log(&format!("Sidecar cleanup failed: {e}")),
+        if unlock_subticks == 0 {
+            if cycles % REDISCOVER_EVERY == 0 {
+                installs = discover();
+                updaters = updater_dirs();
             }
+            // Not on the first poll: at logon this task and the relay's start
+            // together, and a miss before the relay has bound would start the count
+            // early - the log says ninety seconds and it should mean it.
+            if cycles > 0 && cycles % LISTENER_CHECK_EVERY == 0 {
+                listener.check();
+            }
+            #[cfg(windows)]
+            if cycles % 15 == 0 && !updater_busy(&updaters) {
+                match crate::sidecar::reap_orphans() {
+                    Ok(n) if n > 0 => log(&format!("Removed {n} orphaned Antigravity sidecar(s)")),
+                    Ok(_) => {}
+                    Err(e) => log(&format!("Sidecar cleanup failed: {e}")),
+                }
+            }
+            cycles = cycles.wrapping_add(1);
         }
-        cycles = cycles.wrapping_add(1);
 
         // Read per cycle rather than once at start: the task stays registered
         // while the switch is off, so the setting is what has to take effect
@@ -179,17 +224,25 @@ fn run() {
         // update and put the patch straight back (G38). Not `client_patch`
         // either - that is false on every machine that has not patched *yet*,
         // which is the fresh install this is also for (D27).
-        if crate::settings::auto_patch_wanted() {
+        if auto_patch_wanted {
             for inst in &installs {
                 for target in targets(inst) {
                     inspect(&target, states.entry(target.clone()).or_default());
                 }
                 #[cfg(windows)]
-                repair_paid_bootstrap(inst);
+                if unlock_subticks == 0 {
+                    repair_paid_bootstrap(inst);
+                }
             }
         }
 
-        thread::sleep(POLL);
+        if states.values().any(|s| s.desktop_waiting_unlock.is_some()) {
+            unlock_subticks = (unlock_subticks + 1) % 4;
+            thread::sleep(DESKTOP_UNLOCK_POLL);
+        } else {
+            unlock_subticks = 0;
+            thread::sleep(POLL);
+        }
     }
 }
 
@@ -320,34 +373,53 @@ fn inspect(target: &Path, st: &mut FileState) {
     if st.handled == Some(cur) {
         return;
     }
-    if st.deferred_until.is_some_and(|(shape, until)| shape == cur && Instant::now() < until) {
-        return;
-    }
-    // Wait for the file to settle: act only once we have seen the same
-    // (len, mtime) on two consecutive polls, so a file still being written is
-    // never read or patched.
-    if st.pending != Some(cur) {
-        st.pending = Some(cur);
-        // Only a genuinely different file restarts the count. Comparing against
-        // the shape the count was raised for, rather than resetting on sight,
-        // is what keeps MAX_LAUNCH_HOLDS a limit instead of decoration.
-        if st.blocked_for != Some(cur) {
-            st.blocked = 0;
-            st.blocked_for = None;
+    let resume_after_unlock = if st.desktop_waiting_unlock == Some(cur) {
+        #[cfg(windows)]
+        if patch_binary::is_image_locked(target) {
+            return;
         }
-        return;
+        true
+    } else {
+        st.desktop_waiting_unlock = None;
+        false
+    };
+    if !resume_after_unlock {
+        if st
+            .deferred_until
+            .is_some_and(|(shape, until)| shape == cur && Instant::now() < until)
+        {
+            return;
+        }
+        // Wait for the file to settle: act only once we have seen the same
+        // (len, mtime) on two consecutive polls, so a file still being written is
+        // never read or patched.
+        if st.pending != Some(cur) {
+            st.pending = Some(cur);
+            // Only a genuinely different file restarts the count. Comparing against
+            // the shape the count was raised for, rather than resetting on sight,
+            // is what keeps MAX_LAUNCH_HOLDS a limit instead of decoration.
+            if st.blocked_for != Some(cur) {
+                st.blocked = 0;
+                st.blocked_for = None;
+            }
+            return;
+        }
+        st.pending = None;
     }
-    st.pending = None;
 
     match repatch(target) {
         RepatchOutcome::AlreadyPatched => {
             // Our own past write, or an install menu 1 just handled. Record the
             // current shape and stay quiet.
+            st.desktop_waiting_unlock = None;
+            st.deferred_until = None;
             st.handled = stat(target).or(Some(cur));
             reopen_app(st);
         }
         RepatchOutcome::Repatched(n) => {
             log(&format!("patched: {} ({})", show(target), n));
+            st.desktop_waiting_unlock = None;
+            st.deferred_until = None;
             st.blocked = 0;
             st.blocked_for = None;
             // The rename is same-length, so len is unchanged and only mtime
@@ -363,6 +435,8 @@ fn inspect(target: &Path, st: &mut FileState) {
             ));
             // Do not look at this version again; only a further change (a newer
             // build that we might understand) is worth another attempt.
+            st.desktop_waiting_unlock = None;
+            st.deferred_until = None;
             st.handled = Some(cur);
             reopen_app(st);
         }
@@ -372,6 +446,15 @@ fn inspect(target: &Path, st: &mut FileState) {
         }
         RepatchOutcome::Failed(e) => {
             if is_windows_desktop_image(target) {
+                #[cfg(windows)]
+                if patch_binary::is_image_locked(target) {
+                    if st.desktop_waiting_unlock != Some(cur) {
+                        log(&format!("Desktop patch deferred: {} - {}", show(target), e));
+                        st.desktop_waiting_unlock = Some(cur);
+                    }
+                    return;
+                }
+                st.desktop_waiting_unlock = None;
                 log(&format!("Desktop patch deferred: {} - {}", show(target), e));
                 st.deferred_until = Some((cur, Instant::now() + Duration::from_secs(10)));
                 return;
@@ -664,6 +747,51 @@ mod tests {
         inspect(&agy, &mut st); // act
         assert_eq!(fs::read(&agy).unwrap(), contents, "must be left untouched");
         assert!(st.handled.is_some(), "and not re-attempted every poll");
+
+        fs::remove_dir_all(&inst).ok();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn desktop_target_patches_immediately_once_unlock_completes() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let inst = std::env::temp_dir().join(format!("ag_watchdog_unlock_{}", std::process::id()));
+        let bin = inst.join("resources").join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let ls = bin.join("language_server.exe");
+        fs::write(&ls, b"header..ineligible..https_proxy..tail").unwrap();
+
+        let mut st = FileState::default();
+        let holder = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1)
+            .open(&ls)
+            .unwrap();
+
+        inspect(&ls, &mut st);
+        inspect(&ls, &mut st);
+        assert_eq!(
+            fs::read(&ls).unwrap(),
+            b"header..ineligible..https_proxy..tail"
+        );
+        assert!(st.desktop_waiting_unlock.is_some());
+        assert!(st.deferred_until.is_none());
+
+        inspect(&ls, &mut st);
+        assert_eq!(
+            fs::read(&ls).unwrap(),
+            b"header..ineligible..https_proxy..tail"
+        );
+
+        drop(holder);
+        inspect(&ls, &mut st);
+        assert_eq!(
+            fs::read(&ls).unwrap(),
+            b"header..inexigible..AG_LS_PROXY..tail"
+        );
+        assert!(st.desktop_waiting_unlock.is_none());
+        assert!(st.handled.is_some());
 
         fs::remove_dir_all(&inst).ok();
     }

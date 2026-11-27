@@ -25,11 +25,21 @@ pub use unix_impl::*;
 #[cfg(target_os = "windows")]
 mod windows_impl {
     use std::env;
+    use std::ffi::OsString;
     use std::fs;
+    use std::os::windows::ffi::OsStringExt;
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::thread;
     use std::time::Duration;
+
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, ERROR_NO_MORE_FILES, HANDLE, INVALID_HANDLE_VALUE,
+    };
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
 
     use super::{FORWARDER_FLAG, WATCHDOG_FLAG};
     use crate::dns_forwarder;
@@ -118,12 +128,58 @@ mod windows_impl {
             || (crate::settings::auto_patch_wanted() && task_exists(TASK_NAME))
     }
 
-    pub fn is_running() -> bool {
+    struct SnapshotHandle(HANDLE);
+
+    impl Drop for SnapshotHandle {
+        fn drop(&mut self) {
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
+
+    fn process_running_win32(exe_name: &str) -> Option<bool> {
+        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+        if snapshot == INVALID_HANDLE_VALUE {
+            return None;
+        }
+        let snapshot = SnapshotHandle(snapshot);
+        let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        if unsafe { Process32FirstW(snapshot.0, &mut entry) } == 0 {
+            return None;
+        }
+        loop {
+            let len = entry
+                .szExeFile
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(entry.szExeFile.len());
+            let name = OsString::from_wide(&entry.szExeFile[..len]);
+            if name.to_string_lossy().eq_ignore_ascii_case(exe_name) {
+                return Some(true);
+            }
+            if unsafe { Process32NextW(snapshot.0, &mut entry) } == 0 {
+                let err = std::io::Error::last_os_error();
+                return if err.raw_os_error() == Some(ERROR_NO_MORE_FILES as i32) {
+                    Some(false)
+                } else {
+                    None
+                };
+            }
+        }
+    }
+
+    fn is_running_via_tasklist() -> bool {
         let mut cmd = Command::new("tasklist");
         cmd.args(["/FI", &format!("IMAGENAME eq {}", EXE_NAME), "/NH"]);
         bounded_output(no_window(&mut cmd), HELPER_LIMIT).map_or(false, |o| {
             String::from_utf8_lossy(&o.stdout).contains(EXE_NAME)
         })
+    }
+
+    pub fn is_running() -> bool {
+        process_running_win32(EXE_NAME).unwrap_or_else(is_running_via_tasklist)
     }
 
     /// Kills the running relay and waits for it to actually let go.
@@ -154,6 +210,152 @@ mod windows_impl {
     const STOP_SETTLE: Duration = Duration::from_millis(300);
     const STOP_WAIT_TRIES: usize = 10;
 
+    fn ps_quote(value: &str) -> String {
+        value.replace('\'', "''")
+    }
+
+    fn xml_escape(value: &str) -> String {
+        value
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+            .replace('\'', "&apos;")
+    }
+
+    fn render_schtasks_xml(exe: &Path, flag: &str) -> String {
+        let exe_escaped = xml_escape(&exe.display().to_string());
+        let flag_escaped = xml_escape(flag);
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n\
+             <Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\r\n\
+             \x20 <RegistrationInfo>\r\n\
+             \x20\x20\x20 <Description>AI Unlocker: локальный DNS-релей</Description>\r\n\
+             \x20 </RegistrationInfo>\r\n\
+             \x20 <Triggers>\r\n\
+             \x20\x20\x20 <LogonTrigger>\r\n\
+             \x20\x20\x20\x20\x20 <Enabled>true</Enabled>\r\n\
+             \x20\x20\x20 </LogonTrigger>\r\n\
+             \x20 </Triggers>\r\n\
+             \x20 <Principals>\r\n\
+             \x20\x20\x20 <Principal id=\"Author\">\r\n\
+             \x20\x20\x20\x20\x20 <LogonType>InteractiveToken</LogonType>\r\n\
+             \x20\x20\x20\x20\x20 <RunLevel>LeastPrivilege</RunLevel>\r\n\
+             \x20\x20\x20 </Principal>\r\n\
+             \x20 </Principals>\r\n\
+             \x20 <Settings>\r\n\
+             \x20\x20\x20 <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\r\n\
+             \x20\x20\x20 <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\r\n\
+             \x20\x20\x20 <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\r\n\
+             \x20\x20\x20 <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>\r\n\
+             \x20\x20\x20 <RestartOnFailure>\r\n\
+             \x20\x20\x20\x20\x20 <Interval>PT1M</Interval>\r\n\
+             \x20\x20\x20\x20\x20 <Count>3</Count>\r\n\
+             \x20\x20\x20 </RestartOnFailure>\r\n\
+             \x20 </Settings>\r\n\
+             \x20 <Actions Context=\"Author\">\r\n\
+             \x20\x20\x20 <Exec>\r\n\
+             \x20\x20\x20\x20\x20 <Command>{exe_escaped}</Command>\r\n\
+             \x20\x20\x20\x20\x20 <Arguments>{flag_escaped}</Arguments>\r\n\
+             \x20\x20\x20 </Exec>\r\n\
+             \x20 </Actions>\r\n\
+             </Task>\r\n"
+        )
+    }
+
+    fn register_task_ps(dst: &Path, interactive: bool) -> Result<(), String> {
+        let principal = if interactive {
+            "$p=New-ScheduledTaskPrincipal -UserId ([Security.Principal.WindowsIdentity]::GetCurrent().Name) \
+             -LogonType Interactive -RunLevel Limited;"
+        } else {
+            "$p=New-ScheduledTaskPrincipal -UserId ([Security.Principal.WindowsIdentity]::GetCurrent().Name) \
+             -LogonType S4U -RunLevel Limited;"
+        };
+        let cmd = format!(
+            "Stop-ScheduledTask -TaskName '{task}' -ErrorAction SilentlyContinue; \
+             Unregister-ScheduledTask -TaskName '{task}' -Confirm:$false -ErrorAction SilentlyContinue; \
+             $a=New-ScheduledTaskAction -Execute '{exe}' -Argument '{flag}'; \
+             $t=New-ScheduledTaskTrigger -AtLogOn; \
+             $s=New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries \
+                  -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew \
+                  -ExecutionTimeLimit ([TimeSpan]::Zero) \
+                  -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1); \
+             $d='AI Unlocker: локальный DNS-релей'; \
+             {principal} \
+             Register-ScheduledTask -TaskName '{task}' -Action $a -Trigger $t -Settings $s \
+                  -Principal $p -Description $d -Force -ErrorAction Stop | Out-Null; \
+             Start-ScheduledTask -TaskName '{task}'",
+            exe = ps_quote(&dst.display().to_string()),
+            flag = FORWARDER_FLAG,
+            task = TASK_NAME
+        );
+        let out = powershell(&cmd).ok_or_else(|| "не удалось запустить PowerShell".to_string())?;
+        if out.status.success() {
+            Ok(())
+        } else {
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            Err(if stderr.is_empty() {
+                "не удалось зарегистрировать задачу".to_string()
+            } else {
+                stderr
+            })
+        }
+    }
+
+    fn register_via_schtasks_xml(dst: &Path) -> Result<(), String> {
+        let xml_path = env::temp_dir().join(format!("ag_dns_task_{}.xml", std::process::id()));
+        fs::write(&xml_path, render_schtasks_xml(dst, FORWARDER_FLAG))
+            .map_err(|e| format!("не записать XML задачи: {e}"))?;
+        let mut create = Command::new("schtasks");
+        create.args(["/Create", "/TN", TASK_NAME, "/XML"]);
+        create.arg(&xml_path);
+        create.arg("/F");
+        let created = bounded_output(no_window(&mut create), HELPER_LIMIT);
+        fs::remove_file(&xml_path).ok();
+        let Some(out) = created else {
+            return Err("schtasks /Create не ответил".to_string());
+        };
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            return Err(if !stderr.is_empty() {
+                stderr
+            } else if !stdout.is_empty() {
+                stdout
+            } else {
+                "schtasks /Create завершился с ошибкой".to_string()
+            });
+        }
+        let mut run = Command::new("schtasks");
+        run.args(["/Run", "/TN", TASK_NAME]);
+        let ran = bounded_output(no_window(&mut run), HELPER_LIMIT)
+            .ok_or_else(|| "schtasks /Run не ответил".to_string())?;
+        if ran.status.success() {
+            Ok(())
+        } else {
+            let stderr = String::from_utf8_lossy(&ran.stderr).trim().to_string();
+            let stdout = String::from_utf8_lossy(&ran.stdout).trim().to_string();
+            Err(if !stderr.is_empty() { stderr } else { stdout })
+        }
+    }
+
+    fn task_result_hint(code: &str) -> &'static str {
+        match code.trim().trim_start_matches("0x").trim_start_matches("0X").to_ascii_uppercase().as_str() {
+            "80070002" | "800700E1" => "; файл службы заблокирован или удалён антивирусом",
+            "80070422" => "; отключена служба Планировщика заданий Windows",
+            "80070569" | "80070520" | "8007052E" | "8004130F" | "41303" => {
+                "; система запретила запуск задачи для текущей учётной записи"
+            }
+            _ => "",
+        }
+    }
+
+    fn on_relay_started() {
+        if crate::settings::auto_patch_wanted() {
+            arm_desktop_shortcut();
+        }
+    }
+
     /// Copies this exe next to its log and registers the logon task. The copy is
     /// what makes autostart survive the user moving or deleting the download; it is
     /// removed again by `disable`.
@@ -163,122 +365,92 @@ mod windows_impl {
         let dst = installed_exe();
 
         fs::create_dir_all(&dir).map_err(|e| format!("не создать {}: {}", dir.display(), e))?;
+        // Remove the standalone watchdog task first so it cannot respawn
+        // `ag_dns.exe --watchdog` while we stop and verify the relay.
+        let _ = remove_watchdog_task();
         // The file cannot be replaced while the previous relay holds it open.
         stop_process();
+        crate::gate::clear();
         if src != dst {
             copy_over(&src, &dst)?;
         }
 
-        // S4U is what keeps the logon silent. A task action run under the default
-        // Interactive principal is handed a *visible* console (measured), so the
-        // relay flashes a window on every logon during the moment before it can
-        // call FreeConsole. S4U runs it outside any interactive session - same
-        // user, no password stored, and the console it gets is hidden. It needs
-        // the "log on as a batch job" right, so a machine that refuses falls back
-        // to the old principal rather than ending up with no task at all.
-        let cmd = format!(
-            "Stop-ScheduledTask -TaskName '{task}' -ErrorAction SilentlyContinue; \
-             $a=New-ScheduledTaskAction -Execute '{exe}' -Argument '{flag}'; \
-             $t=New-ScheduledTaskTrigger -AtLogOn; \
-             $s=New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries \
-                  -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew \
-                  -ExecutionTimeLimit ([TimeSpan]::Zero) \
-                  -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1); \
-             $d='AI Unlocker: локальный DNS-релей'; \
-             try {{ \
-               $p=New-ScheduledTaskPrincipal -UserId \"$env:USERDOMAIN\\$env:USERNAME\" \
-                    -LogonType S4U -RunLevel Limited; \
-               Register-ScheduledTask -TaskName '{task}' -Action $a -Trigger $t -Settings $s \
-                    -Principal $p -Description $d -Force -ErrorAction Stop | Out-Null }} \
-             catch {{ \
-               Register-ScheduledTask -TaskName '{task}' -Action $a -Trigger $t -Settings $s \
-                    -Description $d -Force -ErrorAction Stop | Out-Null }}; \
-             Start-ScheduledTask -TaskName '{task}'",
-            exe = dst.display(),
-            flag = FORWARDER_FLAG,
-            task = TASK_NAME
-        );
-
-        let out = powershell(&cmd).ok_or_else(|| "не удалось запустить PowerShell".to_string())?;
-        if !out.status.success() {
-            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-            return Err(if stderr.is_empty() {
-                "не удалось зарегистрировать задачу".to_string()
-            } else {
-                stderr
-            });
-        }
-        // Stamped here rather than left to the relay: the answer has to be right
-        // the moment the upgrade finishes, not a second later when the new process
-        // gets around to writing it, or the menu redraws still saying "outdated".
-        dns_forwarder::record_version();
-
-        // Registering the task is not the same as the relay running. It is a
-        // console process that exits 1 when it cannot bind 127.0.0.53:53, and the
-        // previous one can still be holding the socket for a moment after
-        // `stop_process()` returned - the task then sits at Ready with
-        // LastTaskResult 1 and there is no relay, while this function has already
-        // reported success. Observed exactly once, which is once more than a
-        // silent one should happen.
-        if wait_for_relay() {
-            return Ok(());
-        }
-        // Say what the task scheduler knows: 0x80070002 = the exe was blocked,
-        // 0x1 = it ran and exited, 0x41303 = it never ran.
-        let mut last = last_task_result();
-
-        // 0x41303 on a task that was just registered and started: the S4U
-        // principal was accepted by Register-ScheduledTask and then never run -
-        // Task Scheduler refuses a batch logon for the account (the right was
-        // withdrawn, a policy changed; seen 2026-11-11 with even a one-line test
-        // task, while an Interactive one ran at once, G93). The old principal is
-        // the fallback the comment above promises, so it is used for this too,
-        // not only when registering throws. Costs a console flash at logon.
-        if last.as_deref() == Some("41303") {
-            let cmd = format!(
-                "Stop-ScheduledTask -TaskName '{task}' -ErrorAction SilentlyContinue; \
-                 $a=New-ScheduledTaskAction -Execute '{exe}' -Argument '{flag}'; \
-                 $t=New-ScheduledTaskTrigger -AtLogOn; \
-                 $s=New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries \
-                      -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew \
-                      -ExecutionTimeLimit ([TimeSpan]::Zero) \
-                      -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1); \
-                 Register-ScheduledTask -TaskName '{task}' -Action $a -Trigger $t \
-                      -Settings $s -Description 'AI Unlocker: локальный DNS-релей' \
-                      -Force -ErrorAction Stop | Out-Null; \
-                 Start-ScheduledTask -TaskName '{task}'",
-                exe = dst.display(),
-                flag = FORWARDER_FLAG,
-                task = TASK_NAME
-            );
-            if powershell(&cmd).is_some_and(|o| o.status.success()) {
-                if wait_for_relay() {
-                    return Ok(());
-                }
-                last = last_task_result();
+        // S4U keeps logon silent, but some Windows editions/accounts reject S4U
+        // with codes other than 0x41303 or retain stale LastTaskResult unless
+        // unregistered first; fall back to explicit Interactive via PS and then
+        // `schtasks /Create /XML` when WMI/ScheduledTasks cmdlets fail.
+        let s4u_reg = register_task_ps(&dst, false);
+        if s4u_reg.is_ok() {
+            dns_forwarder::record_version();
+            if wait_for_relay(6) {
+                on_relay_started();
+                return Ok(());
             }
         }
+
+        if !dst.exists() {
+            return Err(format!(
+                "антивирус удалил файл службы ({}) — добавьте его в исключения",
+                dst.display()
+            ));
+        }
+
+        if s4u_reg.is_ok() && register_task_ps(&dst, true).is_ok() {
+            dns_forwarder::record_version();
+            if wait_for_relay(8) {
+                on_relay_started();
+                return Ok(());
+            }
+        }
+
+        if !dst.exists() {
+            return Err(format!(
+                "антивирус удалил файл службы ({}) — добавьте его в исключения",
+                dst.display()
+            ));
+        }
+
+        let xml_res = register_via_schtasks_xml(&dst);
+        if xml_res.is_ok() {
+            dns_forwarder::record_version();
+            if wait_for_relay(6) {
+                on_relay_started();
+                return Ok(());
+            }
+        }
+
+        if !dst.exists() {
+            return Err(format!(
+                "антивирус удалил файл службы ({}) — добавьте его в исключения",
+                dst.display()
+            ));
+        }
+
+        let last = last_task_result();
         Err(match last {
             Some(code) => format!(
-                "задача создана, но релей не запустился (код задачи 0x{code}; подробности в forwarder.log)"
+                "задача создана, но релей не запустился (код задачи 0x{code}{}; подробности в forwarder.log)",
+                task_result_hint(&code)
             ),
-            None => "задача создана, но релей не запустился".to_string(),
+            None => match s4u_reg.err().or_else(|| xml_res.err()) {
+                Some(reason) if !reason.is_empty() => {
+                    format!("не удалось запустить службу обхода: {reason}")
+                }
+                _ => "задача создана, но релей не запустился".to_string(),
+            },
         })
     }
 
-    /// How long to give the relay to appear: about 18 s in all. A cold start of a
-    /// fresh exe under antivirus can take well over the 3.6 s this used to allow.
-    /// Waits for the relay process to appear after its task was started.
-    fn wait_for_relay() -> bool {
-        for attempt in 0..RELAY_START_TRIES {
+    /// Waits for the relay process to appear AND publish a fresh `gate.json`.
+    /// Checking the process name alone can mistake `--watchdog` for the relay
+    /// or return before a stalled/early-exiting relay has started.
+    fn wait_for_relay(tries: usize) -> bool {
+        for attempt in 0..tries {
             thread::sleep(RELAY_START_SETTLE);
-            if is_running() {
+            if is_running() && crate::gate::read().is_some_and(|r| !r.is_stale()) {
                 return true;
             }
-            // Re-poke the task only twice, a few seconds apart: a cold first start
-            // (antivirus scan of a fresh exe in ProgramData) is slow, and a start
-            // request on top of a still-starting instance is ignored anyway.
-            if attempt + 1 < RELAY_START_TRIES && attempt % 4 == 3 {
+            if attempt + 1 < tries && attempt % 4 == 3 {
                 powershell(&format!("Start-ScheduledTask -TaskName '{}'", TASK_NAME));
             }
         }
@@ -296,7 +468,6 @@ mod windows_impl {
     }
 
     const RELAY_START_SETTLE: Duration = Duration::from_millis(1500);
-    const RELAY_START_TRIES: usize = 12;
 
     /// Replaces `dst` with `src`, retrying while the old file is still held.
     ///
@@ -360,13 +531,11 @@ mod windows_impl {
     /// it every time.
     pub fn ensure_running() -> Result<(), String> {
         if is_enabled() && is_running() && installed_copy_is_current() {
+            on_relay_started();
             return remove_watchdog_task();
         }
         enable()?;
         crate::launch_guard::uninstall()?;
-        if crate::settings::auto_patch_wanted() {
-            arm_desktop_shortcut();
-        }
         remove_watchdog_task()
     }
 
@@ -432,7 +601,7 @@ mod windows_impl {
                   -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1); \
              $d='AI Unlocker: сторож патча'; \
              try {{ \
-               $p=New-ScheduledTaskPrincipal -UserId \"$env:USERDOMAIN\\$env:USERNAME\" \
+               $p=New-ScheduledTaskPrincipal -UserId ([Security.Principal.WindowsIdentity]::GetCurrent().Name) \
                     -LogonType S4U -RunLevel Limited; \
                Register-ScheduledTask -TaskName '{task}' -Action $a -Trigger $t -Settings $s \
                     -Principal $p -Description $d -Force -ErrorAction Stop | Out-Null }} \
@@ -440,7 +609,7 @@ mod windows_impl {
                Register-ScheduledTask -TaskName '{task}' -Action $a -Trigger $t -Settings $s \
                     -Description $d -Force -ErrorAction Stop | Out-Null }}; \
              Start-ScheduledTask -TaskName '{task}' -ErrorAction SilentlyContinue",
-            exe = exe.display(),
+            exe = ps_quote(&exe.display().to_string()),
             flag = WATCHDOG_FLAG,
             task = WATCHDOG_TASK_NAME
         );
@@ -609,6 +778,43 @@ mod windows_impl {
             assert!(log.starts_with(&local), "got {}", log.display());
             assert_eq!(log.parent(), Some(dns_forwarder::log_dir().as_path()));
             assert_ne!(log.parent(), Some(install_dir().as_path()));
+        }
+
+        #[test]
+        fn win32_process_check_finds_current_exe_and_rejects_missing() {
+            let current = env::current_exe().unwrap();
+            let name = current.file_name().unwrap().to_str().unwrap();
+            assert_eq!(process_running_win32(name), Some(true));
+            assert_eq!(
+                process_running_win32("no_such_ag_unlocker_proc_9f3c.exe"),
+                Some(false)
+            );
+        }
+
+        #[test]
+        fn schtasks_xml_escapes_paths_and_sets_interactive_settings() {
+            let xml = render_schtasks_xml(
+                Path::new(r"C:\ProgramData\A&B\ag_dns.exe"),
+                "--dns-forwarder",
+            );
+            assert!(xml.contains("<LogonType>InteractiveToken</LogonType>"));
+            assert!(xml.contains("<RunLevel>LeastPrivilege</RunLevel>"));
+            assert!(xml.contains("<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>"));
+            assert!(xml.contains("<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>"));
+            assert!(xml.contains("<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>"));
+            assert!(xml.contains("<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>"));
+            assert!(xml.contains("<Command>C:\\ProgramData\\A&amp;B\\ag_dns.exe</Command>"));
+            assert!(xml.contains("<Arguments>--dns-forwarder</Arguments>"));
+        }
+
+        #[test]
+        fn task_result_hints_classify_common_windows_failures() {
+            assert!(task_result_hint("80070002").contains("антивирус"));
+            assert!(task_result_hint("0x800700e1").contains("антивирус"));
+            assert!(task_result_hint("80070422").contains("Планировщика"));
+            assert!(task_result_hint("80070569").contains("запретила"));
+            assert!(task_result_hint("41303").contains("запретила"));
+            assert_eq!(task_result_hint("1"), "");
         }
     }
 }

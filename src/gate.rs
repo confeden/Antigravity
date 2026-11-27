@@ -344,6 +344,25 @@ pub fn note_started() {
     update(|_| {});
 }
 
+/// Refreshes the record's timestamp mid-pass so slow network/WMI work does not
+/// make a live relay look stale.
+pub fn touch() {
+    update(|_| {});
+}
+
+/// Removes any leftover record before starting a fresh relay instance.
+pub fn clear() {
+    if cfg!(test) {
+        return;
+    }
+    if let Ok(mut guard) = CURRENT.lock() {
+        *guard = None;
+    }
+    if let Some(p) = path() {
+        std::fs::remove_file(p).ok();
+    }
+}
+
 /// Records what keeps `what` (`dns`, `door` or `proxy`) from binding, or clears
 /// it.
 /// Written through at once rather than at the next warm pass.

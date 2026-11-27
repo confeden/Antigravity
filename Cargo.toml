@@ -1,6 +1,6 @@
 [package]
 name = "ag_unlocker"
-version = "2.35.2"
+version = "2.36.0"
 edition = "2021"
 description = "AI Unlocker"
 authors = ["Brent t.me/nova_txt"]

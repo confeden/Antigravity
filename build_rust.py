@@ -1158,7 +1158,7 @@ def main(argv=None):
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
     print("[INFO] Starting build process...")
 
-    VERSION = "2.35.2"
+    VERSION = "2.36.0"
     version = VERSION
     cargo_version = ".".join(version.split("_")[0].split(".")[:3])
     print(f"[INFO] Build version: {version}")

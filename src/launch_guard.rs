@@ -1,6 +1,7 @@
 //! The NSIS installer opens the preserved Start Menu shortcut after installing.
 //! Only that shortcut uses the helper. IFEO remains retired (N38, G94).
 use std::ffi::{OsStr, OsString};
+use std::fs;
 use std::io;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
@@ -117,18 +118,78 @@ pub fn run_shortcut() {
         return;
     };
     let args: Vec<_> = args.collect();
-    if args.iter().any(|a| a == "--updated") && crate::settings::auto_patch_wanted() {
+    let has_updated = args.iter().any(|a| a == "--updated");
+    if crate::settings::auto_patch_wanted() {
         let server = app
             .with_file_name("resources")
             .join("bin")
             .join("language_server.exe");
-        if let Err(e) = patch_after_update(&server, &crate::watchdog::updater_dirs()) {
-            crate::watchdog::log(&format!("Desktop update patch skipped: {e}"));
+        let stamp = desktop_patch_stamp_path();
+        if let Err(e) = patch_on_shortcut_launch(
+            &server,
+            &crate::watchdog::updater_dirs(),
+            &stamp,
+            has_updated,
+        ) {
+            crate::watchdog::log(&format!("Desktop launch patch skipped: {e}"));
         }
     }
     if let Err(e) = Command::new(&app).args(args).spawn() {
         report_launch_error(&e.to_string());
     }
+}
+
+fn desktop_patch_stamp_path() -> PathBuf {
+    crate::dns_forwarder::log_dir().join("desktop_patch_stamp.txt")
+}
+
+fn server_stamp(server: &Path) -> Option<String> {
+    let meta = fs::metadata(server).ok()?;
+    let modified = meta.modified().ok()?;
+    let dur = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
+    Some(format!(
+        "{}\n{}\n{}:{}",
+        server.to_string_lossy().to_ascii_lowercase(),
+        meta.len(),
+        dur.as_secs(),
+        dur.subsec_nanos()
+    ))
+}
+
+fn stamp_matches(stamp_path: &Path, server: &Path) -> bool {
+    let Some(cur) = server_stamp(server) else {
+        return false;
+    };
+    fs::read_to_string(stamp_path).is_ok_and(|saved| saved == cur)
+}
+
+fn write_stamp(stamp_path: &Path, server: &Path) {
+    let Some(stamp) = server_stamp(server) else {
+        return;
+    };
+    if let Some(parent) = stamp_path.parent() {
+        fs::create_dir_all(parent).ok();
+    }
+    fs::write(stamp_path, stamp).ok();
+}
+
+fn patch_on_shortcut_launch(
+    server: &Path,
+    dirs: &[PathBuf],
+    stamp_path: &Path,
+    has_updated: bool,
+) -> Result<(), String> {
+    if !has_updated {
+        if crate::patch_binary::is_image_locked(server) {
+            return Ok(());
+        }
+        if !updater_busy(dirs).unwrap_or(false) && stamp_matches(stamp_path, server) {
+            return Ok(());
+        }
+    }
+    patch_after_update(server, dirs)?;
+    write_stamp(stamp_path, server);
+    Ok(())
 }
 
 fn is_desktop_exe(path: &Path) -> bool {
@@ -537,5 +598,43 @@ if ($link.TargetPath -ne $app -or $link.Arguments -or $link.WorkingDirectory -ne
         let mut exit = 0;
         assert_ne!(unsafe { GetExitCodeProcess(child.0, &mut exit) }, 0);
         assert_eq!(exit, 7);
+    }
+
+    #[test]
+    fn shortcut_launch_patches_without_updated_flag_and_uses_stamp_cache() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let dir = std::env::temp_dir().join(format!("agu-stamp-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let server = dir.join("language_server.exe");
+        let stamp = dir.join("desktop_patch_stamp.txt");
+        let dirs: Vec<PathBuf> = Vec::new();
+
+        fs::write(&server, b"..ineligible..https_proxy..").unwrap();
+        patch_on_shortcut_launch(&server, &dirs, &stamp, false).unwrap();
+        assert_eq!(fs::read(&server).unwrap(), b"..inexigible..AG_LS_PROXY..");
+        assert!(stamp_matches(&stamp, &server));
+
+        // Simulate an already-running Desktop binary while stamp is cached: must skip cleanly.
+        {
+            let _holder = fs::OpenOptions::new()
+                .read(true)
+                .share_mode(1)
+                .open(&server)
+                .unwrap();
+            patch_on_shortcut_launch(&server, &dirs, &stamp, false).unwrap();
+        }
+
+        // Replace with a newer build (different length) and launch without --updated.
+        fs::write(&server, b"..new-build..ineligible..https_proxy..").unwrap();
+        assert!(!stamp_matches(&stamp, &server));
+        patch_on_shortcut_launch(&server, &dirs, &stamp, false).unwrap();
+        assert_eq!(
+            fs::read(&server).unwrap(),
+            b"..new-build..inexigible..AG_LS_PROXY.."
+        );
+        assert!(stamp_matches(&stamp, &server));
+
+        fs::remove_dir_all(&dir).ok();
     }
 }

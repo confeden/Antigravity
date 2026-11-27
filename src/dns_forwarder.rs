@@ -176,7 +176,9 @@ pub const LISTEN_PORT: u16 = 53;
 /// 56 = PAID gateway diagnostics (conn ID, stage, reason), post-CONNECT drop logging, and PAID tunnel attribution.
 /// 57 = Backpressure-safe upload buffering in tls_pump_report (fixes >100 KB unexpected EOF) and clean TLS EOF handling.
 /// 58 = Updated DNS-AI default endpoints (removed retired spb3) and 24h auto-refresh from GitHub endpoints.json.
-pub const RELAY_VERSION: u32 = 58;
+/// 59 = Write gate.json immediately on relay start before egress WMI probe, reuse warm_forever's egress probe in cache, and refresh gate.json mid-pass.
+/// 60 = Always arm Antigravity Desktop shortcut on relay enable/fast-path and watchdog loop, retry locked Desktop binary immediately upon unlock, and patch on any Start Menu launch via stamp cache.
+pub const RELAY_VERSION: u32 = 60;
 
 /// Written where an unelevated relay can write and an unelevated unlocker can
 /// read. Absent means a relay from before versioning, i.e. older than anything.
@@ -418,6 +420,16 @@ fn invalidate_interface() {
     }
 }
 
+fn cache_egress(eg: Option<&egress::Egress>) {
+    let (idx, good_for) = match eg {
+        Some(e) => (e.if_index, EGRESS_TTL),
+        None => (0, EGRESS_RETRY),
+    };
+    if let Ok(mut cache) = EGRESS_CACHE.lock() {
+        *cache = Some((idx, Instant::now(), good_for));
+    }
+}
+
 fn isp_interface() -> u32 {
     if let Ok(cache) = EGRESS_CACHE.lock() {
         if let Some((idx, at, good_for)) = *cache {
@@ -430,14 +442,9 @@ fn isp_interface() -> u32 {
     // physical egress to name, but a poor thing to remember for long: at logon
     // the network is often simply not up yet, and caching the miss would leave
     // half an hour of unsubstituted answers.
-    let (idx, good_for) = match egress::detect() {
-        Some(eg) => (eg.if_index, EGRESS_TTL),
-        None => (0, EGRESS_RETRY),
-    };
-    if let Ok(mut cache) = EGRESS_CACHE.lock() {
-        *cache = Some((idx, Instant::now(), good_for));
-    }
-    idx
+    let eg = egress::detect();
+    cache_egress(eg.as_ref());
+    eg.map_or(0, |e| e.if_index)
 }
 
 /// Relays one query and reports which provider answered and whether that answer
@@ -558,6 +565,7 @@ fn warm_forever() {
     let mut since_vpn = VPN_CHECK_EVERY;
     let mut since_exit_check = Duration::ZERO;
     let mut last_best: Option<u32> = None;
+    let mut last_logged_egress: Option<u32> = None;
     loop {
         // One small record per pass, for a window that is another process and
         // can otherwise only read the log meant for a person (P29). **First** in
@@ -604,6 +612,12 @@ fn warm_forever() {
             // own (`routes::Kind::Vpn`), whenever it exits somewhere the gate
             // does not apply.
             let eg = egress::detect();
+            cache_egress(eg.as_ref());
+            let eg_idx = eg.as_ref().map_or(0, |e| e.if_index);
+            if last_logged_egress != Some(eg_idx) {
+                log(&format!("egress: if{}", eg_idx));
+                last_logged_egress = Some(eg_idx);
+            }
             let tunnel = eg.as_ref().is_some_and(|e| e.vpn_active);
             let was = net::tunnel_up();
             net::set_pin_interface(match &eg {
@@ -652,6 +666,7 @@ fn warm_forever() {
             }
             since_vpn = Duration::ZERO;
         }
+        gate::touch();
         if net::tunnel_up() && since_exit_check >= VPN_EXIT_EVERY {
             measure_vpn_exit();
             since_exit_check = Duration::ZERO;
@@ -674,6 +689,7 @@ fn warm_forever() {
         // seconds plus its probes.
         crate::dns_route::refresh_settings();
         resolvers::warm(dns::core_namespaces(), egress);
+        gate::touch();
         // The relay is somebody else's server, so it is the one route we never
         // probe on a timer. A health check every two minutes, from every machine
         // running this tool, is precisely the `handshake_completed` beacon a relay
@@ -1203,14 +1219,9 @@ const PROXY_START_BUDGET: Duration = Duration::from_secs(30);
 /// watchdog. Not one of those needs port 53. That user had a working bypass
 /// available the whole time and got nothing.
 pub fn run() -> Result<(), String> {
-    // Detect once up front. Otherwise the first query pays for a cold probe,
-    // which is long enough that Windows gives up on us and falls back to the
-    // direct resolvers - and then caches that unsubstituted answer for its full
-    // TTL, so one slow startup is felt for minutes.
-    log(&format!("egress: if{}", isp_interface()));
     record_version();
-    // Before any listener is tried: from here on the window can tell this
-    // process from its own watchdog by the age of what it writes (P54).
+    // Before any listener or WMI egress check: from here on the window can tell
+    // this process from its own watchdog by the age of what it writes (P54).
     gate::note_started();
     thread::spawn(warm_forever);
     crate::dns_route::start();
@@ -1233,9 +1244,8 @@ pub fn run() -> Result<(), String> {
     // that knows which provider is substituting right now. It only ever carries
     // traffic that is actually pointed at it, so starting it here costs a
     // listening socket and nothing else.
-    let egress = isp_interface();
-    thread::spawn(move || {
-        if let Err(e) = proxy::run(egress) {
+    thread::spawn(|| {
+        if let Err(e) = proxy::run(0) {
             log_proxy(&format!("not started: {}", e));
         }
     });
@@ -1706,6 +1716,19 @@ mod tests {
     fn a_failed_detection_is_remembered_only_briefly() {
         assert!(EGRESS_RETRY < EGRESS_TTL);
         assert!(EGRESS_RETRY <= Duration::from_secs(60));
+    }
+
+    #[test]
+    fn cache_egress_populates_isp_interface_without_shell() {
+        let eg = egress::Egress {
+            if_index: 42,
+            vpn_active: false,
+        };
+        cache_egress(Some(&eg));
+        assert_eq!(isp_interface(), 42);
+        cache_egress(None);
+        assert_eq!(isp_interface(), 0);
+        invalidate_interface();
     }
 
     /// Relays a real query end to end through the running upstream, and prints

@@ -505,7 +505,9 @@ fn run_worker(
                         .name("vpn-probe".to_string())
                         .spawn(move || {
                             let (vpn, relay_egress) = measure_vpn();
-                            let relay = background::is_enabled() && background::is_running();
+                            let relay = background::is_enabled()
+                                && background::is_running()
+                                && relay_reporting();
                             MEASURING_VPN.store(false, Ordering::SeqCst);
                             let _ = back.send(Cmd::Probed {
                                 vpn,
@@ -1531,12 +1533,6 @@ fn repair(ctx: &mut Ctx) {
         );
         return;
     }
-    // DNS is put back only when it was wanted, or when nothing else is: a user
-    // running just their own proxy must not get DNS rules from a repair.
-    let with_dns = ctx.settings.dns || !routes_want_relay(&ctx.settings);
-    if with_dns {
-        ctx.settings.dns = true;
-    }
     // `ensure_running` reinstalls only a copy that differs from this build;
     // a relay that is merely stopped or outdated needs the full `enable`.
     if let Err(e) = background::enable() {
@@ -1544,6 +1540,21 @@ fn repair(ctx: &mut Ctx) {
         return;
     }
     ctx.log(Level::Ok, "Служба обхода переустановлена и запущена.");
+    if crate::paid::antigravity_enabled() {
+        if crate::proxy::wait_for_our_paid_listener(Duration::from_secs(10)).is_none() {
+            ctx.log(
+                Level::Warn,
+                "Платный локальный прокси ещё не ответил — проверьте вкладку «Журнал».",
+            );
+        }
+        return;
+    }
+    // DNS is put back only when it was wanted, or when nothing else is: a user
+    // running just their own proxy must not get DNS rules from a repair.
+    let with_dns = ctx.settings.dns || !routes_want_relay(&ctx.settings);
+    if with_dns {
+        ctx.settings.dns = true;
+    }
     if with_dns {
         enable_dns(ctx);
     } else {
