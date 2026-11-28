@@ -118,7 +118,7 @@ fn save_license_cache_to(path: &std::path::Path, cache: &LicenseCache) -> Result
     }
     let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
     let body = serde_json::to_vec(cache).map_err(|err| err.to_string())?;
-    fs::write(&tmp, body).map_err(|err| err.to_string())?;
+    crate::secret_file::create_new(&tmp, &body).map_err(|err| err.to_string())?;
     if let Err(err) = fs::rename(&tmp, path) {
         fs::remove_file(&tmp).ok();
         return Err(err.to_string());
@@ -201,7 +201,7 @@ impl Device {
         fs::create_dir_all(crate::dns_forwarder::log_dir()).map_err(|err| err.to_string())?;
         let scratch = path.with_extension(format!("{}.tmp", std::process::id()));
         let data = serde_json::to_vec(&device).map_err(|err| err.to_string())?;
-        fs::write(&scratch, data).map_err(|err| err.to_string())?;
+        crate::secret_file::create_new(&scratch, &data).map_err(|err| err.to_string())?;
         if let Err(error) = fs::hard_link(&scratch, &path) {
             fs::remove_file(scratch).map_err(|cleanup| format!("{error}; {cleanup}"))?;
             if error.kind() == io::ErrorKind::AlreadyExists {

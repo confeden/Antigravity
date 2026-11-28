@@ -12,8 +12,8 @@ hex = "0.4"
 regex = "1.10"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
-webpki-roots = "1"
+rustls = { version = "0.23.46", default-features = false, features = ["std", "ring", "tls12"] }
+webpki-roots = "1.0.10"
 # Decrypts the relay credential baked in by build.rs (owner build only; the
 # private src/relay.rs is the only user).
 aes-gcm = "0.10"

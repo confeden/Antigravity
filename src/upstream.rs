@@ -243,10 +243,12 @@ pub fn parse(input: &str) -> Result<Upstream, String> {
     if raw.is_empty() {
         return Err("пустая строка".to_string());
     }
-    let rest = raw
-        .strip_prefix("http://")
-        .or_else(|| raw.strip_prefix("https://"))
-        .unwrap_or(raw);
+    // CONNECT below uses a plain TCP transport to the proxy. Never silently
+    // downgrade a URL whose scheme promises TLS, especially with Basic auth.
+    if raw.get(..8).is_some_and(|s| s.eq_ignore_ascii_case("https://")) {
+        return Err("HTTPS-прокси пока не поддерживается: TLS к прокси не реализован".to_string());
+    }
+    let rest = raw.strip_prefix("http://").unwrap_or(raw);
     if rest.contains("://") {
         return Err("поддерживается только HTTP-прокси (http://…)".to_string());
     }
@@ -295,7 +297,7 @@ pub fn save(up: &Upstream) -> Result<(), String> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     }
-    fs::write(&path, up.as_line()).map_err(|e| e.to_string())
+    crate::settings::write_replacing(&path, &up.as_line()).map_err(|e| e.to_string())
 }
 
 pub fn try_clear() -> std::io::Result<()> {
@@ -674,6 +676,15 @@ mod tests {
         let (ip, loc) = machine_exit().expect("a trace");
         println!("exit ip={} loc={}", ip, loc);
         assert!(!ip.is_empty() && loc.len() == 2, "ip={} loc={}", ip, loc);
+    }
+
+    #[test]
+    fn rejects_https_proxy_without_leaking_its_credentials() {
+        for input in ["https://user:secret@proxy.test:443", " HTTPS://proxy.test:443 "] {
+            let error = parse(input).expect_err("plain CONNECT cannot promise TLS");
+            assert!(error.contains("TLS"));
+            assert!(!error.contains("secret"));
+        }
     }
 
     #[test]
