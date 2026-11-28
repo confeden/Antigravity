@@ -64,6 +64,7 @@ mod portcheck;
 mod proxy;
 mod resolvers;
 mod routes;
+mod secret_file;
 mod settings;
 mod stale_env;
 mod tui;

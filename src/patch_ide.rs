@@ -22,17 +22,18 @@ fn backup_path(target: &Path) -> PathBuf {
 
 /// Copies `target` to its `.ag_backup` once - never overwriting an existing one,
 /// which is by construction the pristine copy from before we ever touched it.
-/// Best-effort: a failed backup must not stop a patch (the same-marker check
-/// still prevents double-patching), but it is logged so a missing backup is not
-/// silent.
-fn backup_once(target: &Path) {
+/// Refuse to patch without a usable pristine copy. Never overwrite or follow
+/// a pre-existing backup symlink, and do not keep a partially written backup.
+fn backup_once(target: &Path) -> std::io::Result<()> {
     let bak = backup_path(target);
-    if bak.exists() {
-        return;
+    match fs::symlink_metadata(&bak) {
+        Ok(metadata) if metadata.is_file() && metadata.len() > 0 => return Ok(()),
+        Ok(_) => return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid JS backup")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+        Err(error) => return Err(error),
     }
-    if let Err(e) = fs::copy(target, &bak) {
-        eprintln!("  [WARN] бэкап {} не создан: {}", target.display(), e);
-    }
+    let data = fs::read(target)?;
+    crate::secret_file::create_new(&bak, &data)
 }
 
 /// Writes `content` to `path` without a torn intermediate state: a sibling temp
@@ -204,7 +205,7 @@ pub fn patch_ide(_inst: &Path, main_js: &Path) -> Result<(), String> {
         );
         // Pristine copy before the first edit, so the revert can restore it (G25),
         // then an atomic write so a crash cannot leave a half-written main.js.
-        backup_once(main_js);
+        backup_once(main_js).map_err(|e| format!("не создан бэкап: {e}"))?;
         write_atomic(main_js, &new_content).map_err(|e| e.to_string())?;
         Ok(())
     } else {
@@ -317,7 +318,7 @@ const proxyServer = http.createServer((req, res) => {
 
                 const pattern2 = /let ([A-Za-z_$]+)=.*\.getUserStatus\(\{\}\)\)\)\.userStatus;if\(\1\)\{/g;
                 body = body.replace(pattern2, (match, p1) => {
-                    return match.replace(`if(${p1}){`, `${p1}={planStatus:{planInfo:{planName:"pro"}}, disableTelemetry:false, userDataCollectionForceDisabled:false};if(${p1}){`);
+                    return match.replace(`if(${p1}){`, `${p1}={planStatus:{planInfo:{planName:"pro"}}, disableTelemetry:true, userDataCollectionForceDisabled:true};if(${p1}){`);
                 });
 
                 let outBuffer = Buffer.from(body, 'utf-8');
@@ -361,8 +362,8 @@ const apiProxyServer = http.createServer((req, res) => {
                     planStatus: { planInfo: { planName: "pro", isEligible: true } },
                     eligible: true,
                     ineligibleReason: null,
-                    disableTelemetry: false,
-                    userDataCollectionForceDisabled: false,
+                    disableTelemetry: true,
+                    userDataCollectionForceDisabled: true,
                     allowedTiers: [{ id: "STANDARD", name: "Standard", isDefault: true }]
                 }
             }));
@@ -475,7 +476,7 @@ fn apply_desktop_inline_patches(content: &str) -> String {
             return caps.get(0).map_or("", |m| m.as_str()).to_string();
         }
         let v = caps.get(1).map_or("", |m| m.as_str());
-        format!("let {v}=...getUserStatus({{}}))).userStatus;{v}={{\"planStatus\":{{\"planInfo\":{{\"planName\":\"pro\"}}}},\"disableTelemetry\":false,\"userDataCollectionForceDisabled\":false}};if({v}){{")
+        format!("let {v}=...getUserStatus({{}}))).userStatus;{v}={{\"planStatus\":{{\"planInfo\":{{\"planName\":\"pro\"}}}},\"disableTelemetry\":true,\"userDataCollectionForceDisabled\":true}};if({v}){{")
     }).to_string();
 
     let re_auth = Regex::new(r#"_handleAuthErrorResponse\(([A-Za-z_$]+)\)\{var ([A-Za-z_$]+)=([A-Za-z_$]+)\?\.failureDetails;"#).unwrap();
@@ -532,6 +533,18 @@ mod tests {
         assert!(!has_marker(""));
     }
 
+    #[test]
+    fn backup_failure_is_reported_without_overwriting_the_target() {
+        let dir = std::env::temp_dir().join(format!("ag-backup-failure-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("main.js");
+        fs::write(&target, "pristine").unwrap();
+        fs::create_dir(backup_path(&target)).unwrap();
+        assert!(backup_once(&target).is_err());
+        assert_eq!(fs::read_to_string(&target).unwrap(), "pristine");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     /// The G25 fix, end to end on real files: a backup taken before a rewrite is
     /// what `restore_js` uses to put the exact original bytes back, and the backup
     /// is then removed. Without this the full revert left main.js patched.
@@ -544,12 +557,12 @@ mod tests {
         fs::write(&target, original).unwrap();
 
         // First backup captures the pristine file.
-        backup_once(&target);
+        backup_once(&target).unwrap();
         assert!(backup_path(&target).exists());
         // A "patch": rewrite the body and append a marker.
         write_atomic(&target, "REWRITTEN BODY\n// UNLOCKED").unwrap();
         // A second backup must NOT overwrite the pristine one.
-        backup_once(&target);
+        backup_once(&target).unwrap();
 
         assert_eq!(restore_js(&target).unwrap(), true);
         assert_eq!(fs::read_to_string(&target).unwrap(), original, "byte-exact");
@@ -679,7 +692,7 @@ pub fn patch_extension_js(inst: &Path) -> Result<bool, String> {
         new_content,
         crate::canary::file_marker()
     );
-    backup_once(&ext_path);
+    backup_once(&ext_path).map_err(|e| format!("не создан бэкап: {e}"))?;
     write_atomic(&ext_path, &marked).map_err(|e| e.to_string())?;
     Ok(true)
 }

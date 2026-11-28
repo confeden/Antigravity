@@ -314,22 +314,21 @@ fn parse(text: &str) -> Option<Settings> {
 /// the relay re-reads this every 20 s - sees the old file or the new one, never
 /// the empty one `fs::write` leaves between truncating and writing. Per process,
 /// so two savers never share a temp.
-fn write_replacing(path: &Path, text: &str) -> std::io::Result<()> {
+pub(crate) fn write_replacing(path: &Path, text: &str) -> std::io::Result<()> {
     let mut tmp = path.as_os_str().to_os_string();
     tmp.push(format!(".{}.tmp", std::process::id()));
     let tmp = PathBuf::from(tmp);
-    let mut result = std::fs::write(&tmp, text);
-    if result.is_ok() {
-        // A reader that opened the file without delete sharing - a scanner, an
-        // editor - blocks the rename for as long as it holds it. Brief, usually.
-        for attempt in 0..3 {
-            result = std::fs::rename(&tmp, path);
-            if result.is_ok() {
-                break;
-            }
-            if attempt < 2 {
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
+    crate::secret_file::create_new(&tmp, text.as_bytes())?;
+    let mut result = Ok(());
+    // A reader that opened the file without delete sharing - a scanner, an
+    // editor - blocks the rename for as long as it holds it. Brief, usually.
+    for attempt in 0..3 {
+        result = std::fs::rename(&tmp, path);
+        if result.is_ok() {
+            break;
+        }
+        if attempt < 2 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
         }
     }
     if result.is_err() {
@@ -596,11 +595,39 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("settings.json");
         std::fs::write(&file, "old").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
         write_replacing(&file, "{\"dns\": false}").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
+        }
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "{\"dns\": false}");
         let leftovers = std::fs::read_dir(&dir).unwrap().count();
         assert_eq!(leftovers, 1, "only the file itself");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_refuses_a_preexisting_temp_symlink() {
+        let dir = std::env::temp_dir().join(format!("ag-settings-symlink-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("settings.json");
+        let victim = dir.join("victim");
+        std::fs::write(&file, "old settings").unwrap();
+        std::fs::write(&victim, "untouched").unwrap();
+        let tmp = dir.join(format!("settings.json.{}.tmp", std::process::id()));
+        std::os::unix::fs::symlink(&victim, &tmp).unwrap();
+        assert!(write_replacing(&file, "dummy secret").is_err());
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "untouched");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "old settings");
+        assert!(std::fs::symlink_metadata(&tmp).unwrap().file_type().is_symlink());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
