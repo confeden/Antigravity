@@ -16,6 +16,7 @@ mod theme;
 mod widgets;
 #[cfg(windows)]
 mod windows_controls;
+mod update_controls;
 
 use eframe::egui;
 use std::sync::mpsc::{channel, Receiver};
@@ -48,9 +49,8 @@ pub struct App {
     store_test: Option<store_test::Activation>,
     /// Raised when a newer release is on GitHub.
     update: Option<ReleaseInfo>,
-    update_rx: Receiver<ReleaseInfo>,
-    #[cfg(windows)]
-    windows_update: windows_controls::Update,
+    update_rx: Receiver<Option<ReleaseInfo>>,
+    app_update: update_controls::Update,
     #[cfg(windows)]
     startup: windows_controls::Startup,
 
@@ -143,8 +143,7 @@ impl App {
             paid_activation: paid_activation::PaidActivation::new(),
             update: None,
             update_rx,
-            #[cfg(windows)]
-            windows_update: windows_controls::Update::default(),
+            app_update: update_controls::Update::default(),
             #[cfg(windows)]
             startup: windows_controls::Startup::default(),
             worker,
@@ -175,25 +174,11 @@ impl App {
     }
 
     fn is_busy(&self) -> bool {
-        self.busy.is_some()
-    }
-
-    #[cfg(not(windows))]
-    fn update_banner(&self, ui: &mut egui::Ui) {
-        let Some(rel) = &self.update else { return };
-        let label = format!("⬆  Доступна новая версия — {}", rel.display_version());
-        let colors = theme::palette(ui);
-        let btn = egui::Button::new(egui::RichText::new(label).color(colors.on_accent))
-            .fill(colors.accent)
-            .corner_radius(egui::CornerRadius::same(theme::RADIUS_SMALL))
-            .min_size(egui::vec2(ui.available_width(), 32.0));
-        if ui.add(btn).clicked() {
-            // Always /latest, never the tag URL from the API response: the point
-            // is to land the user on whatever is newest when they click, not on
-            // the release this process happened to see hours ago.
-            crate::utils::open_url(update::RELEASES_LATEST_URL);
+        #[cfg(windows)]
+        if self.paid_activation.busy() || self.startup.applying() {
+            return true;
         }
-        ui.add_space(10.0);
+        self.busy.is_some()
     }
 
     /// Re-launches this exe elevated and closes the current window.
@@ -205,7 +190,12 @@ impl App {
     fn request_elevation(&self) {
         #[cfg(target_os = "windows")]
         {
-            if crate::utils::relaunch_elevated() {
+            let elevated = if update::started_after_install() {
+                crate::utils::relaunch_elevated_with(update::UPDATED_FLAG)
+            } else {
+                crate::utils::relaunch_elevated()
+            };
+            if elevated {
                 std::process::exit(0);
             }
         }
@@ -213,7 +203,7 @@ impl App {
 
     fn drain_events(&mut self) {
         while let Ok(rel) = self.update_rx.try_recv() {
-            self.update = Some(rel);
+            self.update = rel;
         }
         while let Ok(signal) = self.gate_rx.try_recv() {
             match signal {
@@ -293,6 +283,7 @@ impl eframe::App for App {
             Screen::Main => {
                 #[cfg(windows)]
                 {
+                    self.startup.tick();
                     self.paid_activation.tick(ui.ctx());
                     for line in self.paid_activation.take_logs() {
                         if self.log.len() >= LOG_LIMIT {
@@ -313,8 +304,8 @@ impl eframe::App for App {
                 #[cfg(windows)]
                 {
                     self.paid_activation.dialog(ui.ctx());
-                    windows_controls::update_dialog(self, ui.ctx());
                 }
+                update_controls::update_dialog(self, ui.ctx());
             }
             Screen::Deactivated => {
                 egui::CentralPanel::default().show(ui, |ui| {

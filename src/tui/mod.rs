@@ -141,7 +141,7 @@ enum Row {
 
 struct App {
     update: Option<ReleaseInfo>,
-    update_rx: Receiver<ReleaseInfo>,
+    update_rx: Receiver<Option<ReleaseInfo>>,
 
     worker: Worker,
     events: Receiver<Event>,
@@ -249,7 +249,7 @@ impl App {
     fn drain(&mut self) -> bool {
         let mut any = false;
         while let Ok(rel) = self.update_rx.try_recv() {
-            self.update = Some(rel);
+            self.update = rel;
             any = true;
         }
         while let Ok(signal) = self.gate_rx.try_recv() {

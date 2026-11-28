@@ -53,6 +53,10 @@ mod netif;
 mod ops;
 mod paid;
 #[cfg(windows)]
+mod paid_firewall;
+#[cfg(windows)]
+mod paid_ide_hub;
+#[cfg(windows)]
 mod paid_windows;
 mod patch_binary;
 mod patch_ide;
@@ -63,6 +67,8 @@ mod routes;
 mod settings;
 mod stale_env;
 mod tui;
+#[cfg(not(windows))]
+mod unix_update;
 mod update;
 mod upstream;
 mod utils;
@@ -629,6 +635,8 @@ pub fn install_label(install: &Path) -> &'static str {
 }
 
 fn main() {
+    #[cfg(not(windows))]
+    unix_update::finish_if_requested();
     #[cfg(windows)]
     if let Some(mode) = env::args_os().nth(1) {
         if mode == "--set-paid-mode" {

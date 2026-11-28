@@ -22,11 +22,13 @@ fn is_window_name(name: &str, own: &str) -> bool {
 }
 
 /// Flags that make a process a service or helper, never a window.
+#[cfg(any(unix, test))]
 fn is_service_args(args: &[String]) -> bool {
     args.iter().any(|a| {
         matches!(
             a.as_str(),
             "--dns-forwarder" | "--watchdog" | "--proxy" | "--patch-root" | "--unpatch-root"
+                | crate::update::HANDOFF_FLAG
         )
     })
 }
@@ -144,6 +146,7 @@ mod tests {
         let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         assert!(is_service_args(&a(&["ag", "--proxy"])));
         assert!(is_service_args(&a(&["ag", "--unpatch-root", "/opt/x"])));
+        assert!(is_service_args(&a(&["ag", crate::update::HANDOFF_FLAG])));
         assert!(!is_service_args(&a(&["ag"])));
     }
 }

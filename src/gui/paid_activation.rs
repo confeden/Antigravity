@@ -42,10 +42,7 @@ struct Transition {
 enum ResultValue {
     Registered,
     License(crate::paid::License),
-    Inspected {
-        license: Option<crate::paid::License>,
-        running: Vec<&'static str>,
-    },
+    Inspected(Vec<&'static str>),
     Applied,
 }
 
@@ -153,7 +150,7 @@ impl PaidActivation {
         }
     }
 
-    pub(super) fn status_message(&self) -> Option<&str> {
+    pub(super) fn progress_message(&self) -> Option<&str> {
         if let Some((action, _)) = &self.pending {
             match action {
                 Action::Register => return Some("Подготавливаем код PAID…"),
@@ -172,6 +169,10 @@ impl PaidActivation {
                 Action::Check => {}
             }
         }
+        None
+    }
+
+    pub(super) fn status_message(&self) -> Option<&str> {
         self.note.as_deref()
     }
 
@@ -226,25 +227,8 @@ impl PaidActivation {
             .name("paid-activation".into())
             .spawn(move || {
                 let result = match action {
-                    Action::Inspect => {
-                        let check = if !apply_apps.is_empty() {
-                            match device.ok_or("Сначала получите код устройства".to_string()) {
-                                Ok(dev) => dev.check().map(Some),
-                                Err(err) => Err(err),
-                            }
-                        } else {
-                            Ok(None)
-                        };
-                        match check {
-                            Ok(Some(lic)) if !lic.eligible => Ok(ResultValue::Inspected {
-                                license: Some(lic),
-                                running: Vec::new(),
-                            }),
-                            Ok(license) => crate::paid_windows::running_for(&inspect_apps)
-                                .map(|running| ResultValue::Inspected { license, running }),
-                            Err(err) => Err(err),
-                        }
-                    }
+                    Action::Inspect => crate::paid_windows::running_for(&inspect_apps)
+                        .map(ResultValue::Inspected),
                     Action::Apply => crate::paid_windows::transition_apps(&apply_apps)
                         .map(|()| ResultValue::Applied),
                     Action::Register => device
@@ -314,47 +298,12 @@ impl PaidActivation {
                     });
                     self.next_check = Some(now + Duration::from_secs(5));
                 }
-                Ok(ResultValue::Inspected { license, running }) => {
-                    if let Some(lic) = license {
-                        self.license = lic;
-                        self.checked_once = true;
-                        self.last_check = Some(now);
-                        if let Some(device) = &self.device {
-                            let _ = crate::paid::save_license_cache(&crate::paid::LicenseCache {
-                                device_code: device.code.clone(),
-                                checked_at: now_unix(),
-                                eligible: lic.eligible,
-                                started: lic.started,
-                                expires_at: lic.expires_at,
-                                reason: lic.reason,
-                            });
-                        }
-                        if !lic.eligible {
-                            self.pending_transition = None;
-                            let msg = lic
-                                .reason
-                                .and_then(crate::paid::LicenseReason::user_message)
-                                .unwrap_or(
-                                    "Лицензия PAID не выдана или отозвана. Подтвердите выдачу заказа в личном кабинете Витрины.",
-                                )
-                                .to_string();
-                            self.pending_logs.push(msg.clone());
-                            self.note = Some(msg);
-                        } else if let Some(transition) = self.pending_transition.clone() {
-                            if running.is_empty() {
-                                self.launch(Action::Apply, ctx);
-                                return;
-                            }
-                            self.pending_transition = None;
-                            self.confirm =
-                                Some((transition.desired, transition.enable_mode, running));
-                        }
-                    } else if let Some(transition) = self.pending_transition.clone() {
-                        if running.is_empty() {
-                            self.launch(Action::Apply, ctx);
-                            return;
-                        }
-                        self.pending_transition = None;
+                Ok(ResultValue::Inspected(running)) => {
+                    if running.is_empty() {
+                        self.launch(Action::Apply, ctx);
+                        return;
+                    }
+                    if let Some(transition) = self.pending_transition.take() {
                         self.confirm =
                             Some((transition.desired, transition.enable_mode, running));
                     }
@@ -467,6 +416,8 @@ impl PaidActivation {
             });
             ui.label(if enable_mode {
                 "Рекомендуется вручную закрыть следующие программы перед активацией:"
+            } else if names.contains(&PaidApp::ClaudeDesktop.label()) {
+                "Перед отключением PAID выйдите из Claude Desktop через значок в трее."
             } else {
                 "Следующие IDE перестанут использовать серверы PAID. Закрывать их не нужно."
             });
@@ -474,9 +425,11 @@ impl PaidActivation {
                 ui.label(*name);
             }
             if enable_mode {
-                ui.label(
-                    "Если IDE останется открытой, запустите её заново, чтобы применить настройки.",
-                );
+                ui.label(if names.contains(&PaidApp::ClaudeDesktop.label()) {
+                    "Выйдите из Claude через трей и снова откройте его из меню «Пуск»."
+                } else {
+                    "Если IDE останется открытой, запустите её заново, чтобы применить настройки."
+                });
             }
             ui.horizontal(|ui| {
                 (

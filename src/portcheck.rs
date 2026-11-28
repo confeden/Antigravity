@@ -128,6 +128,11 @@ pub fn listener_image(addr: SocketAddr) -> Option<String> {
     listener_pid(addr, Proto::Tcp).and_then(process_name)
 }
 
+#[cfg(windows)]
+pub fn listener_path(addr: SocketAddr) -> Option<std::path::PathBuf> {
+    listener_pid(addr, Proto::Tcp).and_then(process_image)
+}
+
 /// The PID holding `addr` itself, or on the wildcard for its port - the two
 /// that can stand in its way. A listener on another loopback address with the
 /// same port does not, and blaming it would send the user after the wrong

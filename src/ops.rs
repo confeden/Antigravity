@@ -739,6 +739,35 @@ fn run_worker(
 fn startup_housekeeping(ctx: &mut Ctx) {
     #[cfg(windows)]
     let _ = crate::launch_guard::uninstall();
+    #[cfg(windows)]
+    let paid_startup = {
+        let apps = crate::paid::active_apps();
+        if apps.is_empty()
+            || (crate::paid_windows::kill_switch_configured(&apps)
+                && !background::relay_is_outdated())
+        {
+            false
+        } else {
+            ctx.busy(Some("Настраиваем защиту PAID…"));
+            match crate::paid_windows::transition_apps(&apps) {
+                Ok(()) => {
+                    ctx.settings = Settings::load();
+                    ctx.log(Level::Ok, "Защита PAID применена автоматически.");
+                }
+                Err(error) => ctx.log(
+                    Level::Err,
+                    format!("Автоматическая настройка защиты PAID: {error}"),
+                ),
+            }
+            ctx.busy(None);
+            true
+        }
+    };
+    #[cfg(not(windows))]
+    let paid_startup = false;
+    if crate::update::started_after_install() && !paid_startup {
+        refresh_installed_services(ctx);
+    }
     if !cfg!(target_os = "windows") || !is_admin() {
         return;
     }
@@ -765,6 +794,27 @@ fn startup_housekeeping(ctx: &mut Ctx) {
             "Antigravity идёт через активный VPN — правила DNS сняты, чтобы не перебивать \
              ваш туннель. Выключите VPN и включите «Обход через DNS» заново.",
         );
+    }
+}
+
+fn refresh_installed_services(ctx: &mut Ctx) {
+    let relay = background::is_enabled();
+    let watchdog = background::is_watchdog_enabled();
+    if !relay && !watchdog {
+        return;
+    }
+    #[cfg(windows)]
+    if !is_admin() {
+        ctx.log(Level::Info, "Для обновления фоновых служб перезапустите AI Unlocker от имени администратора.");
+        return;
+    }
+    let result = if relay {
+        background::ensure_running()
+    } else {
+        background::enable_watchdog()
+    };
+    if let Err(error) = result {
+        ctx.log(Level::Warn, format!("Не удалось обновить фоновую службу: {error}"));
     }
 }
 
@@ -1540,14 +1590,18 @@ fn repair(ctx: &mut Ctx) {
         return;
     }
     ctx.log(Level::Ok, "Служба обхода переустановлена и запущена.");
-    if crate::paid::antigravity_enabled() {
-        if crate::proxy::wait_for_our_paid_listener(Duration::from_secs(10)).is_none() {
-            ctx.log(
-                Level::Warn,
-                "Платный локальный прокси ещё не ответил — проверьте вкладку «Журнал».",
-            );
+    #[cfg(windows)]
+    {
+        let apps = crate::paid::active_apps();
+        if !apps.is_empty() {
+            match crate::paid_windows::apply_apps(&apps) {
+                Ok(()) => ctx.log(Level::Ok, "Защита PAID применена."),
+                Err(error) => ctx.log(Level::Err, format!("Не удалось применить защиту PAID: {error}")),
+            }
+            if apps.iter().any(|app| app.is_antigravity()) {
+                return;
+            }
         }
-        return;
     }
     // DNS is put back only when it was wanted, or when nothing else is: a user
     // running just their own proxy must not get DNS rules from a repair.

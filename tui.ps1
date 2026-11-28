@@ -3,10 +3,8 @@
 #   PowerShell:  irm https://raw.githubusercontent.com/confeden/Antigravity/main/tui.ps1 | iex
 #   cmd:         powershell -NoProfile -c "irm https://raw.githubusercontent.com/confeden/Antigravity/main/tui.ps1 | iex"
 #
-# Fetches the latest release from GitHub into %LOCALAPPDATA%\AGUnlocker\AG.exe and
-# runs it right in this console. Running the same command again downloads only
-# when there is a newer version. Start it from an elevated console for the DNS
-# half of the bypass; otherwise the program offers a restart with admin rights.
+# Installs the latest Windows release for the current user and opens its TUI.
+# An elevated console is only needed for the privileged DNS features.
 #
 # ASCII only, and no BOM (G60): `irm | iex` keeps a BOM as U+FEFF, which the
 # PowerShell 5.1 parser rejects, while without a BOM a *file* is read as ANSI by
@@ -24,62 +22,72 @@
         [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
     $repo = 'confeden/Antigravity'
-    $dir = Join-Path $env:LOCALAPPDATA 'AGUnlocker'
-    $exe = Join-Path $dir 'AG.exe'
-    $stamp = "$exe.version"
+    $exe = Join-Path $env:LOCALAPPDATA 'Programs\AI Unlocker\ag_unlocker.exe'
+    $installed = $null
+    $updated = $false
 
-    # The newest tag from where /releases/latest redirects to: no API call, so
-    # no rate limit.
-    $tag = $null
+    function Parse-ReleaseVersion([string]$value) {
+        if ($value -notmatch '^[vV]?(\d+\.\d+\.\d+)(?:[._](\d+))?$') { return $null }
+        $build = if ($Matches[2]) { $Matches[2] } else { '0' }
+        return [version]($Matches[1] + '.' + $build)
+    }
+
+    if (Test-Path -LiteralPath $exe -PathType Leaf) {
+        $installed = Parse-ReleaseVersion ([Diagnostics.FileVersionInfo]::GetVersionInfo($exe).ProductVersion)
+    }
     try {
-        $r = Invoke-WebRequest -UseBasicParsing -Method Head "https://github.com/$repo/releases/latest"
-        $uri = $r.BaseResponse.ResponseUri                                  # Windows PowerShell 5.1
-        if (-not $uri) { $uri = $r.BaseResponse.RequestMessage.RequestUri } # PowerShell 7
-        $tag = $uri.AbsoluteUri.TrimEnd('/').Split('/')[-1]
-    } catch {}
-    $ver = if ($tag) { $tag.TrimStart('v') } else { '' }
+        $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases/latest" -TimeoutSec 15
+    } catch {
+        if (!$installed) { throw }
+        Write-Host "GitHub did not answer - starting the installed copy. $($_.Exception.Message)"
+        $release = $null
+    }
 
-    if ($ver -notmatch '^[0-9._]+$') {
-        if (-not (Test-Path $exe)) { throw "Could not find the latest version on github.com/$repo." }
-        Write-Host 'GitHub did not answer - starting the copy downloaded before.'
-    } elseif (-not (Test-Path $exe) -or (Get-Content $stamp -ErrorAction SilentlyContinue) -ne $ver) {
-        Write-Host "Downloading AI Unlocker $ver ..."
-        New-Item -ItemType Directory -Force $dir | Out-Null
-        # The tag spells a fourth number with a dot (v2.24.0.1), the asset with an
-        # underscore (AG_2.24.0_1.exe): try both.
-        $alt = $ver -replace '\.(\d+)$', '_$1'
-        $got = $false
-        $downloadError = $null
-        foreach ($suffix in @('_portable', '')) {
-            foreach ($cand in @($ver, $alt) | Select-Object -Unique) {
-                try {
-                    Invoke-WebRequest -UseBasicParsing "https://github.com/$repo/releases/download/$tag/AG_$cand$suffix.exe" -OutFile "$exe.part"
-                    $kind = ([string][Diagnostics.FileVersionInfo]::GetVersionInfo("$exe.part").FileDescription).Trim()
-                    if ($kind -eq 'AI Unlocker Setup') { throw "Windows portable asset is missing in release $tag." }
-                    $got = $true
-                    break
-                } catch {
-                    $downloadError = $_
-                    if (!$_.Exception.Response -or [int]$_.Exception.Response.StatusCode -ne 404) { throw }
-                }
+    if ($release) {
+        $tag = [string]$release.tag_name
+        $latest = Parse-ReleaseVersion $tag
+        if (!$latest -or $release.draft -or $release.prerelease) { throw 'Invalid release version.' }
+        if (!$installed -or $latest -gt $installed) {
+            $version = $tag.TrimStart('v', 'V')
+            $names = @("AI_Unlocker_setup-$version.exe")
+            if ($version -match '^(\d+\.\d+\.\d+)[._](\d+)$') {
+                $names += "AI_Unlocker_setup-$($Matches[1]).$($Matches[2]).exe"
+                $names += "AI_Unlocker_setup-$($Matches[1])_$($Matches[2]).exe"
             }
-            if ($got) { break }
-        }
-        if (!$got) { throw "No Windows program in release $tag. $downloadError" }
-        try {
-            Move-Item -Force "$exe.part" $exe
-            Set-Content -Path $stamp -Value $ver
-        } catch {
-            # The old copy is running (another window of it): it cannot be
-            # replaced now, but it can still be started.
-            Remove-Item -Force "$exe.part" -ErrorAction SilentlyContinue
-            if (-not (Test-Path $exe)) { throw }
-            Write-Host 'The previous version is running and could not be replaced - starting it.'
+            $asset = $release.assets | Where-Object {
+                $_.name -cin $names -and $_.browser_download_url -ceq "https://github.com/$repo/releases/download/$tag/$($_.name)" -and
+                $_.digest -match '^sha256:[0-9a-fA-F]{64}$' -and $_.size -gt 0 -and $_.size -le 200MB
+            } | Select-Object -First 1
+            if (!$asset) { throw "Release $tag has no verifiable Windows installer." }
+
+            Write-Host "Installing AI Unlocker $version ..."
+            $folder = Join-Path ([IO.Path]::GetTempPath()) ('ai-unlocker-tui-' + [guid]::NewGuid().ToString('N'))
+            New-Item -ItemType Directory -Path $folder | Out-Null
+            $setup = Join-Path $folder 'setup.exe'
+            $package = $null
+            try {
+                Invoke-WebRequest -UseBasicParsing -TimeoutSec 90 -MaximumRedirection 4 -Uri $asset.browser_download_url -OutFile $setup
+                $package = [IO.File]::Open($setup, 'Open', 'Read', 'Read')
+                if ($package.Length -ne $asset.size -or (Get-FileHash -InputStream $package -Algorithm SHA256).Hash -ne $asset.digest.Substring(7)) {
+                    throw 'The Windows installer failed verification.'
+                }
+                $result = Start-Process -FilePath $setup -ArgumentList '/SILENT /NORESTART /RESTARTEXITCODE=75' -Wait -PassThru
+                if ($result.ExitCode -ne 0) { throw "Setup exit code: $($result.ExitCode)" }
+                $product = [Diagnostics.FileVersionInfo]::GetVersionInfo($exe).ProductVersion
+                if ((Parse-ReleaseVersion $product) -ne $latest) { throw 'The installed version does not match the release.' }
+                $updated = $true
+            } finally {
+                if ($package) { $package.Dispose() }
+                if (Test-Path -LiteralPath $setup) { Remove-Item -LiteralPath $setup }
+                Remove-Item -LiteralPath $folder
+            }
         }
     }
 
     # -Wait: the exe is a window program, which a console does not wait for by
     # itself. Waiting is what lets it draw here (--inline) without the prompt
     # taking every other keystroke.
-    Start-Process -FilePath $exe -ArgumentList '--tui', '--inline' -Wait -NoNewWindow
+    $flags = @('--tui', '--inline')
+    if ($updated) { $flags += '--updated' }
+    Start-Process -FilePath $exe -ArgumentList $flags -Wait -NoNewWindow
 }

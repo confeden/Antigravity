@@ -26,12 +26,13 @@ import { join as aiuJoin } from 'node:path';
             process.env[key] = value;
             return [key, before, value];
         });
-        const switches = ['proxy-server', 'proxy-bypass-list', 'no-proxy-server', 'proxy-pac-url', 'proxy-auto-detect', 'disable-quic'];
+        const switches = ['proxy-server', 'proxy-bypass-list', 'no-proxy-server', 'proxy-pac-url', 'proxy-auto-detect', 'disable-quic', 'host-resolver-rules'];
         const original = new Map(switches.filter(key => aiuApp.commandLine.hasSwitch(key))
             .map(key => [key, aiuApp.commandLine.getSwitchValue(key)]));
         for (const key of switches) aiuApp.commandLine.removeSwitch(key);
         aiuApp.commandLine.appendSwitch('proxy-server', proxy);
         aiuApp.commandLine.appendSwitch('disable-quic');
+        aiuApp.commandLine.appendSwitch('host-resolver-rules', 'MAP * ~NOTFOUND, EXCLUDE localhost, EXCLUDE 127.0.0.1');
         const paid = { mode: 'fixed_servers', proxyRules: proxy, proxyBypassRules: '<local>' };
         const restoreProxy = new Map();
         const protect = (owner, closeConnections) => {

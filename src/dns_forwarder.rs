@@ -178,7 +178,7 @@ pub const LISTEN_PORT: u16 = 53;
 /// 58 = Updated DNS-AI default endpoints (removed retired spb3) and 24h auto-refresh from GitHub endpoints.json.
 /// 59 = Write gate.json immediately on relay start before egress WMI probe, reuse warm_forever's egress probe in cache, and refresh gate.json mid-pass.
 /// 60 = Always arm Antigravity Desktop shortcut on relay enable/fast-path and watchdog loop, retry locked Desktop binary immediately upon unlock, and patch on any Start Menu launch via stamp cache.
-pub const RELAY_VERSION: u32 = 60;
+pub const RELAY_VERSION: u32 = 63;
 
 /// Written where an unelevated relay can write and an unelevated unlocker can
 /// read. Absent means a relay from before versioning, i.e. older than anything.
@@ -430,7 +430,7 @@ fn cache_egress(eg: Option<&egress::Egress>) {
     }
 }
 
-fn isp_interface() -> u32 {
+pub(crate) fn isp_interface() -> u32 {
     if let Ok(cache) = EGRESS_CACHE.lock() {
         if let Some((idx, at, good_for)) = *cache {
             if at.elapsed() < good_for {

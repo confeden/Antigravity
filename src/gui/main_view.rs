@@ -64,7 +64,7 @@ pub(super) struct ViewState {
     proxy_saved: Option<(Cap, Result<(), String>)>,
     log_copied: Option<(Instant, bool)>,
     confirm_deactivation: bool,
-    antigravity_icon: Option<egui::TextureHandle>,
+    product_icons: std::collections::HashMap<crate::paid::PaidGroup, egui::TextureHandle>,
 }
 
 impl ViewState {
@@ -113,12 +113,18 @@ pub fn view(app: &mut App, ui: &mut egui::Ui) {
     let colors = theme::palette(ui);
     footer_panel(colors).show(ui, |ui| footer(app, ui));
 
-    #[cfg(not(windows))]
-    if app.update.is_some() {
-        egui::Panel::top("main-update")
-            .frame(strip_frame(colors))
-            .show(ui, |ui| app.update_banner(ui));
+    if let Some(progress) = progress_message(app) {
+        egui::Panel::bottom("main-progress")
+            .exact_size(34.0)
+            .frame(strip_frame(colors).fill(colors.accent))
+            .show(ui, |ui| {
+                ui.horizontal_centered(|ui| {
+                    ui.add(egui::Spinner::new().size(21.0).color(colors.on_accent));
+                    ui.label(egui::RichText::new(progress).size(14.0).strong().color(colors.on_accent));
+                });
+            });
     }
+
     egui::Panel::left("main-nav")
         .exact_size(172.0)
         .resizable(false)
@@ -381,8 +387,7 @@ fn title(app: &mut App, ui: &mut egui::Ui, text: &str) {
         ui.label(egui::RichText::new(text).size(24.0).strong());
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             theme_toggle(app, ui);
-            #[cfg(windows)]
-            super::windows_controls::update_button(app, ui);
+            super::update_controls::update_button(app, ui);
             #[cfg(windows)]
             elevate_button(app, ui);
         });
@@ -771,7 +776,16 @@ fn integration(app: &mut App, ui: &mut egui::Ui) {
     let rows = status.installs.clone();
     let paid_apps = status.paid_apps.clone();
     let colors = theme::palette(ui);
-    let ag_paid = crate::paid::antigravity_enabled();
+    #[cfg(windows)]
+    let (paid_active, paid_protected) = {
+        let active = crate::paid::active_apps();
+        (
+            !active.is_empty(),
+            !active.is_empty() && crate::paid_windows::kill_switch_configured(&active),
+        )
+    };
+    #[cfg(not(windows))]
+    let (paid_active, paid_protected) = (false, false);
     #[cfg(windows)]
     let paid_eligible = app.paid_activation.eligible();
     #[cfg(not(windows))]
@@ -780,7 +794,6 @@ fn integration(app: &mut App, ui: &mut egui::Ui) {
     let paid_busy = app.paid_activation.busy();
     #[cfg(not(windows))]
     let paid_busy = false;
-
     egui::Frame::new()
         .fill(colors.card)
         .corner_radius(egui::CornerRadius::same(theme::RADIUS))
@@ -788,11 +801,13 @@ fn integration(app: &mut App, ui: &mut egui::Ui) {
         .stroke(egui::Stroke::new(1.0, colors.line))
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
-            if ag_paid {
+            if paid_protected {
                 ui.colored_label(
                     colors.ok,
-                    "Antigravity работает через PAID — FREE-маршрутизация отключена, чтобы трафик не шёл в оба назначения.",
+                    "Режим PAID защищает трафик от утечек.",
                 );
+            } else if paid_active {
+                ui.colored_label(colors.muted, "Защита PAID ещё не подтверждена. Подробности в журнале.");
             } else if paid_eligible {
                 ui.colored_label(
                     colors.ok,
@@ -823,22 +838,25 @@ fn integration(app: &mut App, ui: &mut egui::Ui) {
         &mut toggle_app,
     );
     ui.add_space(12.0);
+    let idle = !app.is_busy() && !paid_busy;
     paid_group_section(
+        &mut app.main_view,
         ui,
         "Claude",
         crate::paid::PaidGroup::Claude,
         &paid_apps,
-        !app.is_busy() && !paid_busy,
+        idle,
         paid_eligible,
         &mut toggle_app,
     );
     ui.add_space(12.0);
     paid_group_section(
+        &mut app.main_view,
         ui,
-        "Codex / ChatGPT",
+        "ChatGPT",
         crate::paid::PaidGroup::Codex,
         &paid_apps,
-        !app.is_busy() && !paid_busy,
+        idle,
         paid_eligible,
         &mut toggle_app,
     );
@@ -880,29 +898,8 @@ fn integration_group(
     toggle_app: &mut Option<(crate::paid::PaidApp, bool)>,
 ) {
     let colors = theme::palette(ui);
-    let group_icon = if name == "Antigravity" {
-        Some(
-            app.main_view
-                .antigravity_icon
-                .get_or_insert_with(|| {
-                    let image = super::icon::antigravity_image().unwrap_or_else(|| {
-                        egui::ColorImage::filled([1, 1], egui::Color32::TRANSPARENT)
-                    });
-                    ui.ctx().load_texture(
-                        "antigravity-group-icon",
-                        image,
-                        egui::TextureOptions::LINEAR,
-                    )
-                })
-                .clone(),
-        )
-    } else {
-        None
-    };
     ui.horizontal(|ui| {
-        if let Some(tex) = &group_icon {
-            ui.add(egui::Image::new((tex.id(), egui::vec2(20.0, 20.0))));
-        }
+        product_icon(&mut app.main_view, ui, crate::paid::PaidGroup::Antigravity);
         section_title(ui, name);
         widgets::badge(ui, "FREE", colors.chrome, colors.muted);
         widgets::badge(ui, "PAID", colors.soft, colors.accent_text);
@@ -952,8 +949,6 @@ fn integration_row(
         if let Some(path) = &row.path {
             label.on_hover_text(path.display().to_string());
         }
-        widgets::badge(ui, "FREE", colors.chrome, colors.muted);
-        widgets::badge(ui, "PAID", colors.soft, colors.accent_text);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if let Some(status) = paid_status {
                 let mut paid_on = status.active;
@@ -963,12 +958,6 @@ fn integration_row(
                     && row.path.is_some()
                     && status.app.paid_implemented()
                     && (paid_eligible || paid_on);
-                let switch_resp = widgets::switch(
-                    ui,
-                    &mut paid_on,
-                    can_toggle,
-                    &format!("PAID {}", row.label),
-                );
                 let tip = if row.path.is_none() {
                     "Приложение не найдено"
                 } else if !paid_eligible && !status.active {
@@ -978,18 +967,9 @@ fn integration_row(
                 } else {
                     "Включить PAID для этого приложения"
                 };
-                if switch_resp.on_hover_text(tip).changed() {
+                if route_switch(ui, status.app, &mut paid_on, can_toggle, tip).changed() {
                     *toggle_app = Some((status.app, paid_on));
                 }
-                ui.label(
-                    egui::RichText::new("PAID")
-                        .size(11.5)
-                        .color(if status.active {
-                            colors.accent_text
-                        } else {
-                            colors.muted
-                        }),
-                );
             }
             let edit = ui.add_enabled(
                 enabled,
@@ -1030,7 +1010,48 @@ fn integration_row(
     });
 }
 
+fn product_icon(state: &mut ViewState, ui: &mut egui::Ui, group: crate::paid::PaidGroup) {
+    let texture = state.product_icons.entry(group).or_insert_with(|| {
+        ui.ctx().load_texture(
+            format!("{group:?}-group-icon"),
+            super::icon::product_image(group),
+            egui::TextureOptions::LINEAR,
+        )
+    });
+    let mut icon = egui::Image::new((texture.id(), egui::vec2(20.0, 20.0)));
+    if group == crate::paid::PaidGroup::Codex {
+        icon = icon.tint(theme::palette(ui).text);
+    }
+    ui.add(icon);
+}
+
+fn route_switch(
+    ui: &mut egui::Ui,
+    app: crate::paid::PaidApp,
+    paid: &mut bool,
+    enabled: bool,
+    tip: &str,
+) -> egui::Response {
+    let colors = theme::palette(ui);
+    // The action column is laid out from the right.
+    ui.label(egui::RichText::new("PAID").size(11.5).color(if *paid {
+        colors.accent_text
+    } else {
+        colors.muted
+    }));
+    let ordinary = if app.supports_free() { "FREE" } else { "Обычный" };
+    let label = format!("Маршрут {} — {ordinary} / PAID", app.label());
+    let response = widgets::switch(ui, paid, enabled, &label).on_hover_text(tip);
+    ui.label(egui::RichText::new(ordinary).size(11.5).color(if *paid {
+        colors.muted
+    } else {
+        colors.text
+    }));
+    response
+}
+
 fn paid_group_section(
+    state: &mut ViewState,
     ui: &mut egui::Ui,
     title: &str,
     group: crate::paid::PaidGroup,
@@ -1049,6 +1070,7 @@ fn paid_group_section(
     }
     let found = items.iter().filter(|item| item.found).count();
     ui.horizontal(|ui| {
+        product_icon(state, ui, group);
         section_title(ui, title);
         widgets::badge(ui, "PAID", colors.soft, colors.accent_text);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1070,7 +1092,6 @@ fn paid_group_section(
                 if let Some(hint) = &item.path_hint {
                     label.on_hover_text(hint);
                 }
-                widgets::badge(ui, "PAID", colors.soft, colors.accent_text);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let mut on = item.active;
                     let implemented = item.app.paid_implemented();
@@ -1079,12 +1100,6 @@ fn paid_group_section(
                         && item.found
                         && implemented
                         && (paid_eligible || on);
-                    let resp = widgets::switch(
-                        ui,
-                        &mut on,
-                        can_toggle,
-                        &format!("PAID {}", item.app.label()),
-                    );
                     let tip = if let Some(reason) = item.app.unavailable_reason() {
                         reason
                     } else if !item.found {
@@ -1093,18 +1108,20 @@ fn paid_group_section(
                         "Нужна выданная лицензия PAID"
                     } else if item.active {
                         "Отключить PAID для этого приложения"
+                    } else if item.app == crate::paid::PaidApp::CodexCli {
+                        "Включить PAID для Codex CLI в новых сеансах PowerShell"
                     } else {
                         "Включить PAID для этого приложения"
                     };
-                    if resp.on_hover_text(tip).changed() {
+                    if route_switch(ui, item.app, &mut on, can_toggle, tip).changed() {
                         *toggle_app = Some((item.app, on));
                     }
                     let (text, color) = if !item.found {
                         ("Не найден", colors.muted)
                     } else if let Some(reason) = item.app.unavailable_reason() {
                         (reason, colors.muted)
-                    } else if item.active {
-                        ("PAID включён", colors.ok)
+                    } else if item.app == crate::paid::PaidApp::CodexCli {
+                        ("PowerShell", colors.text)
                     } else {
                         ("Найден", colors.text)
                     };
@@ -1630,8 +1647,7 @@ fn journal(app: &mut App, ui: &mut egui::Ui) {
         ui.label(egui::RichText::new(Page::Log.label()).size(24.0).strong());
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             theme_toggle(app, ui);
-            #[cfg(windows)]
-            super::windows_controls::update_button(app, ui);
+            super::update_controls::update_button(app, ui);
             #[cfg(windows)]
             elevate_button(app, ui);
             if widgets::command(
@@ -1738,6 +1754,29 @@ fn log_keys(app: &mut App, ui: &mut egui::Ui) {
     }
 }
 
+fn progress_message(app: &App) -> Option<&str> {
+    #[cfg(windows)]
+    {
+        if let Some(message) = app.paid_activation.progress_message() {
+            return Some(message);
+        }
+        if app.startup.applying() {
+            return Some("Применяем настройку автозапуска…");
+        }
+    }
+    if let Some(message) = app.app_update.progress() {
+        return Some(message);
+    }
+    if let Some(message) = app.busy.as_deref() {
+        return Some(message);
+    }
+    app.main_view.saving_proxy.map(|cap| match cap {
+        Cap::OwnProxy => "Проверяем прокси…",
+        Cap::GroupProxy => "Проверяем ключ…",
+        _ => "Применяем настройку…",
+    })
+}
+
 fn footer(app: &mut App, ui: &mut egui::Ui) {
     let colors = theme::palette(ui);
     ui.horizontal(|ui| {
@@ -1749,10 +1788,6 @@ fn footer(app: &mut App, ui: &mut egui::Ui) {
         };
         widgets::dot(ui, color);
         ui.label(egui::RichText::new(label).size(12.5).color(colors.muted));
-        if let Some(what) = &app.busy {
-            ui.add(egui::Spinner::new().size(13.0));
-            ui.label(egui::RichText::new(what).size(12.5).color(colors.muted));
-        }
         if app.main_view.page == Page::Overview {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if deactivation_button(ui, !app.is_busy()).clicked() {
@@ -1911,6 +1946,87 @@ mod vpn_exclusion_tests {
 #[cfg(test)]
 mod panel_tests {
     use super::*;
+
+    #[test]
+    fn chatgpt_icon_uses_readable_theme_color_before_the_group() {
+        use crate::paid::{PaidApp, PaidAppStatus, PaidGroup};
+        use crate::settings::ThemeMode;
+
+        for mode in [ThemeMode::Light, ThemeMode::Dark] {
+            let ctx = egui::Context::default();
+            theme::apply(&ctx);
+            theme::set_preference(&ctx, mode);
+            let mut state = ViewState::default();
+            let mut expected_color = egui::Color32::TRANSPARENT;
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(760.0, 400.0),
+                )),
+                ..Default::default()
+            };
+            let output = ctx.run_ui(input, |root| {
+                egui::CentralPanel::default().show(root, |ui| {
+                    expected_color = theme::palette(ui).text;
+                    paid_group_section(
+                        &mut state, ui, "ChatGPT", PaidGroup::Codex,
+                        &[PaidAppStatus {
+                            app: PaidApp::ChatGptDesktop,
+                            found: false,
+                            path_hint: None,
+                            active: false,
+                        }],
+                        true, false, &mut None,
+                    );
+                });
+            });
+            let texture = state.product_icons[&PaidGroup::Codex].id();
+            let title = output.shapes.iter().find_map(|item| match &item.shape {
+                egui::Shape::Text(text) if text.galley.text() == "ChatGPT" => Some(text.pos.x),
+                _ => None,
+            });
+            let primitives = ctx.tessellate(output.shapes.clone(), output.pixels_per_point);
+            output.drop_without_applying_deltas();
+            let icon = primitives.iter().find_map(|item| match &item.primitive {
+                egui::epaint::Primitive::Mesh(mesh) if mesh.texture_id == texture => Some(mesh),
+                _ => None,
+            }).expect("ChatGPT group icon");
+            let title = title.expect("ChatGPT group title");
+            assert!(icon.vertices.iter().any(|vertex| vertex.color == expected_color));
+            assert!(icon.vertices.iter().all(|vertex| vertex.pos.x < title));
+        }
+    }
+
+    #[test]
+    fn integration_route_reads_free_switch_paid() {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let mut switch = None;
+        let output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(940.0, 650.0))),
+                ..Default::default()
+            },
+            |root| {
+                egui::CentralPanel::default().show(root, |ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let response = route_switch(ui, crate::paid::PaidApp::AntigravityIde, &mut false, true, "");
+                        switch = Some(response.rect);
+                    });
+                });
+            },
+        );
+        let position = |label| {
+            output.shapes.iter().find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text() == label => Some(text.pos.x),
+                _ => None,
+            }).expect("route label")
+        };
+        let switch = switch.unwrap();
+        assert!(position("FREE") < switch.left());
+        assert!(switch.right() < position("PAID"));
+        output.drop_without_applying_deltas();
+    }
 
     #[test]
     fn deactivation_stays_in_the_footer_while_the_page_scrolls() {
@@ -2163,8 +2279,7 @@ mod panel_tests {
             store_test: None,
             update: None,
             update_rx: std::sync::mpsc::channel().1,
-            #[cfg(windows)]
-            windows_update: super::super::windows_controls::Update::default(),
+            app_update: super::super::update_controls::Update::default(),
             #[cfg(windows)]
             startup: super::super::windows_controls::Startup::default(),
             worker,
@@ -2261,7 +2376,7 @@ mod panel_tests {
             store_test: None,
             update: None,
             update_rx: std::sync::mpsc::channel().1,
-            windows_update: super::super::windows_controls::Update::default(),
+            app_update: super::super::update_controls::Update::default(),
             startup: super::super::windows_controls::Startup::default(),
             worker,
             events: std::sync::mpsc::channel().1,
@@ -2375,7 +2490,7 @@ mod panel_tests {
             store_test: None,
             update: None,
             update_rx: std::sync::mpsc::channel().1,
-            windows_update: super::super::windows_controls::Update::default(),
+            app_update: super::super::update_controls::Update::default(),
             startup: super::super::windows_controls::Startup::default(),
             worker,
             events: std::sync::mpsc::channel().1,

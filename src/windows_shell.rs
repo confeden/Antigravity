@@ -1,14 +1,11 @@
 //! Per-user shell integration and the verified Windows installer handoff.
 
 use std::fs;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use sha2::{Digest, Sha256};
-
-use crate::update::{ReleaseAsset, ReleaseInfo};
+use crate::update::{self, ReleaseAsset, ReleaseInfo};
 
 const SHORTCUT: &str = r#"
 $root = (New-Object -ComObject WScript.Shell).SpecialFolders.Item('Startup')
@@ -101,38 +98,6 @@ Invoke-WebRequest -UseBasicParsing -TimeoutSec 90 -MaximumRedirection 4 `
   -Uri $env:AI_UNLOCKER_DOWNLOAD_URL -OutFile $env:AI_UNLOCKER_UPDATE_FILE
 "#;
 
-const CLOSE_IDES: &str = r#"
-$session = (Get-Process -Id $PID).SessionId
-$roots = @(ConvertFrom-Json -InputObject $env:AI_UNLOCKER_IDE_ROOTS) | ForEach-Object {
-    [IO.Path]::GetFullPath($_).TrimEnd('\') + '\'
-}
-$names = @('Antigravity','Antigravity IDE','agy','language_server_windows_x64','language_server_windows_arm64')
-function Find-Clients {
-  foreach ($proc in (Get-Process -Name $names -ErrorAction SilentlyContinue)) {
-    if ($proc.SessionId -ne $session) { continue }
-    $path = $proc.Path
-    if (!$path) { throw "Cannot verify the executable for $($proc.ProcessName) (PID $($proc.Id))" }
-    foreach ($root in $roots) {
-      if ($path.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) { $proc; break }
-    }
-  }
-}
-$asked = @{}
-$deadline = [DateTime]::UtcNow.AddSeconds(30)
-do {
-  $open = @(Find-Clients)
-  if (!$open.Count) { exit 0 }
-  foreach ($proc in $open) {
-    if ($proc.MainWindowHandle -ne [IntPtr]::Zero -and !$asked.ContainsKey($proc.Id) -and $proc.CloseMainWindow()) {
-      $asked[$proc.Id] = $true
-    }
-  }
-  Start-Sleep -Milliseconds 250
-} while ([DateTime]::UtcNow -lt $deadline)
-$names = ($open | ForEach-Object { $_.ProcessName } | Select-Object -Unique) -join ', '
-throw "Close these clients and retry: $names"
-"#;
-
 const INSTALL: &str = r#"
 $old = Get-Process -Id ([int]$env:AI_UNLOCKER_PREVIOUS_PID) -ErrorAction SilentlyContinue
 $waited = $false
@@ -147,7 +112,7 @@ try {
   $args = '/SILENT /NORESTART /SUPPRESSMSGBOXES /NOCLOSEAPPLICATIONS /RESTARTEXITCODE=75'
   $setup = Start-Process -FilePath $env:AI_UNLOCKER_UPDATE_FILE -ArgumentList $args -Wait -PassThru
   if ($setup.ExitCode -ne 0) { throw ('Setup exit code: ' + $setup.ExitCode) }
-  Start-Process -FilePath $env:AI_UNLOCKER_INSTALLED_EXE
+  Start-Process -FilePath $env:AI_UNLOCKER_INSTALLED_EXE -ArgumentList $env:AI_UNLOCKER_UPDATED_FLAG
 } catch {
   $reason = $_.Exception.Message
   try {
@@ -165,34 +130,14 @@ try {
 "#;
 
 fn installer_asset(release: &ReleaseInfo) -> Option<(&ReleaseAsset, &str)> {
-    let tag = &release.tag_name;
-    let version = release.display_version();
-    if release.draft
-        || release.prerelease
-        || !release.is_newer_than_current()
-        || tag.trim() != tag
-        || version.is_empty()
-        || !version.as_bytes()[0].is_ascii_digit()
-        || !version
-            .bytes()
-            .all(|b| b.is_ascii_digit() || b == b'.' || b == b'_')
-    {
-        return None;
-    }
-    let mut forms = vec![version.to_owned()];
-    if version.matches('.').count() == 3 {
-        if let Some((base, build)) = version.rsplit_once('.') {
-            forms.push(format!("{base}_{build}"));
-        }
-    }
-    for version in forms {
+    for version in update::asset_versions(release) {
         let name = format!("AI_Unlocker_setup-{version}.exe");
-        if let Some(installer) = verified_asset(release, &name) {
+        if let Some(installer) = update::verified_asset(release, &name) {
             return Some(installer);
         }
         let portable = format!("AG_{version}_portable.exe");
         if release.assets.iter().any(|asset| asset.name == portable) {
-            if let Some(installer) = verified_asset(release, &format!("AG_{version}.exe")) {
+            if let Some(installer) = update::verified_asset(release, &format!("AG_{version}.exe")) {
                 return Some(installer);
             }
         }
@@ -200,24 +145,12 @@ fn installer_asset(release: &ReleaseInfo) -> Option<(&ReleaseAsset, &str)> {
     None
 }
 
-fn verified_asset<'a>(release: &'a ReleaseInfo, name: &str) -> Option<(&'a ReleaseAsset, &'a str)> {
-    let releases = crate::update::RELEASES_LATEST_URL.strip_suffix("/latest")?;
-    let expected = format!("{releases}/download/{}/{name}", release.tag_name);
-    let asset = release.assets.iter().find(|asset| {
-        asset.name == name
-            && asset.browser_download_url == expected
-            && (1..=200 * 1024 * 1024).contains(&asset.size)
-    })?;
-    let digest = asset.digest.as_deref()?.strip_prefix("sha256:")?;
-    if digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()) {
-        Some((asset, digest))
-    } else {
-        None
-    }
-}
-
 pub fn can_install(release: &ReleaseInfo) -> bool {
-    installer_asset(release).is_some()
+    installed_exe()
+        .and_then(|path| path.canonicalize().ok())
+        .zip(std::env::current_exe().ok().and_then(|path| path.canonicalize().ok()))
+        .is_some_and(|(installed, running)| installed == running)
+        && installer_asset(release).is_some()
 }
 
 pub struct PreparedUpdate {
@@ -241,6 +174,7 @@ impl PreparedUpdate {
             .env("AI_UNLOCKER_PREVIOUS_PID", std::process::id().to_string())
             .env("AI_UNLOCKER_PREVIOUS_EXE", previous)
             .env("AI_UNLOCKER_INSTALLED_EXE", installed)
+            .env("AI_UNLOCKER_UPDATED_FLAG", update::UPDATED_FLAG)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -259,15 +193,10 @@ impl Drop for PreparedUpdate {
     }
 }
 
-pub fn prepare(release: &ReleaseInfo, roots: Vec<PathBuf>) -> Result<PreparedUpdate, String> {
+pub fn prepare(release: &ReleaseInfo) -> Result<PreparedUpdate, String> {
     let (asset, digest) =
         installer_asset(release).ok_or("Для версии нет проверяемого установщика Windows")?;
-    let mut nonce = [0; 16];
-    rustls::crypto::ring::default_provider()
-        .secure_random
-        .fill(&mut nonce)
-        .map_err(|_| "Не удалось создать временный каталог обновления")?;
-    let folder = std::env::temp_dir().join(format!("ai-unlocker-update-{}", hex::encode(nonce)));
+    let folder = update::staging_path_in(&std::env::temp_dir())?;
     fs::create_dir(&folder).map_err(|error| error.to_string())?;
     let update = PreparedUpdate {
         folder,
@@ -279,42 +208,16 @@ pub fn prepare(release: &ReleaseInfo, roots: Vec<PathBuf>) -> Result<PreparedUpd
         .env("AI_UNLOCKER_DOWNLOAD_URL", &asset.browser_download_url)
         .env("AI_UNLOCKER_UPDATE_FILE", update.package());
     run(&mut download, Duration::from_secs(105))?;
-    if !valid_package(&update.package(), asset.size, digest).map_err(|err| err.to_string())? {
+    if !update::valid_package(&update.package(), asset.size, digest, b"MZ").map_err(|err| err.to_string())? {
         return Err("Размер или SHA-256 установщика не совпадает с GitHub Releases".into());
     }
-    let roots: Vec<_> = roots
-        .into_iter()
-        .chain(crate::discover_installs_fast())
-        .filter(|root| root.is_absolute())
-        .collect();
-    let mut close = powershell(CLOSE_IDES);
-    close.env(
-        "AI_UNLOCKER_IDE_ROOTS",
-        serde_json::to_string(&roots).map_err(|err| err.to_string())?,
-    );
-    run(&mut close, Duration::from_secs(40))?;
     Ok(update)
-}
-
-fn valid_package(path: &Path, size: u64, digest: &str) -> std::io::Result<bool> {
-    let mut file = fs::File::open(path)?;
-    if file.metadata()?.len() != size {
-        return Ok(false);
-    }
-    let mut header = [0; 2];
-    file.read_exact(&mut header)?;
-    if header != *b"MZ" {
-        return Ok(false);
-    }
-    let mut sha = Sha256::new();
-    sha.update(header);
-    std::io::copy(&mut file, &mut sha)?;
-    Ok(hex::encode(sha.finalize()).eq_ignore_ascii_case(digest))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
 
     #[test]
     fn only_a_digest_checked_installer_pair_can_update() {
@@ -331,22 +234,22 @@ mod tests {
                 {"name": "AG_999.0.0_1_portable.exe", "browser_download_url": ""},
             ],
         })).unwrap();
-        assert!(can_install(&release));
+        assert!(installer_asset(&release).is_some());
         let url = release.assets[0].browser_download_url.clone();
         release.assets[0]
             .browser_download_url
             .push_str("?redirect=1");
-        assert!(!can_install(&release));
+        assert!(installer_asset(&release).is_none());
         release.assets[0].browser_download_url = url;
         release.assets[0].digest = None;
-        assert!(!can_install(&release));
+        assert!(installer_asset(&release).is_none());
         release.assets[0].digest = Some(format!("sha256:{}", "b".repeat(64)));
         release.assets.pop();
-        assert!(!can_install(&release));
+        assert!(installer_asset(&release).is_none());
         let name = "AI_Unlocker_setup-999.0.0_1.exe";
         release.assets[0].name = name.into();
         release.assets[0].browser_download_url = format!("{base}/download/{tag}/{name}");
-        assert!(can_install(&release));
+        assert!(installer_asset(&release).is_some());
     }
 
     #[test]
@@ -355,9 +258,9 @@ mod tests {
         let bytes = b"MZfake package";
         fs::write(&path, bytes).unwrap();
         let hash = hex::encode(Sha256::digest(bytes));
-        assert!(valid_package(&path, bytes.len() as u64, &hash).unwrap());
-        assert!(!valid_package(&path, bytes.len() as u64 + 1, &hash).unwrap());
-        assert!(!valid_package(&path, bytes.len() as u64, &"0".repeat(64)).unwrap());
+        assert!(update::valid_package(&path, bytes.len() as u64, &hash, b"MZ").unwrap());
+        assert!(!update::valid_package(&path, bytes.len() as u64 + 1, &hash, b"MZ").unwrap());
+        assert!(!update::valid_package(&path, bytes.len() as u64, &"0".repeat(64), b"MZ").unwrap());
         fs::remove_file(path).unwrap();
     }
 
@@ -390,7 +293,7 @@ mod tests {
 
     #[test]
     fn update_scripts_parse_in_windows_powershell() {
-        for script in [DOWNLOAD, CLOSE_IDES, INSTALL, SHORTCUT] {
+        for script in [DOWNLOAD, INSTALL, SHORTCUT] {
             let mut command = powershell(
                 r#"
                 $tokens = $null; $errorsFound = $null

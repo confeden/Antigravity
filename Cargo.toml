@@ -42,7 +42,8 @@ ratatui = { version = "0.30", default-features = false, features = ["crossterm"]
 # window ever opened, whichever adapter would have been chosen. D3D12 and its
 # software rasteriser WARP ship with every Windows 10, so nothing else is needed.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Threading", "Win32_System_RemoteDesktop", "Win32_System_Diagnostics_Debug", "Win32_System_Diagnostics_ToolHelp"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Isolation", "Win32_System_Threading", "Win32_System_RemoteDesktop", "Win32_System_Diagnostics_Debug", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Rpc", "Win32_NetworkManagement_WindowsFilteringPlatform"] }
+jsonc-parser = { version = "0.34", features = ["cst"] }
 eframe = { version = "0.36", default-features = false, features = ["accesskit", "default_fonts", "links", "wgpu_no_default_features", "glow"] }
 wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "wgsl", "dx12"] }
 

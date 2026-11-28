@@ -7,15 +7,19 @@
 use std::fs;
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 pub const RELEASES_LATEST_URL: &str = "https://github.com/confeden/Antigravity/releases/latest";
+pub const UPDATED_FLAG: &str = "--updated";
+#[cfg(any(unix, test))]
+pub const HANDOFF_FLAG: &str = "--finish-app-update";
 const API_HOST: &str = "api.github.com";
 const API_PATH: &str = "/repos/confeden/Antigravity/releases/latest";
 const CHECK_INTERVAL: Duration = Duration::from_secs(8 * 60 * 60);
@@ -34,6 +38,10 @@ const MAX_BODY: usize = 256 * 1024;
 /// update that does not exist.
 pub fn current_version() -> &'static str {
     option_env!("AG_FULL_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"))
+}
+
+pub fn started_after_install() -> bool {
+    std::env::args_os().any(|arg| arg == UPDATED_FLAG)
 }
 
 /// Information about a GitHub release asset.
@@ -69,7 +77,7 @@ pub struct ReleaseInfo {
 impl ReleaseInfo {
     /// Returns true if this release is strictly newer than the currently running binary.
     pub fn is_newer_than_current(&self) -> bool {
-        is_newer_version(&self.tag_name, current_version())
+        !self.draft && !self.prerelease && is_newer_version(&self.tag_name, current_version())
     }
 
     /// Strips leading 'v' / 'V' and whitespace from tag name for display.
@@ -80,44 +88,84 @@ impl ReleaseInfo {
     }
 }
 
-/// Cached check payload stored on disk.
-#[derive(Debug, Serialize, Deserialize)]
-struct CachedCheck {
-    checked_at_unix: u64,
-    release: ReleaseInfo,
-}
-
-/// Returns the path to the update check cache file in the system temp directory.
-fn cache_path() -> PathBuf {
-    std::env::temp_dir().join("ag_unlocker_update_cache.json")
-}
-
-/// Compares two version strings (e.g. "v2.11.0_4" vs "2.11.0_1", "2.11.0" vs "2.10.0").
-/// Returns true if `remote` is strictly newer than `current`.
-pub fn is_newer_version(remote: &str, current: &str) -> bool {
-    let parse_segments = |v: &str| -> Vec<u64> {
-        let clean = v.trim().trim_start_matches(|c| c == 'v' || c == 'V');
-        clean
-            .split(|c: char| !c.is_ascii_digit())
-            .filter(|s| !s.is_empty())
-            .filter_map(|s| s.parse::<u64>().ok())
-            .collect()
-    };
-
-    let r_parts = parse_segments(remote);
-    let c_parts = parse_segments(current);
-
-    let max_len = r_parts.len().max(c_parts.len());
-    for i in 0..max_len {
-        let r = r_parts.get(i).copied().unwrap_or(0);
-        let c = c_parts.get(i).copied().unwrap_or(0);
-        if r > c {
-            return true;
-        } else if r < c {
-            return false;
-        }
+fn version_parts(version: &str) -> Option<[u64; 4]> {
+    let clean = version.trim().strip_prefix(['v', 'V']).unwrap_or(version.trim());
+    let (base, build) = clean.split_once('_').map_or((clean, None), |(base, build)| (base, Some(build)));
+    let mut parts = base.split('.');
+    let mut numbers = [0; 4];
+    let number = |value: &str| value.bytes().all(|b| b.is_ascii_digit())
+        .then(|| value.parse::<u64>().ok()).flatten();
+    for field in &mut numbers[..3] {
+        *field = number(parts.next()?)?;
     }
-    false
+    match (parts.next(), build) {
+        (Some(_), Some(_)) => return None,
+        (Some(build), None) | (None, Some(build)) => numbers[3] = number(build)?,
+        (None, None) => {}
+    }
+    (parts.next().is_none()).then_some(numbers)
+}
+
+pub fn is_newer_version(remote: &str, current: &str) -> bool {
+    matches!((version_parts(remote), version_parts(current)), (Some(r), Some(c)) if r > c)
+}
+
+#[cfg(not(windows))]
+pub fn same_version(first: &str, second: &str) -> bool {
+    matches!((version_parts(first), version_parts(second)), (Some(a), Some(b)) if a == b)
+}
+
+pub fn asset_versions(release: &ReleaseInfo) -> Vec<String> {
+    let tag = &release.tag_name;
+    let version = release.display_version();
+    if !release.is_newer_than_current() || tag.trim() != tag {
+        return Vec::new();
+    }
+    if let Some((base, build)) = version.rsplit_once('_') {
+        vec![version.to_owned(), format!("{base}.{build}")]
+    } else if version.matches('.').count() == 3 {
+        let (base, build) = version.rsplit_once('.').unwrap();
+        vec![version.to_owned(), format!("{base}_{build}")]
+    } else {
+        vec![version.to_owned()]
+    }
+}
+
+pub fn verified_asset<'a>(release: &'a ReleaseInfo, name: &str) -> Option<(&'a ReleaseAsset, &'a str)> {
+    let releases = RELEASES_LATEST_URL.strip_suffix("/latest")?;
+    let expected = format!("{releases}/download/{}/{name}", release.tag_name);
+    let asset = release.assets.iter().find(|asset| {
+        asset.name == name
+            && asset.browser_download_url == expected
+            && (1..=200 * 1024 * 1024).contains(&asset.size)
+    })?;
+    let digest = asset.digest.as_deref()?.strip_prefix("sha256:")?;
+    (digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit())).then_some((asset, digest))
+}
+
+pub fn valid_package(path: &Path, size: u64, digest: &str, magic: &[u8; 2]) -> io::Result<bool> {
+    let mut file = fs::File::open(path)?;
+    if file.metadata()?.len() != size {
+        return Ok(false);
+    }
+    let mut header = [0; 2];
+    file.read_exact(&mut header)?;
+    if &header != magic {
+        return Ok(false);
+    }
+    let mut sha = Sha256::new();
+    sha.update(header);
+    io::copy(&mut file, &mut sha)?;
+    Ok(hex::encode(sha.finalize()).eq_ignore_ascii_case(digest))
+}
+
+pub fn staging_path_in(directory: &Path) -> Result<PathBuf, String> {
+    let mut nonce = [0; 16];
+    rustls::crypto::ring::default_provider()
+        .secure_random
+        .fill(&mut nonce)
+        .map_err(|_| "Не удалось создать временный каталог обновления")?;
+    Ok(directory.join(format!("ai-unlocker-update-{}", hex::encode(nonce))))
 }
 
 /// Client configuration for TLS. Reuses the project's standard pattern with WebPKI roots
@@ -283,83 +331,26 @@ pub fn fetch_latest_release() -> Result<ReleaseInfo, String> {
     Ok(release)
 }
 
-/// Checks for updates respecting `CHECK_INTERVAL` (8 hours).
-/// If `force` is false, it uses the cached result if available and fresh.
-/// If an update is available, returns `Ok(Some(release))`.
-pub fn check_update_cached(force: bool) -> Result<Option<ReleaseInfo>, String> {
-    let now_unix = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-
-    let path = cache_path();
-    if !force {
-        if let Ok(data) = fs::read_to_string(&path) {
-            if let Ok(cached) = serde_json::from_str::<CachedCheck>(&data) {
-                if now_unix >= cached.checked_at_unix
-                    && Duration::from_secs(now_unix - cached.checked_at_unix) < CHECK_INTERVAL
-                {
-                    return if cached.release.is_newer_than_current() {
-                        Ok(Some(cached.release))
-                    } else {
-                        Ok(None)
-                    };
-                }
-            }
-        }
-    }
-
-    let release = fetch_latest_release()?;
-    let cache_entry = CachedCheck {
-        checked_at_unix: now_unix,
-        release: release.clone(),
-    };
-    if let Ok(serialized) = serde_json::to_string(&cache_entry) {
-        fs::write(&path, serialized).ok();
-    }
-
-    if release.is_newer_than_current() {
-        Ok(Some(release))
-    } else {
-        Ok(None)
-    }
-}
-
-/// Watches for a newer release for as long as the receiver lives.
-///
-/// Checked at startup and then every `CHECK_INTERVAL` while the window stays
-/// open. Only the first pass may answer from the on-disk cache: after that the
-/// thread has already waited the full interval, so re-reading a cache it wrote
-/// itself would just double the wait.
-pub fn spawn_watch(tx: std::sync::mpsc::Sender<ReleaseInfo>, wake: Box<dyn Fn() + Send>) {
+/// Check GitHub Releases at startup and every eight hours while the UI is open.
+pub fn spawn_watch(tx: std::sync::mpsc::Sender<Option<ReleaseInfo>>, wake: Box<dyn Fn() + Send>) {
     std::thread::Builder::new()
         .name("update-watch".to_string())
-        .spawn(move || {
-            let mut first = true;
-            loop {
-                match check_update_cached(!first) {
-                    Ok(Some(rel)) => {
-                        // A closed receiver means the window is gone; so is the
-                        // reason to keep checking.
-                        if tx.send(rel).is_err() {
-                            return;
-                        }
-                        // egui sleeps until something asks it to repaint, so a
-                        // banner that only lands in a channel stays invisible
-                        // until the user happens to move the mouse.
-                        wake();
+        .spawn(move || loop {
+            match fetch_latest_release() {
+                Ok(release) => {
+                    if tx.send(release.is_newer_than_current().then_some(release)).is_err() {
+                        return;
                     }
-                    Ok(None) => {}
-                    Err(_e) => {
-                        // Background check: a failure is not the user's problem,
-                        // and there is no UI surface that could act on it.
-                        #[cfg(debug_assertions)]
-                        eprintln!("update check failed: {}", _e);
-                    }
+                    wake();
                 }
-                first = false;
-                std::thread::sleep(CHECK_INTERVAL);
+                Err(error) => {
+                    #[cfg(debug_assertions)]
+                    eprintln!("update check failed: {}", error);
+                    #[cfg(not(debug_assertions))]
+                    let _ = error;
+                }
             }
+            std::thread::sleep(CHECK_INTERVAL);
         })
         .ok();
 }
@@ -375,6 +366,10 @@ mod tests {
 
     #[test]
     fn test_version_comparison() {
+        assert!(is_newer_version("v2.36.0.1", "2.36.0"));
+        assert!(!is_newer_version("v2.36.0_1", "2.36.0.1"));
+        assert!(!is_newer_version("v2.36.1-rc.1", "2.36.0"));
+        assert!(!is_newer_version("v2.36.0.1.2", "2.36.0"));
         assert!(is_newer_version("2.11.0_1", "2.11.0"));
         assert!(is_newer_version("v2.11.0_4", "2.11.0_1"));
         assert!(is_newer_version("2.12.0", "2.11.0_5"));

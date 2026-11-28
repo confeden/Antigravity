@@ -7,7 +7,7 @@ DefaultDirName={localappdata}\Programs\AI Unlocker
 DisableDirPage=yes
 UsePreviousAppDir=no
 DisableProgramGroupPage=yes
-UsePreviousTasks=no
+UsePreviousTasks=yes
 LicenseFile=LICENSE
 PrivilegesRequired=lowest
 ArchitecturesAllowed=x64compatible
@@ -19,7 +19,9 @@ UninstallDisplayIcon={app}\ag_unlocker.exe
 VersionInfoDescription=AI Unlocker Setup
 VersionInfoVersion={#AppVersion}
 CloseApplications=yes
+CloseApplicationsFilter=ag_unlocker.exe
 RestartApplications=no
+SetupMutex=AI.Unlocker.Setup
 WizardStyle=modern
 
 [Languages]
@@ -46,7 +48,7 @@ Name: "{userprograms}\AI Unlocker"; Filename: "{app}\ag_unlocker.exe"; WorkingDi
 Name: "{userdesktop}\AI Unlocker"; Filename: "{app}\ag_unlocker.exe"; WorkingDir: "{app}"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\ag_unlocker.exe"; Description: "{cm:LaunchAfterSetup}"; Flags: postinstall nowait skipifsilent runasoriginaluser
+Filename: "{app}\ag_unlocker.exe"; Parameters: "--updated"; Description: "{cm:LaunchAfterSetup}"; Flags: postinstall nowait skipifsilent runasoriginaluser
 
 [Code]
 procedure OpenLicense(Sender: TObject; const Link: string; LinkType: TSysLinkType);

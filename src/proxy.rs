@@ -1543,7 +1543,23 @@ pub fn run(if_index: u32) -> Result<(), String> {
 pub fn run_paid() -> Result<(), String> {
     let mut said: Option<crate::gate::Blocker> = None;
     let listener = loop {
-        match bind_from_slot(paid_port(), &PAID_FALLBACK_PORTS, "paid_proxy", adopt_paid) {
+        #[cfg(windows)]
+        let reserved_port = crate::paid_windows::protected_paid_port()
+            .or_else(|| crate::paid::enabled().then(paid_port));
+        #[cfg(not(windows))]
+        let reserved_port: Option<u16> = None;
+        // The persistent WFP rules and client settings point at the same socket.
+        let fallbacks: &[u16] = if reserved_port.is_some() {
+            &[]
+        } else {
+            &PAID_FALLBACK_PORTS
+        };
+        match bind_from_slot(
+            reserved_port.unwrap_or_else(paid_port),
+            fallbacks,
+            "paid_proxy",
+            adopt_paid,
+        ) {
             Ok(listener) => {
                 if said.is_some() {
                     crate::dns_forwarder::log_proxy(&format!(
@@ -1554,6 +1570,11 @@ pub fn run_paid() -> Result<(), String> {
                 break listener;
             }
             Err(blocker) => {
+                let wait = if reserved_port.is_some() && blocker.cause == "held" {
+                    Duration::from_secs(3)
+                } else {
+                    REBIND_EVERY
+                };
                 if said.as_ref() != Some(&blocker) {
                     crate::dns_forwarder::log_proxy(&format!(
                         "paid proxy not started: не занять {} — {}",
@@ -1561,7 +1582,7 @@ pub fn run_paid() -> Result<(), String> {
                     ));
                     said = Some(blocker);
                 }
-                thread::sleep(REBIND_EVERY);
+                thread::sleep(wait);
             }
         }
     };
@@ -1606,24 +1627,41 @@ fn serve_paid(mut client: TcpStream) {
         }
         Request::Gone => return,
     };
-    use crate::paid::PaidApp::AntigravityDesktop;
+    use crate::paid::PaidApp::{AntigravityDesktop, CodexCli};
     // CLI and VS Code can keep the shared environment on this port after
     // Desktop opts out. The connecting process is what identifies Desktop.
     #[cfg(windows)]
-    let desktop = crate::portcheck::client_image(&client)
-        .is_some_and(|image| is_desktop_proxy_client(&image));
+    let app = crate::portcheck::client_image(&client).and_then(|image| {
+        if is_desktop_proxy_client(&image) {
+            Some(AntigravityDesktop)
+        } else if crate::paid_windows::codex_cli_path()
+            .is_some_and(|exe| exe.as_os_str().eq_ignore_ascii_case(image.as_os_str()))
+        {
+            Some(CodexCli)
+        } else {
+            None
+        }
+    });
     #[cfg(not(windows))]
-    let desktop = false;
+    let app = None;
     let active = crate::paid::active_apps();
-    let desktop_free = desktop && !active.contains(&AntigravityDesktop);
+    if active.is_empty() || (app == Some(CodexCli) && !active.contains(&CodexCli)) {
+        client.write_all(RESP_BAD_GATEWAY).ok();
+        return;
+    }
+    let desktop_free = app == Some(AntigravityDesktop) && !active.contains(&AntigravityDesktop);
     if desktop_free && http.is_none() {
         serve_free_connect(client, &host, port);
         return;
     }
-    if !desktop_free && !active.is_empty() {
+    if !desktop_free {
+        #[cfg(windows)]
+        if !crate::paid_windows::kill_switch_configured(&active) {
+            client.write_all(RESP_BAD_GATEWAY).ok();
+            return;
+        }
         client.set_read_timeout(None).ok();
         if let Ok(peer) = client.try_clone() {
-            let app = desktop.then_some(AntigravityDesktop);
             if let Err(error) = crate::paid::serve(peer, &host, port, http.as_deref(), app) {
                 if !error.starts_with("PAID отказ") {
                     crate::dns_forwarder::log_proxy(&error);
@@ -1634,19 +1672,6 @@ fn serve_paid(mut client: TcpStream) {
             client.write_all(RESP_BAD_GATEWAY).ok();
         }
         return;
-    }
-    if let Some(head) = http {
-        if port != 80 {
-            client.write_all(RESP_NOT_ALLOWED).ok();
-            return;
-        }
-        if let Ok(mut target) = connect_bounded(&host, port, TUNNEL_OPEN_BUDGET) {
-            if target.write_all(&head).is_ok() {
-                client.set_read_timeout(None).ok();
-                splice(client, target);
-                return;
-            }
-        }
     }
     client.write_all(RESP_BAD_GATEWAY).ok();
 }

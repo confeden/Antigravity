@@ -17,18 +17,16 @@ const ICON_W: u32 = 64;
 const ICON_H: u32 = 64;
 const ICON_RGBA: &[u8] = include_bytes!("../../assets/icon_64.rgba");
 
-const ANTIGRAVITY_SIZE: usize = 48;
-const ANTIGRAVITY_RGBA: &[u8] = include_bytes!("../../assets/antigravity_48.rgba");
+const PRODUCT_SIZE: usize = 48;
 
-/// The Antigravity product badge shown next to the group heading in Integration.
-pub fn antigravity_image() -> Option<egui::ColorImage> {
-    if ANTIGRAVITY_RGBA.len() != ANTIGRAVITY_SIZE * ANTIGRAVITY_SIZE * 4 {
-        return None;
-    }
-    Some(egui::ColorImage::from_rgba_unmultiplied(
-        [ANTIGRAVITY_SIZE, ANTIGRAVITY_SIZE],
-        ANTIGRAVITY_RGBA,
-    ))
+pub(super) fn product_image(group: crate::paid::PaidGroup) -> egui::ColorImage {
+    use crate::paid::PaidGroup;
+    let pixels: &[u8; PRODUCT_SIZE * PRODUCT_SIZE * 4] = match group {
+        PaidGroup::Antigravity => include_bytes!("../../assets/antigravity_48.rgba"),
+        PaidGroup::Claude => include_bytes!("../../assets/claude_48.rgba"),
+        PaidGroup::Codex => include_bytes!("../../assets/chatgpt_48.rgba"),
+    };
+    egui::ColorImage::from_rgba_unmultiplied([PRODUCT_SIZE, PRODUCT_SIZE], pixels)
 }
 
 /// The window icon, or `None` if the baked asset is not the size it claims.
@@ -66,12 +64,11 @@ mod tests {
     }
 
     #[test]
-    fn the_antigravity_icon_is_the_size_it_claims() {
-        let img = antigravity_image().expect("antigravity asset must match 48x48 RGBA");
-        assert_eq!(img.size, [ANTIGRAVITY_SIZE, ANTIGRAVITY_SIZE]);
-        assert!(
-            img.pixels.iter().any(|px| px.a() != 0),
-            "the antigravity icon is entirely transparent"
-        );
+    fn the_product_icons_are_visible() {
+        use crate::paid::PaidGroup;
+        for group in [PaidGroup::Antigravity, PaidGroup::Claude, PaidGroup::Codex] {
+            let image = product_image(group);
+            assert!(image.pixels.iter().any(|pixel| pixel.a() != 0), "{group:?}");
+        }
     }
 }

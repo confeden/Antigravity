@@ -216,9 +216,9 @@ fn main() {
                 static_canary, release_token
             ),
         );
-        // Kept in step with Cargo.toml, which build_rust.py rewrites per release.
-        res.set("FileVersion", &version);
-        res.set("ProductVersion", &version);
+        let full_version = env::var("AG_FULL_VERSION").unwrap_or_else(|_| version.clone());
+        res.set("FileVersion", &full_version);
+        res.set("ProductVersion", &full_version);
         res.compile().unwrap();
     }
 }

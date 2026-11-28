@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import plistlib
 import re
 import secrets
 import shutil
@@ -785,10 +786,8 @@ def linux_glibc_baseline(distro, elf_wsl_path):
     return found[len("GLIBC_"):] if found.startswith("GLIBC_") else None
 
 
-def build_linux_bundle(version):
-    """Builds the Linux ELF in WSL and assembles release/AG_<ver>_linux/ (+ .tar.gz)
-    with the double-click launcher assets. Best-effort; returns the bundle dir or
-    None. Never raises - the Windows build must not depend on it."""
+def build_linux_bundle(version, output_dir):
+    """Builds the Linux ELF in WSL and returns the installer archive or None."""
     import tarfile
 
     # Where the Linux target dir lived before LINUX_CACHE.
@@ -860,7 +859,7 @@ def build_linux_bundle(version):
         if shown:
             print(shown)
         if res.returncode != 0 or not target_dir:
-            print("[WARNING] Linux-сборка не удалась (см. вывод выше) - отгружён только .exe.")
+            print("[WARNING] Linux-сборка не удалась (см. вывод выше).")
             return None
 
         elf = "%s/%s" % (target_dir, elf_in_cache)
@@ -873,14 +872,15 @@ def build_linux_bundle(version):
         # checks (that is how the GLIBC_2.39 bundle shipped).
         baseline = linux_glibc_baseline(distro, elf)
         if baseline is None:
-            print("[i] Планку glibc проверить нечем (нет objdump в WSL).")
-        elif has_zigbuild and _version_tuple(baseline) > _version_tuple(LINUX_GLIBC):
+            print("[WARNING] Планка glibc не проверена. Проверьте objdump в WSL.")
+            return None
+        if _version_tuple(baseline) > _version_tuple(LINUX_GLIBC):
             print(f"[WARNING] ELF требует glibc {baseline}, хотя собирался под "
                   f"{LINUX_GLIBC} - планка не удержана, проверьте цель сборки.")
-        else:
-            print(f"[INFO] Linux-бандл требует glibc {baseline} и старше.")
+            return None
+        print(f"[INFO] Linux-бандл требует glibc {baseline} и старше.")
 
-        bundle = os.path.abspath(os.path.join("release", f"AG_{version}_linux"))
+        bundle = os.path.join(output_dir, f"AG_{version}_linux")
         if os.path.exists(bundle):
             shutil.rmtree(bundle, ignore_errors=True)
         os.makedirs(bundle, exist_ok=True)
@@ -891,10 +891,8 @@ def build_linux_bundle(version):
         if copied.returncode != 0:
             print(f"[WARNING] ELF не скопирован в бандл: {(copied.stdout or '').strip()}")
             return None
-        for name in ("launch.sh", "install.sh", "Antigravity-Unlocker.desktop", "README.md"):
-            src = os.path.join("linux", name)
-            if os.path.exists(src):
-                shutil.copy2(src, os.path.join(bundle, name))
+        for name in ("launch.sh", "install.sh", "README.md"):
+            shutil.copy2(os.path.join("linux", name), os.path.join(bundle, name))
 
         # Best-effort icon: convert icon.ico -> icon.png if Pillow is present.
         try:
@@ -952,7 +950,7 @@ def build_linux_bundle(version):
         else:
             print("[i] Кэш Linux-сборки не почищен (нужен python3 в WSL): %s"
                   % (said[-1] if said else "нет ответа"))
-        return bundle
+        return tar_path
     except Exception as e:
         print(f"[WARNING] Linux-сборка пропущена из-за ошибки: {e}")
         return None
@@ -975,15 +973,6 @@ MACOS_TARGET = "aarch64-apple-darwin"
 MACOS_DEPLOYMENT_TARGET = "11.0"
 MACOS_SDK_DIR = "${XDG_DATA_HOME:-$HOME/.local/share}/macos-sdk"
 MACOS_CACHE = "${XDG_CACHE_HOME:-$HOME/.cache}/ag_unlocker/target-mac"
-
-# Double-click launcher, the same text the CI workflow writes.
-MACOS_LAUNCHER = """#!/bin/sh
-# Double-click launcher. Strips our own quarantine flag (a downloaded
-# tar keeps it) and starts the unlocker from its own folder.
-cd "$(dirname "$0")"
-xattr -dr com.apple.quarantine ag_unlocker 2>/dev/null || true
-exec ./ag_unlocker "$@"
-"""
 
 LC_CODE_SIGNATURE = 0x1D
 
@@ -1015,10 +1004,8 @@ def macho_is_signed(path):
     return False
 
 
-def build_macos_bundle(version):
-    """Cross-builds the arm64 Mach-O in WSL and assembles release/AG_<ver>_macos/
-    (+ .tar.gz), the layout the CI workflow ships. Best-effort; returns the bundle
-    dir or None. Never raises - the Windows build must not depend on it."""
+def build_macos_bundle(version, output_dir):
+    """Cross-builds the arm64 Mach-O in WSL and returns the installer archive or None."""
     import tarfile
 
     try:
@@ -1085,7 +1072,7 @@ def build_macos_bundle(version):
 
         binary = "%s/%s/release/ag_unlocker" % (target_dir, MACOS_TARGET)
         name = f"AG_{version}_macos"
-        bundle = os.path.abspath(os.path.join("release", name))
+        bundle = os.path.join(output_dir, name)
         if os.path.exists(bundle):
             shutil.rmtree(bundle, ignore_errors=True)
         os.makedirs(bundle, exist_ok=True)
@@ -1102,18 +1089,27 @@ def build_macos_bundle(version):
             return None
         print("[INFO] macOS-бинарник подписан ad-hoc (подпись компоновщика).")
 
-        with open(os.path.join(bundle, "Запустить.command"), "w", encoding="utf-8", newline="\n") as f:
-            f.write(MACOS_LAUNCHER)
-        readme = os.path.join("linux", "README.md")
-        if os.path.exists(readme):
-            shutil.copy2(readme, os.path.join(bundle, "README.md"))
+        shutil.copy2(os.path.join("macos", "install.sh"), os.path.join(bundle, "Установить.command"))
+        major, minor, patch, *build = version.replace("_", ".").split(".")
+        with open(os.path.join(bundle, "Info.plist"), "wb") as f:
+            plistlib.dump({
+                "CFBundleDisplayName": "AI Unlocker",
+                "CFBundleName": "AI Unlocker",
+                "CFBundleExecutable": "ag_unlocker",
+                "CFBundleIdentifier": "com.confeden.ai-unlocker",
+                "CFBundlePackageType": "APPL",
+                "LSMinimumSystemVersion": "13.0",
+                "CFBundleShortVersionString": f"{major}.{minor}.{patch}",
+                "CFBundleVersion": f"{major}.{minor}.{int(patch) * 100 + int((build or ['0'])[0])}",
+                "NSHighResolutionCapable": True,
+            }, f)
 
         tar_path = bundle + ".tar.gz"
         if os.path.exists(tar_path):
             os.remove(tar_path)
 
         def _exec_bits(tarinfo):
-            if tarinfo.isdir() or os.path.basename(tarinfo.name) in ("ag_unlocker", "Запустить.command"):
+            if tarinfo.isdir() or os.path.basename(tarinfo.name) in ("ag_unlocker", "Установить.command"):
                 tarinfo.mode = 0o755
             return tarinfo
 
@@ -1138,7 +1134,7 @@ def build_macos_bundle(version):
         else:
             print("[i] Кэш macOS-сборки не почищен (нужен python3 в WSL): %s"
                   % (said[-1] if said else "нет ответа"))
-        return bundle
+        return tar_path
     except Exception as e:
         print(f"[WARNING] macOS-сборка пропущена из-за ошибки: {e}")
         return None
@@ -1150,7 +1146,7 @@ def main(argv=None):
         "--portable",
         "--windows-portable",
         action="store_true",
-        help="Собрать только переносимую Windows-версию (release/AG_<ver>_portable.exe).",
+        help="Локальная тестовая сборка в release/ для ярлыка build_rust Portable.lnk.",
     )
     args = parser.parse_args(argv)
 
@@ -1158,7 +1154,7 @@ def main(argv=None):
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
     print("[INFO] Starting build process...")
 
-    VERSION = "2.36.0"
+    VERSION = "2.36.0.1"
     version = VERSION
     cargo_version = ".".join(version.split("_")[0].split(".")[:3])
     print(f"[INFO] Build version: {version}")
@@ -1167,12 +1163,15 @@ def main(argv=None):
         # 1. Sync the version in Cargo.toml so env!("CARGO_PKG_VERSION") matches this build.
         with open("Cargo.toml", 'r', encoding='utf-8') as f:
             cargo_content = f.read()
-        cargo_content = re.sub(r'^version\s*=\s*"[^"]*"', f'version = "{cargo_version}"', cargo_content, flags=re.MULTILINE)
-        with open("Cargo.toml", 'w', encoding='utf-8') as f:
-            f.write(cargo_content)
+        synced = re.sub(r'^version\s*=\s*"[^"]*"', f'version = "{cargo_version}"', cargo_content,
+                        count=1, flags=re.MULTILINE)
+        if synced != cargo_content:
+            with open("Cargo.toml", 'w', encoding='utf-8') as f:
+                f.write(synced)
 
-        # 2. Build the release binary (only the main target).
-        print("[INFO] Запуск компиляции (Release mode)...")
+        # 2. Build the main binary for the requested profile.
+        print("[INFO] Быстрая тестовая компиляция..." if args.portable
+              else "[INFO] Запуск компиляции (Release mode)...")
         installer_compiler = None if args.portable else find_iscc()
         cargo_env = os.environ.copy()
         cargo_env["AG_FULL_VERSION"] = version
@@ -1188,30 +1187,40 @@ def main(argv=None):
         # not on a faster system drive: measured, the same cold build ran within 3%
         # on the owner's HDD and NVMe - rustc is CPU-bound once the OS caches files.
         target_dir = os.path.abspath("target")
-        build = cargo_build(
-            ["cargo", "build", "--release", "--bin", "ag_unlocker", "--target-dir", target_dir],
-            env=cargo_env,
-        )
+        command = ["cargo", "build", "--bin", "ag_unlocker", "--target-dir", target_dir]
+        if not args.portable:
+            command.append("--release")
+        build = cargo_build(command, env=cargo_env)
         built_exe = build.executables.get("ag_unlocker")
         if not built_exe or not os.path.isfile(built_exe):
             raise RuntimeError("cargo не сообщил, где собранный exe")
 
-        os.makedirs("release", exist_ok=True)
-        portable_path = os.path.abspath(os.path.join("release", f"AG_{version}_portable.exe"))
-        publish_windows_exe(built_exe, portable_path)
-        check_shipped_binary(portable_path, [home + "\\", "\\.cargo\\registry"], windows=True)
-        if UPX_ENABLED:
-            compress_exe_inplace(portable_path)
-
+        release_dir = os.path.abspath("release")
+        os.makedirs(release_dir, exist_ok=True)
         if args.portable:
+            portable_path = os.path.join(release_dir, f"AG_{version}_portable.exe")
+            publish_windows_exe(built_exe, portable_path)
             print(f"Переносимая сборка Windows: {portable_path}")
             return 0
 
-        out_path = os.path.abspath(os.path.join("release", installer_filename(version)))
-        build_windows_installer(installer_compiler, portable_path, version, out_path)
-
-        print(f"Установщик Windows: {out_path}")
-        print(f"Переносимая сборка для TUI: {portable_path}")
+        out_path = os.path.join(release_dir, installer_filename(version))
+        check_shipped_binary(built_exe, [home + "\\", "\\.cargo\\registry"], windows=True)
+        with tempfile.TemporaryDirectory(prefix="ag-packages-", dir=target_dir) as staging:
+            payload = built_exe
+            if UPX_ENABLED:
+                payload = os.path.join(staging, "ag_unlocker.exe")
+                shutil.copy2(built_exe, payload)
+                compress_exe_inplace(payload)
+            windows_package = os.path.join(staging, installer_filename(version))
+            build_windows_installer(installer_compiler, payload, version, windows_package)
+            linux_package = build_linux_bundle(version, staging)
+            macos_package = build_macos_bundle(version, staging)
+            if not linux_package or not macos_package:
+                raise RuntimeError("Нужны установщики для Windows, Linux и macOS. Проверьте вывод WSL.")
+            for package in (windows_package, linux_package, macos_package):
+                destination = os.path.join(release_dir, os.path.basename(package))
+                publish_windows_exe(package, destination)
+                print(f"Установщик: {destination}")
 
         # Provenance record. Written after compression so the hash is of the file
         # that actually ships.
@@ -1227,12 +1236,6 @@ def main(argv=None):
         # The exe is in release\; only now is it known what the cache must keep.
         print()
         print_prune("Windows", target_dir, prune_release_cache(target_dir, build, whole_dir=False))
-
-        # Linux bundle, built via WSL alongside the exe. Best-effort: a machine
-        # without WSL/cargo still ships the Windows build above.
-        build_linux_bundle(version)
-        # The Apple-Silicon bundle, cross-built in the same distro.
-        build_macos_bundle(version)
 
         removed, freed = prune_old_releases("release", version)
         if removed:

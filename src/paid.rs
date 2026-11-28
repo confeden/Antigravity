@@ -335,7 +335,7 @@ impl PaidApp {
             Self::ClaudeCode => "Claude Code",
             Self::ClaudeDesktop => "Claude Desktop",
             Self::CodexCli => "Codex CLI",
-            Self::ChatGptDesktop => "ChatGPT / Codex",
+            Self::ChatGptDesktop => "ChatGPT",
         }
     }
 
@@ -366,13 +366,14 @@ impl PaidApp {
                 | Self::AntigravityCli
                 | Self::AntigravityVscode
                 | Self::ClaudeCode
+                | Self::ClaudeDesktop
+                | Self::CodexCli
         )
     }
 
     pub fn unavailable_reason(self) -> Option<&'static str> {
         match self {
-            Self::ClaudeDesktop | Self::ChatGptDesktop => Some("В разработке (MSIX)"),
-            Self::CodexCli => Some("В разработке"),
+            Self::ChatGptDesktop => Some("PAID недоступен для приложения из Microsoft Store"),
             _ => None,
         }
     }
@@ -565,16 +566,39 @@ fn request_gateway(request: &[u8]) -> Result<Reply, String> {
 }
 
 fn request_at(addr: SocketAddr, route_label: &str, request: &[u8]) -> io::Result<Reply> {
-    request_with_config(addr, route_label, request, tls_config())
+    #[cfg(windows)]
+    let socket = {
+        let isp = crate::dns_forwarder::isp_interface();
+        if isp == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                "Нет физического интерфейса для связи со шлюзом PAID",
+            ));
+        }
+        crate::net::connect(addr, CONNECT_TIMEOUT, isp)?
+    };
+    #[cfg(not(windows))]
+    let socket = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)?;
+    request_on_socket(socket, route_label, request, tls_config())
 }
 
+#[cfg(test)]
 fn request_with_config(
     addr: SocketAddr,
     route_label: &str,
     request: &[u8],
     config: Arc<ClientConfig>,
 ) -> io::Result<Reply> {
-    let mut socket = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)?;
+    let socket = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)?;
+    request_on_socket(socket, route_label, request, config)
+}
+
+fn request_on_socket(
+    mut socket: TcpStream,
+    route_label: &str,
+    request: &[u8],
+    config: Arc<ClientConfig>,
+) -> io::Result<Reply> {
     socket.set_read_timeout(Some(CONNECT_TIMEOUT))?;
     socket.set_write_timeout(Some(CONNECT_TIMEOUT))?;
     let name = rustls::pki_types::ServerName::try_from(PRIMARY).map_err(io::Error::other)?;
@@ -1003,12 +1027,13 @@ mod tests {
         assert!(!PaidApp::ClaudeCode.is_antigravity());
         assert!(!PaidApp::ClaudeCode.supports_free());
         assert!(PaidApp::ClaudeCode.paid_implemented());
-        assert!(!PaidApp::ClaudeDesktop.paid_implemented());
+        assert!(PaidApp::ClaudeDesktop.paid_implemented());
+        assert_eq!(PaidApp::ChatGptDesktop.label(), "ChatGPT");
         assert!(!PaidApp::ChatGptDesktop.paid_implemented());
-        assert!(!PaidApp::CodexCli.paid_implemented());
+        assert!(PaidApp::CodexCli.paid_implemented());
         assert_eq!(
             PaidApp::ChatGptDesktop.unavailable_reason(),
-            Some("В разработке (MSIX)")
+            Some("PAID недоступен для приложения из Microsoft Store")
         );
     }
 
