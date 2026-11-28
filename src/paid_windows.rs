@@ -53,7 +53,7 @@ fn ps(script: &str) -> Result<(), String> {
         &format!("$ErrorActionPreference='Stop'; {script}"),
         Duration::from_secs(75),
     )
-    .ok_or("Windows не ответила при настройке платного режима")?;
+    .ok_or("Windows не ответила при настройке режима PAID")?;
     if output.status.success() {
         return Ok(());
     }
@@ -359,9 +359,162 @@ fn verify_paid_listener(port: u16) -> Result<(), String> {
     Ok(())
 }
 
+const CODEX_NETWORK_EXES: &[&str] = &[
+    "codex.exe",
+    "codex-exec-server.exe",
+    "codex-code-mode-host.exe",
+    "codex-voice-host.exe",
+];
+
+fn is_codex_network_exe_name(name: &std::ffi::OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    CODEX_NETWORK_EXES
+        .iter()
+        .any(|candidate| name.eq_ignore_ascii_case(candidate))
+}
+
+fn strip_extended_prefix(path: &Path) -> String {
+    let raw = path.to_string_lossy();
+    let trimmed = raw
+        .strip_prefix(r"\\?\UNC\")
+        .map(|tail| format!(r"\\{tail}"))
+        .unwrap_or_else(|| raw.strip_prefix(r"\\?\").unwrap_or(&raw).to_string());
+    trimmed.replace('/', "\\").to_ascii_lowercase()
+}
+
+fn canonical_dedup_key(path: &Path) -> String {
+    let resolved = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    strip_extended_prefix(&resolved)
+}
+
+fn collect_codex_network_exes(root: &Path, out: &mut Vec<PathBuf>, recurse: bool) {
+    use std::os::windows::fs::MetadataExt;
+    const REPARSE_POINT: u32 = 0x400;
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        let path = entry.path();
+        if kind.is_dir() {
+            if recurse
+                && entry
+                    .metadata()
+                    .is_ok_and(|meta| meta.file_attributes() & REPARSE_POINT == 0)
+            {
+                collect_codex_network_exes(&path, out, true);
+            }
+        } else if kind.is_file() && is_codex_network_exe_name(&entry.file_name()) {
+            out.push(path);
+        }
+    }
+}
+
 pub fn codex_cli_path() -> Option<PathBuf> {
     let local = std::env::var_os("LOCALAPPDATA")?;
     Some(PathBuf::from(local).join(r"Programs\OpenAI\Codex\bin\codex.exe"))
+}
+
+fn codex_cli_targets_in(local_appdata: Option<&Path>, userprofile: Option<&Path>) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(local) = local_appdata {
+        collect_codex_network_exes(&local.join(r"Programs\OpenAI\Codex\bin"), &mut candidates, false);
+    }
+    if let Some(home) = userprofile {
+        let packages = home.join(r".codex\packages");
+        for package in ["standalone", "app-server-daemon"] {
+            let pkg_root = packages.join(package);
+            collect_codex_network_exes(&pkg_root.join("releases"), &mut candidates, true);
+            collect_codex_network_exes(&pkg_root.join(r"current\bin"), &mut candidates, false);
+            collect_codex_network_exes(
+                &pkg_root.join(r"current\codex-resources\voice\bin"),
+                &mut candidates,
+                false,
+            );
+        }
+    }
+    dedup_paths_canonical(candidates)
+}
+
+fn dedup_paths_canonical(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut keyed: Vec<(String, PathBuf)> = paths
+        .into_iter()
+        .map(|path| (canonical_dedup_key(&path), path))
+        .collect();
+    keyed.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    keyed.dedup_by(|left, right| left.0 == right.0);
+    keyed.into_iter().map(|(_, path)| path).collect()
+}
+
+pub fn codex_cli_targets() -> Vec<PathBuf> {
+    let local = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
+    let home = std::env::var_os("USERPROFILE").map(PathBuf::from);
+    codex_cli_targets_in(local.as_deref(), home.as_deref())
+}
+
+fn is_codex_cli_image_in(
+    image: &Path,
+    local_appdata: Option<&Path>,
+    userprofile: Option<&Path>,
+) -> bool {
+    let Some(name) = image.file_name() else {
+        return false;
+    };
+    if !is_codex_network_exe_name(name) {
+        return false;
+    }
+    let mut roots = Vec::new();
+    if let Some(local) = local_appdata {
+        roots.push(local.join(r"Programs\OpenAI\Codex\bin"));
+    }
+    if let Some(home) = userprofile {
+        roots.push(home.join(r".codex\packages\standalone"));
+        roots.push(home.join(r".codex\packages\app-server-daemon"));
+    }
+    let norm_roots: Vec<String> = roots
+        .iter()
+        .flat_map(|root| {
+            let mut items = vec![format!("{}\\", strip_extended_prefix(root).trim_end_matches('\\'))];
+            if let Ok(canon) = fs::canonicalize(root) {
+                items.push(format!("{}\\", strip_extended_prefix(&canon).trim_end_matches('\\')));
+            }
+            items
+        })
+        .collect();
+    let direct = strip_extended_prefix(image);
+    let canonical = canonical_dedup_key(image);
+    norm_roots
+        .iter()
+        .any(|prefix| direct.starts_with(prefix) || canonical.starts_with(prefix))
+}
+
+pub fn is_codex_cli_image(image: &Path) -> bool {
+    let local = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
+    let home = std::env::var_os("USERPROFILE").map(PathBuf::from);
+    is_codex_cli_image_in(image, local.as_deref(), home.as_deref())
+}
+
+fn stop_codex_daemon_best_effort() {
+    let Some(cli) = codex_cli_path().filter(|path| path.is_file()) else {
+        return;
+    };
+    let Some(home) = std::env::var_os("USERPROFILE") else {
+        return;
+    };
+    let pid_file = PathBuf::from(home).join(r".codex\app-server-daemon\daemon.pid");
+    if !pid_file.is_file() {
+        return;
+    }
+    let mut cmd = std::process::Command::new(&cli);
+    cmd.args(["app-server", "daemon", "stop"]);
+    let _ = crate::utils::bounded_output(
+        crate::utils::no_window(&mut cmd),
+        Duration::from_secs(5),
+    );
 }
 
 fn configure_codex_cli(enabled: bool) -> Result<(), String> {
@@ -370,7 +523,9 @@ fn configure_codex_cli(enabled: bool) -> Result<(), String> {
         "& {{\n{}\n}} -Mode {}",
         include_str!("paid_codex.ps1").trim_start_matches('\u{feff}'),
         quote(mode)
-    ))
+    ))?;
+    stop_codex_daemon_best_effort();
+    Ok(())
 }
 
 fn find_executable(candidates: &[PathBuf], names: &[&str]) -> Option<PathBuf> {
@@ -443,7 +598,11 @@ fn build_running_script(apps: &[PaidApp], ide_exes: &[PathBuf]) -> String {
             }
             PaidApp::AntigravityCli | PaidApp::AntigravityVscode => push_name("agy.exe"),
             PaidApp::ClaudeCode | PaidApp::ClaudeDesktop => push_name("claude.exe"),
-            PaidApp::CodexCli => push_name("codex.exe"),
+            PaidApp::CodexCli => {
+                for name in CODEX_NETWORK_EXES {
+                    push_name(name);
+                }
+            }
             PaidApp::ChatGptDesktop => {
                 push_name("ChatGPT.exe");
                 push_name("codex.exe");
@@ -496,7 +655,7 @@ fn build_running_script(apps: &[PaidApp], ide_exes: &[PathBuf]) -> String {
             }
             PaidApp::CodexCli => {
                 format!(
-                    "if ($procs | Where-Object {{ $_.Name -ieq 'codex.exe' -and ($_.ExecutablePath -notlike '*\\WindowsApps\\*') }}) {{ Write-Output {id} }}"
+                    "if ($procs | Where-Object {{ ($_.Name -ieq 'codex.exe' -or $_.Name -ieq 'codex-exec-server.exe' -or $_.Name -ieq 'codex-code-mode-host.exe' -or $_.Name -ieq 'codex-voice-host.exe') -and ($_.ExecutablePath -notlike '*\\WindowsApps\\*') }}) {{ Write-Output {id} }}"
                 )
             }
             PaidApp::ChatGptDesktop => {
@@ -791,7 +950,7 @@ pub fn transition_apps(desired: &[PaidApp]) -> Result<(), String> {
     );
     let worker_err = fs::read_to_string(&err_path).ok();
     let _ = fs::remove_file(&err_path);
-    let output = output.ok_or("Windows не ответила при настройке платного режима")?;
+    let output = output.ok_or("Windows не ответила при настройке режима PAID")?;
     if output.status.success() {
         return Ok(());
     }
@@ -830,8 +989,12 @@ fn lock_transition() -> Result<fs::File, String> {
     Ok(file)
 }
 
+const POLICY_SCHEMA: u32 = 2;
+
 #[derive(serde::Serialize, serde::Deserialize)]
 struct PolicyState {
+    #[serde(default)]
+    schema: u32,
     port: u16,
     apps: Vec<String>,
     ide_port: Option<u16>,
@@ -843,7 +1006,8 @@ impl PolicyState {
     }
 
     fn covers(&self, apps: &[PaidApp]) -> bool {
-        self.port != 0
+        self.schema == POLICY_SCHEMA
+            && self.port != 0
             && self.apps.len() == apps.len()
             && apps.iter().all(|app| self.apps.iter().any(|id| id == app.id()))
     }
@@ -941,12 +1105,12 @@ impl StrictTargets {
             targets.programs.push(exe);
         }
         if apps.contains(&PaidApp::CodexCli) {
-            let exe = codex_cli_path().filter(|path| path.is_file())
+            codex_cli_path()
+                .filter(|path| path.is_file())
                 .ok_or("Для PAID нужна нативная установка Codex CLI для Windows.")?;
-            targets.programs.push(exe);
+            targets.programs.extend(codex_cli_targets());
         }
-        targets.programs.sort_unstable();
-        targets.programs.dedup();
+        targets.programs = dedup_paths_canonical(targets.programs);
         Ok(targets)
     }
 
@@ -963,6 +1127,7 @@ impl StrictTargets {
             None
         };
         let state = PolicyState {
+            schema: POLICY_SCHEMA,
             port,
             apps: apps.iter().map(|app| app.id().to_string()).collect(),
             ide_port: self.hub.as_ref().map(|hub| hub.port),
@@ -1118,7 +1283,7 @@ pub fn apply_apps(desired: &[PaidApp]) -> Result<(), String> {
     }
     let port = if next.is_some() {
         crate::proxy::wait_for_our_paid_listener(Duration::from_secs(20))
-            .ok_or("Платный локальный прокси не запустился")?
+            .ok_or("Локальный прокси PAID не запустился")?
     } else {
         crate::proxy::paid_port()
     };
@@ -1267,6 +1432,7 @@ try {{
     Configure 'set'
     if ([Convert]::ToBase64String([IO.File]::ReadAllBytes($file)) -cne $installed) {{ throw 'Hook is not idempotent.' }}
     $env:LOCALAPPDATA = $root
+    $env:CODEX_HOME = Join-Path $root '.codex'
     $exeDir = Join-Path $root 'Programs\OpenAI\Codex\bin'
     [void][IO.Directory]::CreateDirectory($exeDir)
     Copy-Item -LiteralPath "$env:SystemRoot\System32\cmd.exe" -Destination (Join-Path $exeDir 'codex.exe')
@@ -1428,6 +1594,164 @@ try {{
             "Включите брандмауэр Windows для всех профилей перед включением PAID."
         );
         assert!(clean_ps_error("", status).contains("Настройка Windows завершилась со статусом"));
+    }
+
+    #[test]
+    fn codex_profile_restarts_stale_daemon_with_paid_proxy_once() {
+        let script = include_str!("paid_codex.ps1").trim_start_matches('\u{feff}');
+        ps(&format!(r##"
+$tempDir = [IO.Path]::GetTempPath()
+$root = Join-Path $tempDir ('aiu-codex-daemon-' + [Guid]::NewGuid().ToString('N'))
+$profileDir = Join-Path $root 'WindowsPowerShell'
+$file = Join-Path $profileDir 'profile.ps1'
+[void][IO.Directory]::CreateDirectory($profileDir)
+& {{
+    {script}
+}} -Mode 'set' -Documents $root
+try {{
+    $env:LOCALAPPDATA = $root
+    $env:CODEX_HOME = Join-Path $root '.codex'
+    $exeDir = Join-Path $root 'Programs\OpenAI\Codex\bin'
+    [void][IO.Directory]::CreateDirectory($exeDir)
+    $fakeExe = Join-Path $exeDir 'codex.exe'
+    $logFile = Join-Path $root 'invocations.log'
+    $env:AIU_TEST_LOG = $logFile
+    Add-Type -OutputAssembly $fakeExe -OutputType ConsoleApplication -TypeDefinition @'
+using System;
+using System.IO;
+public static class Program {{
+    public static void Main(string[] args) {{
+        var log = Environment.GetEnvironmentVariable("AIU_TEST_LOG");
+        var proxy = Environment.GetEnvironmentVariable("HTTPS_PROXY") ?? "";
+        File.AppendAllText(log, proxy + "|" + string.Join(" ", args) + Environment.NewLine);
+    }}
+}}
+'@
+    $state = Join-Path $root 'AGUnlocker'
+    [void][IO.Directory]::CreateDirectory($state)
+    [IO.File]::WriteAllText((Join-Path $state 'paid-proxy-enabled'), '{{"version":2,"apps":["codex-cli"]}}')
+    $policyPath = Join-Path $state 'paid-wfp-state.json'
+    [IO.File]::WriteAllText($policyPath, '{{"schema":2,"port":53130,"apps":["codex-cli"]}}')
+    $daemonDir = Join-Path $env:CODEX_HOME 'app-server-daemon'
+    [void][IO.Directory]::CreateDirectory($daemonDir)
+    $pidFile = Join-Path $daemonDir 'daemon.pid'
+    [IO.File]::WriteAllText($pidFile, '{{"pid":1}}')
+    (Get-Item -LiteralPath $pidFile).LastWriteTimeUtc = (Get-Item -LiteralPath $policyPath).LastWriteTimeUtc.AddSeconds(-10)
+
+    . $file
+    codex hello
+    codex world
+    $lines = Get-Content -LiteralPath $logFile
+    if ($lines.Count -ne 3) {{ throw "Expected 3 invocations, got $($lines.Count): $($lines -join '; ')" }}
+    if ($lines[0] -ne 'http://127.0.0.1:53130|app-server daemon restart') {{ throw "Unexpected first call: $($lines[0])" }}
+    if ($lines[1] -ne 'http://127.0.0.1:53130|hello') {{ throw "Unexpected second call: $($lines[1])" }}
+    if ($lines[2] -ne 'http://127.0.0.1:53130|world') {{ throw "Unexpected third call: $($lines[2])" }}
+}} finally {{
+    $owned = Get-Item -LiteralPath $root
+    if ($owned.Parent.FullName -ne $tempDir.TrimEnd('\') -or $owned.Name -notlike 'aiu-codex-daemon-*') {{
+        throw 'Unexpected test cleanup path.'
+    }}
+    Remove-Item -LiteralPath $owned.FullName -Recurse -Force
+}}
+"##)).unwrap();
+    }
+
+    #[test]
+    fn codex_cli_targets_and_image_matching_cover_daemon_and_exec_server() {
+        let root = std::env::temp_dir().join(format!("ag_codex_targets_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let local = root.join("Local");
+        let home = root.join("Home");
+
+        let cli_bin = local.join(r"Programs\OpenAI\Codex\bin");
+        let standalone_rel = home.join(r".codex\packages\standalone\releases\0.172.0");
+        let daemon_rel = home.join(r".codex\packages\app-server-daemon\releases\0.172.0");
+        for dir in [
+            cli_bin.clone(),
+            standalone_rel.join("bin"),
+            standalone_rel.join(r"codex-resources\voice\bin"),
+            standalone_rel.join("codex-path"),
+            daemon_rel.join("bin"),
+            daemon_rel.join(r"codex-resources\voice\bin"),
+            daemon_rel.join("codex-resources"),
+        ] {
+            fs::create_dir_all(&dir).unwrap();
+        }
+        let expected_names = [
+            cli_bin.join("codex.exe"),
+            standalone_rel.join(r"bin\codex.exe"),
+            standalone_rel.join(r"bin\codex-exec-server.exe"),
+            standalone_rel.join(r"bin\codex-code-mode-host.exe"),
+            standalone_rel.join(r"codex-resources\voice\bin\codex-voice-host.exe"),
+            daemon_rel.join(r"bin\codex.exe"),
+            daemon_rel.join(r"bin\codex-exec-server.exe"),
+            daemon_rel.join(r"bin\codex-code-mode-host.exe"),
+            daemon_rel.join(r"codex-resources\voice\bin\codex-voice-host.exe"),
+        ];
+        for path in &expected_names {
+            fs::write(path, b"mz").unwrap();
+        }
+        for ignored in [
+            standalone_rel.join(r"codex-path\rg.exe"),
+            daemon_rel.join(r"codex-resources\codex-command-runner.exe"),
+        ] {
+            fs::write(ignored, b"mz").unwrap();
+        }
+
+        let found = codex_cli_targets_in(Some(&local), Some(&home));
+        assert_eq!(found.len(), expected_names.len(), "{found:?}");
+        for path in &expected_names {
+            assert!(found.contains(path), "missing {}", path.display());
+            assert!(
+                is_codex_cli_image_in(path, Some(&local), Some(&home)),
+                "image check failed for {}",
+                path.display()
+            );
+        }
+        assert!(!is_codex_cli_image_in(
+            Path::new(r"C:\Program Files\WindowsApps\OpenAI.Codex_1.0\app\resources\codex.exe"),
+            Some(&local),
+            Some(&home),
+        ));
+        assert!(!is_codex_cli_image_in(
+            &daemon_rel.join(r"codex-resources\codex-command-runner.exe"),
+            Some(&local),
+            Some(&home),
+        ));
+
+        let legacy_policy = PolicyState {
+            schema: 0,
+            port: 53130,
+            apps: vec!["codex-cli".into()],
+            ide_port: None,
+        };
+        assert!(!legacy_policy.covers(&[PaidApp::CodexCli]));
+        let current_policy = PolicyState {
+            schema: POLICY_SCHEMA,
+            ..legacy_policy
+        };
+        assert!(current_policy.covers(&[PaidApp::CodexCli]));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[ignore = "requires administrator rights and installed Codex CLI"]
+    fn live_codex_cli_targets_register_in_wfp() {
+        let targets = codex_cli_targets();
+        assert!(!targets.is_empty(), "no Codex CLI targets found");
+        let has_daemon = targets.iter().any(|p| {
+            p.to_string_lossy()
+                .to_ascii_lowercase()
+                .contains("app-server-daemon")
+                && p.file_name().is_some_and(|n| n.eq_ignore_ascii_case("codex.exe"))
+        });
+        let has_exec = targets
+            .iter()
+            .any(|p| p.file_name().is_some_and(|n| n.eq_ignore_ascii_case("codex-exec-server.exe")));
+        assert!(has_daemon, "missing app-server-daemon codex.exe in {targets:?}");
+        assert!(has_exec, "missing codex-exec-server.exe in {targets:?}");
+        crate::paid_firewall::verify_app_ids(&targets).expect("FwpmGetAppIdFromFileName0");
     }
 
     #[test]

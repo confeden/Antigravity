@@ -373,7 +373,7 @@ impl PaidApp {
 
     pub fn unavailable_reason(self) -> Option<&'static str> {
         match self {
-            Self::ChatGptDesktop => Some("PAID недоступен для приложения из Microsoft Store"),
+            Self::ChatGptDesktop => Some("Режим PAID пока недоступен"),
             _ => None,
         }
     }
@@ -538,7 +538,7 @@ fn first_reachable<T>(mut attempt: impl FnMut(&str, u16) -> io::Result<T>) -> Re
             Err(error) => errors.push(format!("{host}:{port} — {error}")),
         }
     }
-    Err(format!("Нет связи с платным шлюзом: {}", errors.join(", ")))
+    Err(format!("Нет связи с сервером PAID: {}", errors.join(", ")))
 }
 
 fn request_gateway(request: &[u8]) -> Result<Reply, String> {
@@ -688,7 +688,7 @@ pub(crate) fn classify_gateway_refusal(
     let summary = if status == 503 || reason.starts_with("store_") {
         "Сбой проверки лицензии на Витрине (503)".to_string()
     } else if status == 403 && matches!(reason.as_str(), "destination_forbidden" | "non_public_destination") {
-        "Хост запрещён политикой платного шлюза (403)".to_string()
+        "Хост запрещён политикой сервера PAID (403)".to_string()
     } else if status == 403 && reason == "device_limit" {
         LicenseReason::DeviceLimit
             .user_message()
@@ -702,11 +702,11 @@ pub(crate) fn classify_gateway_refusal(
     } else if status == 403 {
         "Лицензия PAID отклонена шлюзом (403)".to_string()
     } else if status == 502 || reason.starts_with("upstream_") {
-        "Платный шлюз не смог подключиться к целевому серверу (502)".to_string()
+        "Сервер PAID не смог подключиться к целевому серверу (502)".to_string()
     } else if status == 429 {
-        "Превышен лимит соединений платного шлюза (429)".to_string()
+        "Превышен лимит соединений сервера PAID (429)".to_string()
     } else {
-        format!("Платный шлюз отклонил соединение ({status})")
+        format!("Сервер PAID отклонил соединение ({status})")
     };
     let host_port = format!("{host}:{port}");
     let log_line = format!(
@@ -759,7 +759,7 @@ pub fn serve(
                 stage: "connect".into(),
                 status: 0,
                 reason: "gateway_unreachable".into(),
-                summary: "Нет связи с платным шлюзом".into(),
+                summary: "Нет связи с сервером PAID".into(),
             };
             log_and_record_paid_error(&log_line, failure, crate::proxy::is_gate_host(host));
             return Err(log_line);
@@ -888,7 +888,7 @@ fn serve_with_reply_impl(
             stage: "tunnel".into(),
             status: 200,
             reason: why_code.into(),
-            summary: "Соединение через платный шлюз оборвалось после CONNECT".into(),
+            summary: "Соединение через сервер PAID оборвалось после CONNECT".into(),
         };
         on_error(&line, failure, is_gate);
     }
@@ -1033,7 +1033,7 @@ mod tests {
         assert!(PaidApp::CodexCli.paid_implemented());
         assert_eq!(
             PaidApp::ChatGptDesktop.unavailable_reason(),
-            Some("PAID недоступен для приложения из Microsoft Store")
+            Some("Режим PAID пока недоступен")
         );
     }
 

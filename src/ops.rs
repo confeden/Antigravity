@@ -1528,7 +1528,7 @@ fn enable_all(ctx: &mut Ctx) {
         }
         ctx.log(
             Level::Ok,
-            "Готово. Для Antigravity активен платный режим PAID.",
+            "Готово. Для Antigravity активен режим PAID.",
         );
         return;
     }

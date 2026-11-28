@@ -483,6 +483,11 @@ pub fn group_proxy_enabled() -> bool {
     !crate::paid::antigravity_enabled() && cached().group_proxy_wanted()
 }
 
+pub(crate) fn free_bypass_wanted() -> bool {
+    let c = cached();
+    c.dns || c.local_proxy || c.group_proxy_wanted()
+}
+
 /// The user's own proxy was set after the group code, so it goes first.
 pub fn own_proxy_first() -> bool {
     let c = cached();

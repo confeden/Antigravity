@@ -178,7 +178,8 @@ pub const LISTEN_PORT: u16 = 53;
 /// 58 = Updated DNS-AI default endpoints (removed retired spb3) and 24h auto-refresh from GitHub endpoints.json.
 /// 59 = Write gate.json immediately on relay start before egress WMI probe, reuse warm_forever's egress probe in cache, and refresh gate.json mid-pass.
 /// 60 = Always arm Antigravity Desktop shortcut on relay enable/fast-path and watchdog loop, retry locked Desktop binary immediately upon unlock, and patch on any Start Menu launch via stamp cache.
-pub const RELAY_VERSION: u32 = 63;
+/// 64 = Pause FREE background probes while PAID is active and no IDE uses FREE; recognize Codex CLI daemon/helper images in serve_paid.
+pub const RELAY_VERSION: u32 = 64;
 
 /// Written where an unelevated relay can write and an unelevated unlocker can
 /// read. Absent means a relay from before versioning, i.e. older than anything.
@@ -558,6 +559,56 @@ fn network_fingerprint(isp: u32, best: Option<u32>, tunnel: bool) -> u64 {
     1 + ((isp as u64) << 33) + ((best.unwrap_or(0) as u64) << 1) + tunnel as u64
 }
 
+fn free_checks_paused_for(
+    active_paid: &[crate::paid::PaidApp],
+    free_bypass_wanted: bool,
+    has_desktop_install: bool,
+) -> bool {
+    use crate::paid::PaidApp;
+    if active_paid.is_empty() {
+        return false;
+    }
+    if active_paid.iter().any(|app| app.is_antigravity()) {
+        let ag_env_paid = active_paid.iter().any(|app| {
+            matches!(
+                app,
+                PaidApp::AntigravityDesktop | PaidApp::AntigravityCli | PaidApp::AntigravityVscode
+            )
+        });
+        let desktop_on_free =
+            ag_env_paid && !active_paid.contains(&PaidApp::AntigravityDesktop) && has_desktop_install;
+        return !desktop_on_free;
+    }
+    !free_bypass_wanted
+}
+
+pub(crate) fn free_checks_paused() -> bool {
+    use crate::paid::PaidApp;
+    let active_paid = crate::paid::active_apps();
+    if active_paid.is_empty() {
+        return false;
+    }
+    let ag_env_paid = active_paid.iter().any(|app| {
+        matches!(
+            app,
+            PaidApp::AntigravityDesktop | PaidApp::AntigravityCli | PaidApp::AntigravityVscode
+        )
+    });
+    let has_desktop_install = if ag_env_paid && !active_paid.contains(&PaidApp::AntigravityDesktop) {
+        crate::discover_installs_fast()
+            .into_iter()
+            .chain(crate::settings::manual_paths())
+            .any(|path| crate::install_label(&path) == "Antigravity 2.0")
+    } else {
+        false
+    };
+    free_checks_paused_for(
+        &active_paid,
+        crate::settings::free_bypass_wanted(),
+        has_desktop_install,
+    )
+}
+
 fn warm_forever() {
     let mut since_upstream = PROBE_HEALTHY_EVERY;
     let mut since_exits = PROBE_HEALTHY_EVERY;
@@ -566,7 +617,17 @@ fn warm_forever() {
     let mut since_exit_check = Duration::ZERO;
     let mut last_best: Option<u32> = None;
     let mut last_logged_egress: Option<u32> = None;
+    let mut was_free_paused = false;
     loop {
+        let free_paused = free_checks_paused();
+        if was_free_paused && !free_paused {
+            since_upstream = PROBE_HEALTHY_EVERY;
+            since_exits = PROBE_HEALTHY_EVERY;
+            since_direct = PROBE_HEALTHY_EVERY;
+            since_exit_check = VPN_EXIT_EVERY;
+            crate::dns_route::wake();
+        }
+        was_free_paused = free_paused;
         // One small record per pass, for a window that is another process and
         // can otherwise only read the log meant for a person (P29). **First** in
         // the pass, not last: a pass opens with a PowerShell VPN check and runs
@@ -654,7 +715,7 @@ fn warm_forever() {
                     "VPN отключён"
                 });
             }
-            if tunnel && (!was || proxy::vpn_exit().is_none()) {
+            if !free_paused && tunnel && (!was || proxy::vpn_exit().is_none()) {
                 measure_vpn_exit();
                 since_exit_check = Duration::ZERO;
             }
@@ -667,7 +728,7 @@ fn warm_forever() {
             since_vpn = Duration::ZERO;
         }
         gate::touch();
-        if net::tunnel_up() && since_exit_check >= VPN_EXIT_EVERY {
+        if !free_paused && net::tunnel_up() && since_exit_check >= VPN_EXIT_EVERY {
             measure_vpn_exit();
             since_exit_check = Duration::ZERO;
         }
@@ -682,6 +743,14 @@ fn warm_forever() {
             since_exits = PROBE_HEALTHY_EVERY;
             since_direct = PROBE_HEALTHY_EVERY;
             log_proxy("сеть изменилась — что работает, выясняется заново");
+        }
+        if free_paused {
+            since_upstream = PROBE_HEALTHY_EVERY;
+            since_exits = PROBE_HEALTHY_EVERY;
+            since_direct = PROBE_HEALTHY_EVERY;
+            thread::sleep(WARM_EVERY);
+            since_vpn += WARM_EVERY;
+            continue;
         }
         // The client logs are watched on a thread of their own every two
         // seconds (`watch_client_logs`), not here: a refusal costs the user
@@ -898,7 +967,7 @@ fn on_drops(count: usize, at: Instant, host: Option<&str>, answered_after: bool)
             stage: "tunnel".into(),
             status: 200,
             reason: "stream_eof".into(),
-            summary: "Запрос к модели через платный шлюз оборвался".into(),
+            summary: "Запрос к модели через сервер PAID оборвался".into(),
         });
         return;
     }
@@ -1307,7 +1376,7 @@ fn spawn_proxy_env_maintainer() {
                 let Some(port) = proxy::wait_for_our_paid_listener(PROXY_START_BUDGET) else {
                     if !waiting_said {
                         log_proxy(&format!(
-                            "{} не выставлена: платный прокси не поднялся",
+                            "{} не выставлена: локальный прокси PAID не поднялся",
                             var
                         ));
                         waiting_said = true;
@@ -1318,7 +1387,7 @@ fn spawn_proxy_env_maintainer() {
                 let url = proxy::url_at(port);
                 match crate::endpoint::ensure_proxy_env(&url) {
                     Ok(crate::endpoint::Outcome::Applied) => {
-                        log_proxy(&format!("{} указывает на платный прокси", var))
+                        log_proxy(&format!("{} указывает на локальный прокси PAID", var))
                     }
                     Ok(crate::endpoint::Outcome::AlreadySet) => {}
                     Err(e) => log_proxy(&format!("{} не выставлена: {}", var, e)),
@@ -1797,5 +1866,25 @@ mod tests {
              providers dropped every name"
         );
         println!("substituted: {:?}", substituted);
+    }
+
+    #[test]
+    fn free_checks_pause_only_when_paid_is_active_and_no_ide_uses_free() {
+        use crate::paid::PaidApp::*;
+
+        assert!(!free_checks_paused_for(&[], false, true));
+        assert!(!free_checks_paused_for(&[], true, true));
+
+        assert!(free_checks_paused_for(
+            &[AntigravityDesktop, AntigravityIde, AntigravityCli, AntigravityVscode],
+            true,
+            true,
+        ));
+        assert!(free_checks_paused_for(&[AntigravityIde], true, true));
+        assert!(!free_checks_paused_for(&[AntigravityCli], false, true));
+        assert!(free_checks_paused_for(&[AntigravityCli], false, false));
+
+        assert!(free_checks_paused_for(&[CodexCli], false, true));
+        assert!(!free_checks_paused_for(&[CodexCli], true, true));
     }
 }

@@ -1,56 +1,71 @@
-# ANTIGRAVITY NON-COMMERCIAL & RESTRICTED USE LICENSE
+# AI UNLOCKER SOURCE-AVAILABLE RESTRICTED USE LICENSE
 
-Version 1.0 (June 2026)
+Version 2.0 (November 2026)
 
-Copyright (c) 2026 Justin
+Copyright (c) 2026 Brent (t.me/nova_txt)
 
-## 1. DEFINITIONS AND SCOPE
-This License governs the use, copying, and distribution of the software project "Antigravity Unlocker" (including all source code, executables, scripts, assets, and documentation, hereinafter referred to as the "Software").
+## 1. DEFINITIONS AND ACCEPTANCE
+This License governs access to, installation, copying, compilation, and use of the software project "AI Unlocker" (including all source code, executables, installers, scripts, assets, and documentation, collectively the "Software") made available by the copyright holder identified above (the "Author").
 
-By accessing, running, compiling, downloading, or using the Software, you (the "User") agree to be bound by the terms of this License. If you do not agree to these terms, you are not authorized to use the Software and must immediately destroy all copies in your possession.
+By downloading, installing, compiling, accessing, or running the Software, you (the "User") agree to be bound by this License. If you do not agree to all terms of this License, you have no right to use the Software and must immediately cease use and delete all copies in your possession.
 
----
+## 2. LICENSE GRANT, RESTRICTIONS, AND RESERVATION OF RIGHTS
 
-## 2. RESTRICTIONS ON USE
+### 2.1 Limited Personal License
+Subject to strict compliance with this License, the Author grants the User a limited, revocable, non-exclusive, non-transferable, non-sublicensable license to download, compile, install, and run the Software solely on devices owned or lawfully controlled by the User for personal, non-commercial, diagnostic, interoperability, or educational purposes.
 
-### 2.1 Non-Commercial Restriction
-The Software is licensed strictly for personal, non-commercial, educational, and testing purposes. 
-* Any commercial exploitation, including but not limited to selling, renting, leasing, licensing, hosting, or using the Software to provide paid services or integration into proprietary/commercial products, is strictly prohibited.
+### 2.2 Prohibitions
+Except as expressly permitted by mandatory applicable law or prior written consent of the Author, the User shall not:
+* use, sell, rent, lease, sublicense, host, bundle, or otherwise exploit the Software for any commercial purpose or to provide a paid or managed service to third parties;
+* modify, adapt, patch, translate, reverse engineer, decompile, disassemble, or create derivative works based on the Software, in whole or in part;
+* redistribute, mirror, repackage, or publicly host original or modified copies of the Software;
+* use the Software's source code, binaries, or documentation to train, fine-tune, or build artificial intelligence or machine learning models, or perform automated scraping outside of standard platform display, indexing, and caching expressly required by the hosting platform's Terms of Service.
 
-### 2.2 Modification and Derivative Works
-* You may not modify, alter, patch, translate, reverse engineer, decompile, disassemble, or create derivative works of the Software, in whole or in part, without the prior written consent of the Author.
-* Public hosting of modified versions of the Software is strictly prohibited.
+### 2.3 Reservation of Rights
+All rights not expressly granted under this License are reserved by the Author. Nothing in this License restricts the Author from offering separate services, licenses, or commercial terms independently of this License.
 
-### 2.3 Crawler, Scraper, AI, and Machine Learning Restrictions
-* The Software's source code, documentation, and metadata must not be accessed, read, scraped, crawled, analyzed, or parsed by search engine robots, scrapers, web crawlers, AI agents, artificial intelligence systems, large language models (LLMs), or neural networks.
-* The use of the Software's code, structure, logic, or text for training artificial intelligence models, machine learning algorithms, or translation/synthesis systems is strictly prohibited, regardless of whether such use is for non-profit, educational, or commercial purposes.
+## 3. INDEPENDENT PROJECT, THIRD-PARTY RIGHTS, AND NATURE OF THE SOFTWARE
 
----
+### 3.1 No Affiliation and Trademarks
+AI Unlocker is an independent third-party utility. It is not affiliated with, endorsed by, sponsored by, or officially connected to Google LLC or any other third-party software vendor or service provider. All third-party product names, logos, and trademarks are the property of their respective owners and are referenced solely for descriptive and compatibility identification purposes.
 
-## 3. DISCLAIMER OF LIABILITY AND INDEMNIFICATION
+### 3.2 No Third-Party Proprietary Code
+The Software contains no third-party proprietary source code, binaries, credentials, API keys, or copyrighted third-party program assets. Any interaction with local configuration, network settings, or locally installed software occurs strictly on the User's own device, solely upon the User's explicit initiation, and remains under the User's exclusive control.
 
-### 3.1 Disclaimer of Warranty
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+## 4. USER COMPLIANCE WITH LAWS AND THIRD-PARTY TERMS
 
-### 3.2 Indemnification and Release
-* Running, compiling, or executing this Software releases the Author from any and all liability for any direct, indirect, incidental, special, exemplary, or consequential damages (including, but not limited to, loss of data, system corruption, software locks, account bans, service disruptions, or hardware failure) arising in any way out of the use or inability to use this Software.
-* The User assumes all risks associated with the usage, execution, and performance of the Software.
+### 4.1 Sole Responsibility of the User
+The User is solely and exclusively responsible for determining whether downloading, installing, or using the Software -- and any configuration or local modifications initiated through it -- complies with:
+* all applicable local, national, and international laws and regulations, including export control, sanctions, telecommunications, and copyright/anti-circumvention laws; and
+* all End User License Agreements (EULAs), Terms of Service (ToS), and acceptable use policies of any third-party software or online services the User interacts with.
 
----
+### 4.2 Prohibition of Unlawful Use
+The Author does not authorize, encourage, instruct, or condone any violation of applicable law or third-party agreements. Any use of the Software in a jurisdiction or manner prohibited by applicable law or binding third-party terms is outside the scope of this License and is strictly prohibited.
 
-## 4. JURISDICTION AND COMPLIANCE WITH LAWS
+## 5. DISCLAIMER OF WARRANTIES
+TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, THE SOFTWARE IS PROVIDED "AS IS" AND "AS AVAILABLE", WITH ALL FAULTS AND WITHOUT WARRANTY OF ANY KIND, EXPRESS, IMPLIED, OR STATUTORY, INCLUDING WITHOUT LIMITATION ANY IMPLIED WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, TITLE, QUIET ENJOYMENT, ACCURACY, OR NON-INFRINGEMENT. THE AUTHOR DOES NOT WARRANT THAT THE SOFTWARE WILL BE UNINTERRUPTED, ERROR-FREE, COMPATIBLE WITH FUTURE THIRD-PARTY UPDATES, OR FREE FROM SECURITY OR ACCOUNT RISKS.
 
-### 4.1 User Responsibility
-* The Software is designed to interact with local development tools. The User is solely responsible for ensuring that the use of the Software complies with all applicable local, regional, national, and international laws, regulations, and third-party terms of service.
-* If the use of this Software violates the laws of any jurisdiction or the terms of any service provider, the responsibility for such use lies entirely and solely with the User.
+## 6. ASSUMPTION OF RISK AND LIMITATION OF LIABILITY
 
-### 4.2 Guarantee of No Claims
-* The User guarantees and promises that they will not bring any legal action, lawsuit, claim, or demand against the Author in any jurisdiction or court worldwide. 
-* The User agrees to indemnify, defend, and hold harmless the Author from any third-party claims, liabilities, losses, or expenses (including legal fees) arising from the User's use of the Software.
+### 6.1 Assumption of Risk
+The User acknowledges and expressly assumes all risks arising from installing, compiling, or running the Software, including without limitation: suspension, restriction, or termination of third-party accounts or services; incompatibility or malfunction of third-party software after updates; network, DNS, or proxy misconfiguration; data loss; or system instability.
 
----
+### 6.2 Limitation of Liability
+TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, CONSEQUENTIAL, EXEMPLARY, OR PUNITIVE DAMAGES, OR ANY LOSS OF DATA, PROFITS, REVENUE, BUSINESS, GOODWILL, OR ACCESS TO THIRD-PARTY SERVICES, ARISING OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THIS LICENSE, UNDER ANY THEORY OF LIABILITY (CONTRACT, TORT, NEGLIGENCE, STRICT LIABILITY, OR OTHERWISE), EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGES. WHERE LIABILITY CANNOT BE FULLY EXCLUDED UNDER APPLICABLE LAW, THE AUTHOR'S AGGREGATE LIABILITY SHALL NOT EXCEED ZERO U.S. DOLLARS (USD 0.00) OR THE MINIMUM AMOUNT PERMITTED BY APPLICABLE LAW.
 
-## 5. THIRD-PARTY ASSETS AND LICENSES
+## 7. INDEMNIFICATION
+To the maximum extent permitted by applicable law, the User agrees to indemnify, defend, and hold harmless the Author from and against any and all third-party claims, demands, actions, damages, liabilities, penalties, losses, and reasonable legal fees arising out of or relating to: (a) the User's use or misuse of the Software; (b) the User's breach of this License; or (c) the User's violation of any applicable law or third-party rights, EULA, or Terms of Service.
+
+## 8. COPYRIGHT MANAGEMENT INFORMATION
+Embedded copyright notices, provenance notices, and license notices included in the Software or its binaries constitute copyright management information (including under 17 U.S.C. Section 1202 and equivalent laws) and must not be removed, obscured, or altered.
+
+## 9. TERMINATION, SEVERABILITY, AND ENTIRE AGREEMENT
+* **Termination:** The User's rights under this License terminate automatically and without notice if the User fails to comply with any of its terms. Upon termination, the User must cease all use and destroy all copies of the Software. Sections 2.3 and 3 through 10 survive termination.
+* **Severability:** If any provision of this License is held invalid, illegal, or unenforceable in any jurisdiction, such provision shall be enforced to the maximum extent permissible to reflect the parties' intent, and the remaining provisions shall remain in full force and effect.
+* **No Waiver:** Failure by the Author to enforce any right or provision of this License shall not constitute a waiver of that right or provision.
+
+## 10. THIRD-PARTY OPEN-SOURCE COMPONENTS
+This Software incorporates open-source components governed by their respective licenses (including MIT, Apache-2.0, BSD, and ISC licenses). Nothing in this License limits rights granted under those third-party licenses with respect to those components.
 
 ### Lucide Icons
 This Software includes a subset of icons from Lucide (`assets/lucide-panel.ttf`), licensed under the ISC License (with portions derived from Feather under the MIT License):

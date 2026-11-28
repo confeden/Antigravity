@@ -390,6 +390,13 @@ pub(super) struct IdeIpc<'a> {
     pub listeners: &'a [PathBuf],
 }
 
+pub(super) fn verify_app_ids(programs: &[PathBuf]) -> Result<(), String> {
+    for path in programs {
+        AppId::from_path(path)?;
+    }
+    Ok(())
+}
+
 pub(super) fn install(
     programs: &[PathBuf],
     packages: &[&str],

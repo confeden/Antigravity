@@ -657,7 +657,7 @@ pub fn headline(f: &Facts) -> Headline {
     {
         return Headline {
             tone: Tone::Action,
-            title: "Сбой платного шлюза".into(),
+            title: "Сбой сервера PAID".into(),
             detail: format!(
                 "{} ({}, ID {}) — {}. Подробности — во вкладке «Журнал».",
                 err.summary,
@@ -1314,7 +1314,7 @@ mod tests {
         };
         let h_only = headline(&f_only);
         assert_eq!(h_only.tone, Tone::Action);
-        assert_eq!(h_only.title, "Сбой платного шлюза");
+        assert_eq!(h_only.title, "Сбой сервера PAID");
         assert!(h_only.detail.contains("c778899"), "{}", h_only.detail);
         assert!(h_only.detail.contains("Витрине (503)"), "{}", h_only.detail);
 

@@ -816,7 +816,7 @@ fn integration(app: &mut App, ui: &mut egui::Ui) {
             } else {
                 widgets::hint(
                     ui,
-                    "FREE поддерживается только для Antigravity. Для остальных IDE и платного маршрута активируйте PAID на вкладке «Обзор».",
+                    "FREE поддерживается только для Antigravity. Для остальных IDE и маршрута PAID активируйте PAID на вкладке «Обзор».",
                 );
             }
             #[cfg(windows)]
@@ -1116,16 +1116,11 @@ fn paid_group_section(
                     if route_switch(ui, item.app, &mut on, can_toggle, tip).changed() {
                         *toggle_app = Some((item.app, on));
                     }
-                    let (text, color) = if !item.found {
-                        ("Не найден", colors.muted)
+                    if !item.found {
+                        ui.label(egui::RichText::new("Не найден").size(13.0).color(colors.muted));
                     } else if let Some(reason) = item.app.unavailable_reason() {
-                        (reason, colors.muted)
-                    } else if item.app == crate::paid::PaidApp::CodexCli {
-                        ("PowerShell", colors.text)
-                    } else {
-                        ("Найден", colors.text)
-                    };
-                    ui.label(egui::RichText::new(text).size(13.0).color(color));
+                        ui.label(egui::RichText::new(reason).size(13.0).color(colors.muted));
+                    }
                 });
             });
         });
@@ -1995,6 +1990,87 @@ mod panel_tests {
             assert!(icon.vertices.iter().any(|vertex| vertex.color == expected_color));
             assert!(icon.vertices.iter().all(|vertex| vertex.pos.x < title));
         }
+    }
+
+    #[test]
+    fn paid_group_section_hides_found_and_powershell_labels_and_shows_unavailable_reason() {
+        use crate::paid::{PaidApp, PaidAppStatus, PaidGroup};
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let mut state = ViewState::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(760.0, 500.0),
+            )),
+            ..Default::default()
+        };
+        let items = [
+            PaidAppStatus {
+                app: PaidApp::ClaudeCode,
+                found: true,
+                path_hint: Some(r"C:\Users\Test\.local\bin\claude.exe".into()),
+                active: false,
+            },
+            PaidAppStatus {
+                app: PaidApp::ClaudeDesktop,
+                found: false,
+                path_hint: None,
+                active: false,
+            },
+            PaidAppStatus {
+                app: PaidApp::CodexCli,
+                found: true,
+                path_hint: Some(r"C:\Users\Test\AppData\Local\Programs\OpenAI\Codex\bin\codex.exe".into()),
+                active: false,
+            },
+            PaidAppStatus {
+                app: PaidApp::ChatGptDesktop,
+                found: true,
+                path_hint: Some("OpenAI.Codex_26.1120.6357.0_x64__2p2nqsd0c76g0".into()),
+                active: false,
+            },
+        ];
+        let output = ctx.run_ui(input, |root| {
+            egui::CentralPanel::default().show(root, |ui| {
+                paid_group_section(
+                    &mut state,
+                    ui,
+                    "Claude",
+                    PaidGroup::Claude,
+                    &items,
+                    true,
+                    true,
+                    &mut None,
+                );
+                paid_group_section(
+                    &mut state,
+                    ui,
+                    "ChatGPT",
+                    PaidGroup::Codex,
+                    &items,
+                    true,
+                    true,
+                    &mut None,
+                );
+            });
+        });
+        let texts: Vec<String> = output
+            .shapes
+            .iter()
+            .filter_map(|item| match &item.shape {
+                egui::Shape::Text(text) => Some(text.galley.text().to_string()),
+                _ => None,
+            })
+            .collect();
+        output.drop_without_applying_deltas();
+        assert!(!texts.iter().any(|t| t == "Найден"), "{texts:?}");
+        assert!(!texts.iter().any(|t| t == "PowerShell"), "{texts:?}");
+        assert!(texts.iter().any(|t| t == "Не найден"), "{texts:?}");
+        assert!(
+            texts.iter().any(|t| t == "Режим PAID пока недоступен"),
+            "{texts:?}"
+        );
     }
 
     #[test]

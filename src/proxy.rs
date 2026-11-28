@@ -1563,7 +1563,7 @@ pub fn run_paid() -> Result<(), String> {
             Ok(listener) => {
                 if said.is_some() {
                     crate::dns_forwarder::log_proxy(&format!(
-                        "платный прокси поднялся на порту {}",
+                        "локальный прокси PAID поднялся на порту {}",
                         paid_port()
                     ));
                 }
@@ -1634,9 +1634,7 @@ fn serve_paid(mut client: TcpStream) {
     let app = crate::portcheck::client_image(&client).and_then(|image| {
         if is_desktop_proxy_client(&image) {
             Some(AntigravityDesktop)
-        } else if crate::paid_windows::codex_cli_path()
-            .is_some_and(|exe| exe.as_os_str().eq_ignore_ascii_case(image.as_os_str()))
-        {
+        } else if crate::paid_windows::is_codex_cli_image(&image) {
             Some(CodexCli)
         } else {
             None

@@ -643,7 +643,7 @@ fn main() {
             let result = match env::args().nth(2).as_deref() {
                 Some("on") => paid_windows::start(),
                 Some("off") => paid_windows::disable(),
-                _ => Err("Неизвестный режим платной маршрутизации".into()),
+                _ => Err("Неизвестный режим маршрутизации PAID".into()),
             };
             if let Err(error) = result {
                 dns_forwarder::log_proxy(&error);

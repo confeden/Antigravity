@@ -204,14 +204,14 @@ fn main() {
         // visible in the file's Properties dialog without any tooling.
         res.set(
             "LegalTrademarks",
-            "Antigravity Unlocker (c) 2026 Brent - github.com/confeden/Antigravity",
+            "AI Unlocker (c) 2026 Brent - github.com/confeden/Antigravity",
         );
         res.set(
             "Comments",
             &format!(
-                "Antigravity Unlocker (c) 2026 Brent, t.me/nova_txt. \
+                "AI Unlocker (c) 2026 Brent, t.me/nova_txt. \
                  Origin: github.com/confeden/Antigravity. \
-                 Non-Commercial & Restricted Use License - derivative works not permitted. \
+                 Source-Available Restricted Use License - derivative works not permitted. \
                  mark {} build {}",
                 static_canary, release_token
             ),

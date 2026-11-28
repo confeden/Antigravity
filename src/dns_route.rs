@@ -118,6 +118,12 @@ pub fn start() {
     });
 }
 
+pub fn wake() {
+    if let Some(tx) = WAKE.get() {
+        let _ = tx.try_send(());
+    }
+}
+
 pub fn network_changed() {
     if let Ok(mut s) = state().lock() {
         s.generation = s.generation.wrapping_add(1);
@@ -165,6 +171,9 @@ pub fn feedback(host: &str, ip: Ipv4Addr, answered: bool) {
 }
 
 fn check_all() {
+    if crate::dns_forwarder::free_checks_paused() {
+        return;
+    }
     refresh_settings();
     let generation = match state().lock() {
         Ok(s) => s.generation,

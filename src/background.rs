@@ -335,7 +335,13 @@ mod windows_impl {
         } else {
             let stderr = String::from_utf8_lossy(&ran.stderr).trim().to_string();
             let stdout = String::from_utf8_lossy(&ran.stdout).trim().to_string();
-            Err(if !stderr.is_empty() { stderr } else { stdout })
+            Err(if !stderr.is_empty() {
+                stderr
+            } else if !stdout.is_empty() {
+                stdout
+            } else {
+                "schtasks /Run завершился с ошибкой".to_string()
+            })
         }
     }
 
@@ -395,7 +401,8 @@ mod windows_impl {
             ));
         }
 
-        if s4u_reg.is_ok() && register_task_ps(&dst, true).is_ok() {
+        let interactive_reg = register_task_ps(&dst, true);
+        if interactive_reg.is_ok() {
             dns_forwarder::record_version();
             if wait_for_relay(8) {
                 on_relay_started();
@@ -426,19 +433,22 @@ mod windows_impl {
             ));
         }
 
-        let last = last_task_result();
-        Err(match last {
-            Some(code) => format!(
-                "задача создана, но релей не запустился (код задачи 0x{code}{}; подробности в forwarder.log)",
-                task_result_hint(&code)
-            ),
-            None => match s4u_reg.err().or_else(|| xml_res.err()) {
-                Some(reason) if !reason.is_empty() => {
-                    format!("не удалось запустить службу обхода: {reason}")
-                }
-                _ => "задача создана, но релей не запустился".to_string(),
-            },
-        })
+        let mut error = "ни один способ запуска релея не сработал".to_string();
+        for (method, result) in [
+            ("S4U (PowerShell)", s4u_reg),
+            ("Interactive (PowerShell)", interactive_reg),
+            ("schtasks /XML", xml_res),
+        ] {
+            let reason = match &result {
+                Ok(()) => "релей не подтвердил запуск, подробности в forwarder.log",
+                Err(reason) => reason,
+            };
+            error.push_str(&format!("\n{method} — {reason}"));
+        }
+        if let Some(code) = last_task_result() {
+            error.push_str(&format!("\nКод задачи 0x{code}{}", task_result_hint(&code)));
+        }
+        Err(error)
     }
 
     /// Waits for the relay process to appear AND publish a fresh `gate.json`.
@@ -460,9 +470,10 @@ mod windows_impl {
     /// The task's last result as hex digits, or `None` when it cannot be read.
     fn last_task_result() -> Option<String> {
         powershell(&format!(
-            "'{{0:X}}' -f (Get-ScheduledTaskInfo -TaskName '{}').LastTaskResult",
+            "'{{0:X}}' -f (Get-ScheduledTaskInfo -TaskName '{}' -ErrorAction Stop).LastTaskResult",
             TASK_NAME
         ))
+        .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .filter(|s| !s.is_empty())
     }

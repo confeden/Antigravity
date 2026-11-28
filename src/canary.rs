@@ -69,9 +69,9 @@ pub const ORIGIN: &str = "https://github.com/confeden/Antigravity";
 /// Copyright management information. Kept on one line so a `strings` dump of the
 /// binary shows it intact.
 pub const NOTICE: &str = concat!(
-    "Antigravity Unlocker. Copyright (c) 2026 Brent (t.me/nova_txt). ",
+    "AI Unlocker. Copyright (c) 2026 Brent (t.me/nova_txt). ",
     "Origin: https://github.com/confeden/Antigravity . ",
-    "Licensed under the Antigravity Non-Commercial & Restricted Use License: ",
+    "Licensed under the AI Unlocker Source-Available Restricted Use License: ",
     "modification, derivative works and public hosting of modified copies are ",
     "not permitted. This notice is copyright management information; removing ",
     "or altering it is assessed separately from the copying itself."
@@ -170,6 +170,7 @@ mod tests {
 
     #[test]
     fn notice_names_author_licence_and_origin() {
+        assert!(NOTICE.contains("AI Unlocker"));
         assert!(NOTICE.contains("Copyright (c) 2026"));
         assert!(NOTICE.contains("t.me/nova_txt"));
         assert!(NOTICE.contains("github.com/confeden/Antigravity"));

@@ -494,8 +494,8 @@ pub fn classify_forwarder_line(raw: &str) -> Option<(crate::ops::Level, String)>
     }
     let level = if trimmed.contains("PAID отказ")
         || trimmed.contains("PAID обрыв")
-        || trimmed.contains("Платный шлюз отклонил")
-        || trimmed.contains("Нет связи с платным шлюзом")
+        || trimmed.contains("Сервер PAID отклонил")
+        || trimmed.contains("Нет связи с сервером PAID")
         || trimmed.contains("обрыв соединения при ответе модели")
         || trimmed.contains("not started:")
     {
@@ -1065,7 +1065,7 @@ mod tests {
             Some(crate::ops::Level::Err)
         );
         assert_eq!(
-            classify_forwarder_line("23:07:31 proxy        модель ответила (x1) — маршрут «платный шлюз (PAID)»").map(|(l, _)| l),
+            classify_forwarder_line("23:07:31 proxy        модель ответила (x1) — маршрут «сервер режима PAID»").map(|(l, _)| l),
             Some(crate::ops::Level::Ok)
         );
         assert!(classify_forwarder_line("22:50:00 proxy        Proxy-Authorization: Device SECRET.PROOF").is_none());

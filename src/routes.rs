@@ -1099,7 +1099,7 @@ pub fn note_used(kind: Kind) {
     }
 }
 
-pub const PAID_LABEL: &str = "платный шлюз (PAID)";
+pub const PAID_LABEL: &str = "сервер режима PAID";
 
 struct PaidTunnel {
     id: u64,

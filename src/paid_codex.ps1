@@ -22,7 +22,8 @@ if (!(Get-Command codex -CommandType Alias,Function -ErrorAction SilentlyContinu
             & (Get-Command codex.exe -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source @args
             return
         }
-        $policy = Get-Content -LiteralPath (Join-Path $stateDir 'paid-wfp-state.json') -Raw -Encoding UTF8 -ErrorAction Stop |
+        $policyPath = Join-Path $stateDir 'paid-wfp-state.json'
+        $policy = Get-Content -LiteralPath $policyPath -Raw -Encoding UTF8 -ErrorAction Stop |
             ConvertFrom-Json -ErrorAction Stop
         if ($policy.apps -notcontains 'codex-cli' -or $policy.port -lt 1 -or $policy.port -gt 65535) {
             throw 'AI Unlocker has not applied the PAID protection for Codex CLI.'
@@ -44,6 +45,30 @@ if (!(Get-Command codex -CommandType Alias,Function -ErrorAction SilentlyContinu
         try {
             foreach ($name in $vars.Keys) {
                 [Environment]::SetEnvironmentVariable($name, $vars[$name], 'Process')
+            }
+            $codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }
+            $daemonPid = Join-Path $codexHome 'app-server-daemon\daemon.pid'
+            $daemonStamp = Join-Path $stateDir 'paid-codex-daemon.stamp'
+            $isDaemonCmd = ($args.Count -ge 2 -and $args[0] -ieq 'app-server' -and $args[1] -ieq 'daemon')
+            if (!$isDaemonCmd -and (Test-Path -LiteralPath $daemonPid)) {
+                $pidTicks = (Get-Item -LiteralPath $daemonPid -ErrorAction SilentlyContinue).LastWriteTimeUtc.Ticks
+                $expected = "$($policy.port):$pidTicks"
+                $seen = if (Test-Path -LiteralPath $daemonStamp) {
+                    (Get-Content -LiteralPath $daemonStamp -Raw -Encoding UTF8 -ErrorAction SilentlyContinue).Trim()
+                } else { '' }
+                if ($seen -cne $expected) {
+                    $policyTicks = (Get-Item -LiteralPath $policyPath -ErrorAction SilentlyContinue).LastWriteTimeUtc.Ticks
+                    if ($pidTicks -lt $policyTicks) {
+                        & $target app-server daemon restart *> $null
+                        if (Test-Path -LiteralPath $daemonPid) {
+                            $pidTicks = (Get-Item -LiteralPath $daemonPid -ErrorAction SilentlyContinue).LastWriteTimeUtc.Ticks
+                            $expected = "$($policy.port):$pidTicks"
+                        }
+                    }
+                    try {
+                        [IO.File]::WriteAllText($daemonStamp, $expected, [Text.UTF8Encoding]::new($false))
+                    } catch {}
+                }
             }
             & $target @args
         } finally {
