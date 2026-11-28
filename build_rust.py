@@ -1090,19 +1090,33 @@ def build_macos_bundle(version, output_dir):
         print("[INFO] macOS-бинарник подписан ad-hoc (подпись компоновщика).")
 
         shutil.copy2(os.path.join("macos", "install.sh"), os.path.join(bundle, "Установить.command"))
+        has_icon = False
+        try:
+            from PIL import Image
+            if os.path.exists("icon.ico"):
+                Image.open("icon.ico").convert("RGBA").save(
+                    os.path.join(bundle, "AppIcon.icns"), format="ICNS"
+                )
+                has_icon = True
+        except Exception as exc:
+            print(f"[INFO] AppIcon.icns для macOS не создан (необязательно): {exc}")
+
         major, minor, patch, *build = version.replace("_", ".").split(".")
+        plist_data = {
+            "CFBundleDisplayName": "AI Unlocker",
+            "CFBundleName": "AI Unlocker",
+            "CFBundleExecutable": "ag_unlocker",
+            "CFBundleIdentifier": "com.confeden.ai-unlocker",
+            "CFBundlePackageType": "APPL",
+            "LSMinimumSystemVersion": "13.0",
+            "CFBundleShortVersionString": f"{major}.{minor}.{patch}",
+            "CFBundleVersion": f"{major}.{minor}.{int(patch) * 100 + int((build or ['0'])[0])}",
+            "NSHighResolutionCapable": True,
+        }
+        if has_icon:
+            plist_data["CFBundleIconFile"] = "AppIcon"
         with open(os.path.join(bundle, "Info.plist"), "wb") as f:
-            plistlib.dump({
-                "CFBundleDisplayName": "AI Unlocker",
-                "CFBundleName": "AI Unlocker",
-                "CFBundleExecutable": "ag_unlocker",
-                "CFBundleIdentifier": "com.confeden.ai-unlocker",
-                "CFBundlePackageType": "APPL",
-                "LSMinimumSystemVersion": "13.0",
-                "CFBundleShortVersionString": f"{major}.{minor}.{patch}",
-                "CFBundleVersion": f"{major}.{minor}.{int(patch) * 100 + int((build or ['0'])[0])}",
-                "NSHighResolutionCapable": True,
-            }, f)
+            plistlib.dump(plist_data, f)
 
         tar_path = bundle + ".tar.gz"
         if os.path.exists(tar_path):

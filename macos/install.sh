@@ -17,7 +17,12 @@ NEW="$STAGE/AI Unlocker.app"
 mkdir -p "$NEW/Contents/MacOS"
 install -m 0755 "$SRC/ag_unlocker" "$NEW/Contents/MacOS/ag_unlocker"
 install -m 0644 "$SRC/Info.plist" "$NEW/Contents/Info.plist"
-/usr/bin/codesign --verify "$NEW/Contents/MacOS/ag_unlocker"
+if [ -f "$SRC/AppIcon.icns" ]; then
+    mkdir -p "$NEW/Contents/Resources"
+    install -m 0644 "$SRC/AppIcon.icns" "$NEW/Contents/Resources/AppIcon.icns"
+fi
+/usr/bin/codesign --force --sign - "$NEW"
+/usr/bin/codesign --verify "$NEW"
 if /usr/bin/xattr -p com.apple.quarantine "$NEW/Contents/MacOS/ag_unlocker" >/dev/null 2>&1; then
     /usr/bin/xattr -d com.apple.quarantine "$NEW/Contents/MacOS/ag_unlocker"
 fi
